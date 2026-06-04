@@ -1,0 +1,449 @@
+name: ACIRM R13MUG metadata only SCW coverage route selection no values
+
+on:
+  workflow_dispatch:
+
+jobs:
+  scw-route-selection:
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Lock no-values scope
+        shell: bash
+        run: |
+          set -euo pipefail
+          STAGE="ACIRM_R13MUG_GITHUB_ACTIONS_METADATA_ONLY_SCW_COVERAGE_AND_ROUTE_SELECTION_NO_VALUES"
+          OUT="$GITHUB_WORKSPACE/${STAGE}_OUTPUT"
+          mkdir -p "$OUT"
+          cat > "$OUT/R13MUG_ROUTE_LOCK.json" <<'JSON'
+          {
+            "stage": "ACIRM_R13MUG_GITHUB_ACTIONS_METADATA_ONLY_SCW_COVERAGE_AND_ROUTE_SELECTION_NO_VALUES",
+            "opens_science_values": false,
+            "downloads_science_products": false,
+            "downloads_fits": false,
+            "reads_fits_tables": false,
+            "purpose": "Metadata-only SCW route discovery and route selection before any values",
+            "forbidden": [
+              "SPI spectra",
+              "SPI images",
+              "511 keV flux/count/intensity values",
+              "FITS download",
+              "FITS science product opening",
+              "FITS table reading",
+              "science-window value extraction",
+              "particle-production claim"
+            ],
+            "claim_ceiling": "metadata-only SCW route selection"
+          }
+          JSON
+
+      - name: System info
+        shell: bash
+        run: |
+          set -euo pipefail
+          STAGE="ACIRM_R13MUG_GITHUB_ACTIONS_METADATA_ONLY_SCW_COVERAGE_AND_ROUTE_SELECTION_NO_VALUES"
+          OUT="$GITHUB_WORKSPACE/${STAGE}_OUTPUT"
+          {
+            echo "date_utc=$(date -u)"
+            echo "runner_os=$RUNNER_OS"
+            echo "runner_arch=$RUNNER_ARCH"
+            echo "kernel=$(uname -a)"
+            python3 --version || true
+            df -h
+          } > "$OUT/R13MUG_SYSTEM_INFO.txt"
+
+      - name: Build metadata-only SCW route search plan
+        shell: bash
+        run: |
+          set -euo pipefail
+          STAGE="ACIRM_R13MUG_GITHUB_ACTIONS_METADATA_ONLY_SCW_COVERAGE_AND_ROUTE_SELECTION_NO_VALUES"
+          OUT="$GITHUB_WORKSPACE/${STAGE}_OUTPUT"
+          python3 - <<'PY'
+          from pathlib import Path
+          import csv
+          import json
+          import os
+
+          root = Path(os.environ["GITHUB_WORKSPACE"])
+          out = root / "ACIRM_R13MUG_GITHUB_ACTIONS_METADATA_ONLY_SCW_COVERAGE_AND_ROUTE_SELECTION_NO_VALUES_OUTPUT"
+
+          routes = [
+              {
+                  "route_id": "SCW-ROOT",
+                  "url": "https://heasarc.gsfc.nasa.gov/FTP/integral/data/scw/",
+                  "role": "official_scw_root",
+                  "allowed_now": "small_html_index_only",
+                  "forbidden_now": "no_fits_no_science_product_download"
+              },
+              {
+                  "route_id": "DATA-ROOT",
+                  "url": "https://heasarc.gsfc.nasa.gov/FTP/integral/data/",
+                  "role": "official_integral_data_root",
+                  "allowed_now": "small_html_index_only",
+                  "forbidden_now": "no_fits_no_science_product_download"
+              },
+              {
+                  "route_id": "AUX-ROOT",
+                  "url": "https://heasarc.gsfc.nasa.gov/FTP/integral/data/aux/",
+                  "role": "official_aux_root_context",
+                  "allowed_now": "small_html_index_only",
+                  "forbidden_now": "no_fits_no_science_product_download"
+              },
+              {
+                  "route_id": "IDX-ROOT",
+                  "url": "https://heasarc.gsfc.nasa.gov/FTP/integral/data/idx/",
+                  "role": "official_idx_root_context",
+                  "allowed_now": "small_html_index_only",
+                  "forbidden_now": "no_fits_no_science_product_download"
+              }
+          ]
+
+          path = out / "R13MUG_SCW_ROUTE_SEARCH_PLAN.csv"
+          with path.open("w", newline="", encoding="utf-8") as f:
+              cols = ["route_id", "url", "role", "allowed_now", "forbidden_now"]
+              w = csv.DictWriter(f, fieldnames=cols)
+              w.writeheader()
+              w.writerows(routes)
+
+          target = {
+              "target_context": "R9C_SPI_511_ROUTE_PREPARATION_ONLY",
+              "goal": "Find official SCW metadata route structure, not science values.",
+              "selection_rule": "Use only URL reachability, directory-listing metadata, href names, and route structure. Do not download FITS.",
+              "future_needed": [
+                  "exact UTC interval from locked R9C gate package",
+                  "official SCW metadata query method",
+                  "SCW identifier list by time coverage",
+                  "IC/IDX/CAT/AUX/response exact route lock",
+                  "background and 511 keV line window method lock"
+              ],
+              "science_values_authorized": False
+          }
+          (out / "R13MUG_TARGET_CONTEXT_AND_SELECTION_RULE.json").write_text(json.dumps(target, indent=2), encoding="utf-8")
+          PY
+
+      - name: Metadata-only route checks and href discovery
+        shell: bash
+        run: |
+          set -euo pipefail
+          STAGE="ACIRM_R13MUG_GITHUB_ACTIONS_METADATA_ONLY_SCW_COVERAGE_AND_ROUTE_SELECTION_NO_VALUES"
+          OUT="$GITHUB_WORKSPACE/${STAGE}_OUTPUT"
+          python3 - <<'PY'
+          from pathlib import Path
+          from urllib.parse import urljoin
+          import csv
+          import json
+          import os
+          import re
+          import urllib.request
+
+          root = Path(os.environ["GITHUB_WORKSPACE"])
+          out = root / "ACIRM_R13MUG_GITHUB_ACTIONS_METADATA_ONLY_SCW_COVERAGE_AND_ROUTE_SELECTION_NO_VALUES_OUTPUT"
+          plan_path = out / "R13MUG_SCW_ROUTE_SEARCH_PLAN.csv"
+
+          def small_get(url, timeout=25, max_bytes=500000):
+              req = urllib.request.Request(url, headers={
+                  "User-Agent": "ACIRM-R13MUG-scw-route-metadata-no-values",
+                  "Accept": "text/html,text/plain,*/*"
+              })
+              with urllib.request.urlopen(req, timeout=timeout) as r:
+                  data = r.read(max_bytes + 1)
+                  if len(data) > max_bytes:
+                      data = data[:max_bytes]
+                  text = data.decode("utf-8", errors="replace")
+                  return {
+                      "ok": True,
+                      "status": getattr(r, "status", ""),
+                      "final_url": r.geturl(),
+                      "content_type": r.headers.get("Content-Type", ""),
+                      "chars": len(text),
+                      "text": text,
+                      "error": ""
+                  }
+
+          def hrefs_from_html(text):
+              hrefs = re.findall(r"href=[\"']([^\"']+)[\"']", text, flags=re.I)
+              clean = []
+              for h in hrefs:
+                  if not h or h.startswith("?") or h.startswith("#"):
+                      continue
+                  if h not in clean:
+                      clean.append(h)
+              return clean
+
+          plan_rows = list(csv.DictReader(plan_path.open(encoding="utf-8")))
+          route_rows = []
+          href_rows = []
+
+          for row in plan_rows:
+              url = row["url"]
+              try:
+                  res = small_get(url)
+                  text = res["text"]
+                  low = text.lower()
+                  hrefs = hrefs_from_html(text)
+                  for h in hrefs[:300]:
+                      abs_url = urljoin(url, h)
+                      lname = h.lower()
+                      href_rows.append({
+                          "source_route_id": row["route_id"],
+                          "href": h,
+                          "absolute_url": abs_url,
+                          "looks_directory": h.endswith("/"),
+                          "mentions_scw": "scw" in lname,
+                          "mentions_ic": "ic" in lname,
+                          "mentions_idx": "idx" in lname,
+                          "mentions_cat": "cat" in lname,
+                          "mentions_aux": "aux" in lname,
+                          "mentions_fits_name": ".fits" in lname or ".fit" in lname or ".fits.gz" in lname
+                      })
+                  route_rows.append({
+                      "route_id": row["route_id"],
+                      "url": url,
+                      "tested": True,
+                      "ok": True,
+                      "status": res["status"],
+                      "content_type": res["content_type"],
+                      "chars": res["chars"],
+                      "href_count_limited": len(hrefs[:300]),
+                      "contains_index_terms": "index of" in low or "parent directory" in low or "href" in low,
+                      "contains_fits_name": ".fits" in low or ".fit" in low or ".fits.gz" in low,
+                      "contains_scw_token": "scw" in low,
+                      "error": ""
+                  })
+              except Exception as e:
+                  route_rows.append({
+                      "route_id": row["route_id"],
+                      "url": url,
+                      "tested": True,
+                      "ok": False,
+                      "status": "",
+                      "content_type": "",
+                      "chars": 0,
+                      "href_count_limited": 0,
+                      "contains_index_terms": False,
+                      "contains_fits_name": False,
+                      "contains_scw_token": False,
+                      "error": repr(e)[:500]
+                  })
+
+          with (out / "R13MUG_SCW_ROUTE_REACHABILITY_AND_INDEX_METADATA.csv").open("w", newline="", encoding="utf-8") as f:
+              cols = ["route_id", "url", "tested", "ok", "status", "content_type", "chars", "href_count_limited", "contains_index_terms", "contains_fits_name", "contains_scw_token", "error"]
+              w = csv.DictWriter(f, fieldnames=cols)
+              w.writeheader()
+              w.writerows(route_rows)
+
+          with (out / "R13MUG_SCW_ROUTE_HREF_DISCOVERY_LIMITED.csv").open("w", newline="", encoding="utf-8") as f:
+              cols = ["source_route_id", "href", "absolute_url", "looks_directory", "mentions_scw", "mentions_ic", "mentions_idx", "mentions_cat", "mentions_aux", "mentions_fits_name"]
+              w = csv.DictWriter(f, fieldnames=cols)
+              w.writeheader()
+              w.writerows(href_rows)
+
+          no_values = {
+              "stage": "R13MUG_href_discovery",
+              "downloaded_fits": False,
+              "opened_fits": False,
+              "read_science_values": False,
+              "href_rows": len(href_rows),
+              "route_rows": len(route_rows)
+          }
+          (out / "R13MUG_NO_VALUES_CONFIRMATION.json").write_text(json.dumps(no_values, indent=2), encoding="utf-8")
+          PY
+
+      - name: Probe candidate subdirectories metadata only
+        shell: bash
+        run: |
+          set -euo pipefail
+          STAGE="ACIRM_R13MUG_GITHUB_ACTIONS_METADATA_ONLY_SCW_COVERAGE_AND_ROUTE_SELECTION_NO_VALUES"
+          OUT="$GITHUB_WORKSPACE/${STAGE}_OUTPUT"
+          python3 - <<'PY'
+          from pathlib import Path
+          import csv
+          import json
+          import os
+          import urllib.request
+
+          root = Path(os.environ["GITHUB_WORKSPACE"])
+          out = root / "ACIRM_R13MUG_GITHUB_ACTIONS_METADATA_ONLY_SCW_COVERAGE_AND_ROUTE_SELECTION_NO_VALUES_OUTPUT"
+          href_path = out / "R13MUG_SCW_ROUTE_HREF_DISCOVERY_LIMITED.csv"
+
+          def small_get(url, timeout=20, max_bytes=250000):
+              req = urllib.request.Request(url, headers={
+                  "User-Agent": "ACIRM-R13MUG-scw-subdir-metadata-no-values",
+                  "Accept": "text/html,text/plain,*/*"
+              })
+              with urllib.request.urlopen(req, timeout=timeout) as r:
+                  data = r.read(max_bytes + 1)
+                  if len(data) > max_bytes:
+                      data = data[:max_bytes]
+                  text = data.decode("utf-8", errors="replace")
+                  return {
+                      "ok": True,
+                      "status": getattr(r, "status", ""),
+                      "content_type": r.headers.get("Content-Type", ""),
+                      "chars": len(text),
+                      "text": text,
+                      "error": ""
+                  }
+
+          href_rows = list(csv.DictReader(href_path.open(encoding="utf-8"))) if href_path.exists() else []
+          candidates = []
+          for r in href_rows:
+              if r["source_route_id"] == "SCW-ROOT" and str(r["looks_directory"]).lower() == "true":
+                  h = r["href"]
+                  if h not in ["../", "./"]:
+                      candidates.append(r["absolute_url"])
+              if len(candidates) >= 12:
+                  break
+
+          probe_rows = []
+          for url in candidates:
+              try:
+                  res = small_get(url)
+                  low = res["text"].lower()
+                  probe_rows.append({
+                      "candidate_url": url,
+                      "tested": True,
+                      "ok": True,
+                      "status": res["status"],
+                      "content_type": res["content_type"],
+                      "chars": res["chars"],
+                      "contains_index_terms": "index of" in low or "parent directory" in low or "href" in low,
+                      "contains_fits_name": ".fits" in low or ".fit" in low or ".fits.gz" in low,
+                      "contains_scw_token": "scw" in low,
+                      "error": ""
+                  })
+              except Exception as e:
+                  probe_rows.append({
+                      "candidate_url": url,
+                      "tested": True,
+                      "ok": False,
+                      "status": "",
+                      "content_type": "",
+                      "chars": 0,
+                      "contains_index_terms": False,
+                      "contains_fits_name": False,
+                      "contains_scw_token": False,
+                      "error": repr(e)[:500]
+                  })
+
+          with (out / "R13MUG_SCW_SUBDIRECTORY_PROBE_METADATA_ONLY.csv").open("w", newline="", encoding="utf-8") as f:
+              cols = ["candidate_url", "tested", "ok", "status", "content_type", "chars", "contains_index_terms", "contains_fits_name", "contains_scw_token", "error"]
+              w = csv.DictWriter(f, fieldnames=cols)
+              w.writeheader()
+              w.writerows(probe_rows)
+
+          (out / "R13MUG_SCW_SUBDIRECTORY_PROBE_SUMMARY.json").write_text(json.dumps({
+              "candidate_count": len(candidates),
+              "probe_rows": len(probe_rows),
+              "ok_count": sum(1 for r in probe_rows if r["ok"]),
+              "downloaded_fits": False,
+              "opened_fits": False,
+              "read_science_values": False
+          }, indent=2), encoding="utf-8")
+          PY
+
+      - name: Classify SCW metadata route selection no values
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+          import csv
+          import json
+          import os
+
+          root = Path(os.environ["GITHUB_WORKSPACE"])
+          out = root / "ACIRM_R13MUG_GITHUB_ACTIONS_METADATA_ONLY_SCW_COVERAGE_AND_ROUTE_SELECTION_NO_VALUES_OUTPUT"
+
+          route_path = out / "R13MUG_SCW_ROUTE_REACHABILITY_AND_INDEX_METADATA.csv"
+          href_path = out / "R13MUG_SCW_ROUTE_HREF_DISCOVERY_LIMITED.csv"
+          probe_path = out / "R13MUG_SCW_SUBDIRECTORY_PROBE_METADATA_ONLY.csv"
+
+          routes = list(csv.DictReader(route_path.open(encoding="utf-8"))) if route_path.exists() else []
+          hrefs = list(csv.DictReader(href_path.open(encoding="utf-8"))) if href_path.exists() else []
+          probes = list(csv.DictReader(probe_path.open(encoding="utf-8"))) if probe_path.exists() else []
+
+          scw_root_ok = any(r["route_id"] == "SCW-ROOT" and str(r["ok"]).lower() == "true" for r in routes)
+          scw_href_count = sum(1 for r in hrefs if r["source_route_id"] == "SCW-ROOT")
+          scw_dir_count = sum(1 for r in hrefs if r["source_route_id"] == "SCW-ROOT" and str(r["looks_directory"]).lower() == "true")
+          probe_ok_count = sum(1 for r in probes if str(r["ok"]).lower() == "true")
+          any_fits_names_in_index = any(str(r.get("contains_fits_name")).lower() == "true" for r in routes + probes)
+
+          selected_route = "https://heasarc.gsfc.nasa.gov/FTP/integral/data/scw/" if scw_root_ok else ""
+
+          if scw_root_ok and scw_dir_count > 0 and probe_ok_count > 0:
+              route_decision = "SCW_METADATA_ROUTE_SELECTED_WITH_SUBDIR_PROBE_VALUES_STILL_BLOCKED"
+              next_stage = "R13MUH_METADATA_ONLY_TIME_COVERAGE_QUERY_DESIGN_NO_VALUES"
+          elif scw_root_ok and scw_dir_count > 0:
+              route_decision = "SCW_METADATA_ROUTE_ROOT_SELECTED_SUBDIR_PROBE_WEAK_VALUES_BLOCKED"
+              next_stage = "R13MUH_REPAIR_SUBDIR_PROBE_OR_TIME_COVERAGE_DESIGN_NO_VALUES"
+          elif scw_root_ok:
+              route_decision = "SCW_ROOT_REACHABLE_BUT_DIRECTORY_STRUCTURE_NOT_LOCKED_NO_VALUES"
+              next_stage = "R13MUH_REPAIR_SCW_DIRECTORY_DISCOVERY_NO_VALUES"
+          else:
+              route_decision = "SCW_METADATA_ROUTE_NOT_REACHABLE_NO_VALUES"
+              next_stage = "R13MUH_REPAIR_SCW_ROUTE_URL_OR_ALTERNATIVE_OFFICIAL_INDEX_NO_VALUES"
+
+          decision = {
+              "stage": "ACIRM_R13MUG_GITHUB_ACTIONS_METADATA_ONLY_SCW_COVERAGE_AND_ROUTE_SELECTION_NO_VALUES",
+              "route_decision": route_decision,
+              "next_stage": next_stage,
+              "selected_scw_root_route": selected_route,
+              "scw_root_ok": scw_root_ok,
+              "scw_href_count": scw_href_count,
+              "scw_directory_count": scw_dir_count,
+              "probe_ok_count": probe_ok_count,
+              "fits_names_in_directory_listing_only": any_fits_names_in_index,
+              "downloaded_fits": False,
+              "opened_fits": False,
+              "read_science_values": False,
+              "science_values_authorized": False,
+              "new_values_opened": False,
+              "hard_blockers_before_values": [
+                  "exact_R9C_UTC_interval_not_embedded_in_SCW_query",
+                  "exact_SCW_list_not_locked",
+                  "exact_IC_IDX_CAT_AUX_versions_not_locked",
+                  "exact_SPI_response_IRF_RMF_not_locked",
+                  "background_method_not_locked",
+                  "511_line_window_and_sidebands_not_locked"
+              ],
+              "claim_ceiling": "metadata-only SCW route selection; no SPI/511 values"
+          }
+          (out / "R13MUG_SCW_METADATA_ROUTE_SELECTION_DECISION.json").write_text(json.dumps(decision, indent=2), encoding="utf-8")
+          print(json.dumps(decision, indent=2))
+          PY
+
+      - name: Package results
+        shell: bash
+        run: |
+          set -euo pipefail
+          STAGE="ACIRM_R13MUG_GITHUB_ACTIONS_METADATA_ONLY_SCW_COVERAGE_AND_ROUTE_SELECTION_NO_VALUES"
+          OUT="$GITHUB_WORKSPACE/${STAGE}_OUTPUT"
+          ZIP="$GITHUB_WORKSPACE/${STAGE}_RESULTS.zip"
+          SHA="$ZIP.sha256.txt"
+
+          cat > "$OUT/R13MUG_GO_NO_GO.csv" <<'CSV'
+          question,decision,reason
+          Open SPI/511 science values now?,NO,This stage is metadata-only SCW route selection.
+          Download FITS now?,NO,FITS downloads remain forbidden in this stage.
+          Is SCW route selected?,SEE_DECISION,Read R13MUG_SCW_METADATA_ROUTE_SELECTION_DECISION.json.
+          Can this prove 511 keV or particle production?,NO,No values opened.
+          CSV
+
+          cd "$GITHUB_WORKSPACE"
+          rm -f "$ZIP" "$SHA"
+          zip -r "$ZIP" "$(basename "$OUT")"
+          sha256sum "$ZIP" > "$SHA"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ACIRM_R13MUG_GITHUB_ACTIONS_METADATA_ONLY_SCW_COVERAGE_AND_ROUTE_SELECTION_NO_VALUES_RESULTS
+          path: |
+            ACIRM_R13MUG_GITHUB_ACTIONS_METADATA_ONLY_SCW_COVERAGE_AND_ROUTE_SELECTION_NO_VALUES_RESULTS.zip
+            ACIRM_R13MUG_GITHUB_ACTIONS_METADATA_ONLY_SCW_COVERAGE_AND_ROUTE_SELECTION_NO_VALUES_RESULTS.zip.sha256.txt
+          retention-days: 7
