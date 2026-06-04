@@ -1,0 +1,716 @@
+name: ACIRM R13MPV R2 small artifact final
+
+on:
+  workflow_dispatch:
+
+jobs:
+  one-cell-spi-final-small:
+    runs-on: ubuntu-latest
+    timeout-minutes: 240
+
+    steps:
+      - name: Run R13MPV R2 open data but keep artifact small
+        shell: bash
+        run: |
+          set +e
+          STAGE="ACIRM_R13MPV_R2_SMALL_ARTIFACT_FINAL"
+          OUT="$GITHUB_WORKSPACE/${STAGE}_OUTPUT"
+          mkdir -p "$OUT"
+
+          cat > "$OUT/R13MPV_R2_FIREWALL.json" <<'JSON'
+          {
+            "stage": "ACIRM_R13MPV_R2_SMALL_ARTIFACT_FINAL",
+            "purpose": "Open locked SPI public data products, compute guarded 511/sideband result if safe mapping exists, then remove downloaded FITS data before artifact packaging.",
+            "locked_line_window_keV": [508.0, 514.0],
+            "locked_lower_sideband_keV": [490.0, 500.0],
+            "locked_upper_sideband_keV": [522.0, 532.0],
+            "minimum_detection_candidate_ratio": 1.2,
+            "artifact_policy": "Do not include downloaded FITS products in final artifact.",
+            "claim_ceiling": "guarded diagnostic candidate at most; no proof/discovery/evidence claim"
+          }
+          JSON
+
+          {
+            echo "python_start"
+            python3 --version
+            python3 -m pip --version
+            echo "install_start_utc=$(date -u)"
+            python3 -m pip install --user --no-cache-dir --upgrade numpy astropy
+            echo "install_exit_code=$?"
+            echo "install_end_utc=$(date -u)"
+            python3 - <<'PYCHECK'
+          import sys, site
+          site.addsitedir(site.getusersitepackages())
+          import numpy, astropy
+          print("IMPORT_CHECK_OK", numpy.__version__, astropy.__version__)
+          PYCHECK
+            echo "import_check_exit_code=$?"
+          } > "$OUT/R13MPV_R2_DEPENDENCY_INSTALL_AND_IMPORT_CHECK.log" 2>&1
+
+          cat > "$OUT/controller.py" <<'PYCODE'
+          from pathlib import Path
+          from urllib.request import Request, urlopen, urlretrieve
+          from urllib.parse import urljoin
+          import csv, hashlib, json, math, os, re, subprocess, sys, time, site
+
+          STAGE = "ACIRM_R13MPV_R2_SMALL_ARTIFACT_FINAL"
+          out = Path(os.environ.get("GITHUB_WORKSPACE", ".")) / (STAGE + "_OUTPUT")
+          out.mkdir(parents=True, exist_ok=True)
+
+          site.addsitedir(site.getusersitepackages())
+
+          MIN_RATIO = 1.2
+          TARGET_SCW_IDS = [
+              "250400090010", "250400020010", "250400080010", "250400030010",
+              "250400070021", "250400040010", "250400060010", "250400050010"
+          ]
+          HEASARC_BASE = "https://heasarc.gsfc.nasa.gov/FTP/integral/data/scw/2504"
+
+          def write_json(name, obj):
+              (out / name).write_text(json.dumps(obj, indent=2, ensure_ascii=False), encoding="utf-8")
+
+          def write_csv(name, rows, columns):
+              with (out / name).open("w", newline="", encoding="utf-8") as f:
+                  w = csv.DictWriter(f, fieldnames=columns)
+                  w.writeheader()
+                  for r in rows:
+                      w.writerow({c: r.get(c, "") for c in columns})
+
+          def sha256_file(path):
+              h = hashlib.sha256()
+              with open(path, "rb") as f:
+                  for b in iter(lambda: f.read(1024 * 1024), b""):
+                      h.update(b)
+              return h.hexdigest()
+
+          def run_cmd(cmd, log_name, timeout=600):
+              t0 = time.time()
+              log_path = out / log_name
+              try:
+                  p = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=timeout)
+                  log_path.write_text(p.stdout, encoding="utf-8", errors="replace")
+                  return {"exit_code": p.returncode, "seconds": round(time.time() - t0, 2), "tail": p.stdout[-3000:]}
+              except subprocess.TimeoutExpired as e:
+                  txt = (e.stdout or "") + "\nTIMEOUT\n"
+                  log_path.write_text(txt, encoding="utf-8", errors="replace")
+                  return {"exit_code": 124, "seconds": round(time.time() - t0, 2), "tail": txt[-3000:]}
+
+          def final_stop(decision, next_stage, **kwargs):
+              obj = {
+                  "stage": STAGE,
+                  "decision": decision,
+                  "next_stage": next_stage,
+                  "claim_ceiling": "guarded diagnostic candidate at most; no proof/discovery/evidence claim"
+              }
+              obj.update(kwargs)
+              write_json("R13MPV_R2_FINAL_DECISION.json", obj)
+              print(json.dumps(obj, indent=2, ensure_ascii=False))
+              return obj
+
+          write_json("R13MPV_R2_LOCKED_CONTEXT.json", {
+              "target_scw_ids": TARGET_SCW_IDS,
+              "heasarc_base": HEASARC_BASE,
+              "locked_line_window_keV": [508.0, 514.0],
+              "locked_lower_sideband_keV": [490.0, 500.0],
+              "locked_upper_sideband_keV": [522.0, 532.0],
+              "minimum_detection_candidate_ratio": MIN_RATIO,
+              "no_window_retuning": True,
+              "small_artifact_mode": True
+          })
+
+          run_errors = []
+
+          try:
+              import numpy as np
+              from astropy.io import fits
+              import astropy
+              dependency_status = {
+                  "numpy_version": np.__version__,
+                  "astropy_version": astropy.__version__,
+                  "astropy_import_ok": True
+              }
+          except Exception as e:
+              dependency_status = {"astropy_import_ok": False, "error": repr(e)}
+              run_errors.append("astropy_numpy_import_error: " + repr(e))
+              final_stop(
+                  "FINAL_TECHNICAL_BLOCK_ASTROPY_IMPORT_FAILED_AFTER_R2_FIX",
+                  "STOP_OR_USE_EXTERNAL_OSA_RUNNER",
+                  dependency_status=dependency_status,
+                  opened_fits_count=0,
+                  safe_energy_mapping_found=False,
+                  diagnostic_value_rows=0,
+                  detection_candidate=False,
+                  run_errors=run_errors
+              )
+              sys.exit(0)
+
+          write_json("R13MPV_R2_DEPENDENCY_STATUS.json", dependency_status)
+
+          # OSA toolpath check only; no OSA science run here.
+          osa_image = "integralsw/osa:latest"
+          osa_pull = run_cmd(["docker", "pull", osa_image], "R13MPV_R2_DOCKER_PULL_OSA_LATEST.log", timeout=1200)
+
+          osa_script = out / "osa_toolpath_check.sh"
+          osa_lines = [
+              "#!/usr/bin/env bash",
+              "set +e",
+              "export PATH=/opt/osa/bin:$PATH",
+              "LIBGUI=$(find /opt /usr -name libGui.so 2>/dev/null | head -1)",
+              "if [ -n \"$LIBGUI\" ]; then export LD_LIBRARY_PATH=$(dirname \"$LIBGUI\"):/opt/osa/lib:/opt/osa/lib64:$LD_LIBRARY_PATH; else export LD_LIBRARY_PATH=/opt/osa/lib:/opt/osa/lib64:$LD_LIBRARY_PATH; fi",
+              "mkdir -p /tmp/pfiles",
+              "export PFILES=/tmp/pfiles",
+              "echo OSA_CONTAINER_RUNTIME_OK",
+              "for t in spi_science_analysis og_create dal_list spiros; do if command -v \"$t\" >/dev/null 2>&1; then echo TOOL_FOUND|$t|$(command -v \"$t\"); elif [ -x \"/opt/osa/bin/$t\" ]; then echo TOOL_FOUND_ABSPATH|$t|/opt/osa/bin/$t; else echo TOOL_MISSING|$t; fi; done"
+          ]
+          osa_script.write_text("\n".join(osa_lines) + "\n", encoding="utf-8")
+          os.chmod(osa_script, 0o755)
+
+          osa_runtime = {
+              "image": osa_image,
+              "pull_exit_code": osa_pull["exit_code"],
+              "container_runtime_ok": False,
+              "spi_tool_ok": False,
+              "og_create_ok": False,
+              "dal_list_ok": False
+          }
+
+          if osa_pull["exit_code"] == 0:
+              run_cmd(
+                  ["docker", "run", "--rm", "-v", f"{out}:/out", "--entrypoint", "/bin/bash", osa_image, "/out/osa_toolpath_check.sh"],
+                  "R13MPV_R2_OSA_TOOLPATH_CHECK.log",
+                  timeout=300
+              )
+              log_text = (out / "R13MPV_R2_OSA_TOOLPATH_CHECK.log").read_text(encoding="utf-8", errors="replace")
+              osa_runtime["container_runtime_ok"] = "OSA_CONTAINER_RUNTIME_OK" in log_text
+              osa_runtime["spi_tool_ok"] = ("TOOL_FOUND|spi_science_analysis|" in log_text) or ("TOOL_FOUND_ABSPATH|spi_science_analysis|" in log_text)
+              osa_runtime["og_create_ok"] = ("TOOL_FOUND|og_create|" in log_text) or ("TOOL_FOUND_ABSPATH|og_create|" in log_text)
+              osa_runtime["dal_list_ok"] = ("TOOL_FOUND|dal_list|" in log_text) or ("TOOL_FOUND_ABSPATH|dal_list|" in log_text)
+
+          write_json("R13MPV_R2_OSA_TOOLPATH_STATUS.json", osa_runtime)
+
+          def url_head(url, timeout=30):
+              try:
+                  req = Request(url, method="HEAD", headers={"User-Agent": "ACIRM-R13MPV-R2-small"})
+                  with urlopen(req, timeout=timeout) as r:
+                      length = r.headers.get("Content-Length", "")
+                      return {
+                          "ok": True,
+                          "status": getattr(r, "status", ""),
+                          "content_type": r.headers.get("Content-Type", ""),
+                          "content_length": int(length) if str(length).isdigit() else None,
+                          "final_url": r.geturl(),
+                          "error": ""
+                      }
+              except Exception as e:
+                  return {"ok": False, "status": "", "content_type": "", "content_length": None, "final_url": "", "error": repr(e)[:500]}
+
+          def fetch_index(url, timeout=30, max_bytes=1500000):
+              try:
+                  req = Request(url, headers={"User-Agent": "ACIRM-R13MPV-R2-small", "Accept": "text/html,text/plain,*/*"})
+                  with urlopen(req, timeout=timeout) as r:
+                      data = r.read(max_bytes)
+                      return True, r.geturl(), data.decode("utf-8", errors="replace"), ""
+              except Exception as e:
+                  return False, "", "", repr(e)[:500]
+
+          def extract_hrefs(html):
+              rows = []
+              for m in re.finditer(r"<a\s+[^>]*href=[\"']([^\"']+)[\"'][^>]*>(.*?)</a>", html, flags=re.I | re.S):
+                  href = m.group(1).strip()
+                  label = re.sub(r"<[^>]+>", "", m.group(2))
+                  label = re.sub(r"\s+", " ", label).strip()
+                  rows.append((href, label))
+              if not rows:
+                  for m in re.finditer(r"href=[\"']([^\"']+)[\"']", html, flags=re.I):
+                      rows.append((m.group(1).strip(), ""))
+              return rows
+
+          def candidate_score(name):
+              s = name.lower()
+              score = 0
+              if "energy_bound" in s or "energ" in s:
+                  score += 100
+              if "evts_det_spec" in s or "det_spec" in s:
+                  score += 100
+              if "spectrum" in s or "spectra" in s or "spec" in s:
+                  score += 40
+              if "spi" in s:
+                  score += 20
+              if s.endswith(".fits") or s.endswith(".fits.gz"):
+                  score += 10
+              return score
+
+          discovered_rows = []
+          product_candidates = []
+          explicit_names = [
+              "energy_boundaries.fits",
+              "energy_boundaries.fits.gz",
+              "evts_det_spec.fits",
+              "evts_det_spec.fits.gz",
+              "spi_spectra.fits.gz",
+              "spi_spectra.fits"
+          ]
+
+          for scw in TARGET_SCW_IDS:
+              base_url = f"{HEASARC_BASE}/{scw}.001/"
+              ok, final_index_url, html, err = fetch_index(base_url)
+              hrefs = extract_hrefs(html) if ok else []
+              discovered_rows.append({
+                  "scw_id": scw,
+                  "directory_url": base_url,
+                  "index_ok": ok,
+                  "final_index_url": final_index_url,
+                  "index_error": err,
+                  "href_count": len(hrefs)
+              })
+              if ok:
+                  for href, label in hrefs:
+                      abs_url = urljoin(final_index_url or base_url, href)
+                      fname = Path(href).name
+                      if fname and (fname.endswith(".fits") or fname.endswith(".fits.gz")):
+                          score = candidate_score(fname)
+                          if score > 0:
+                              product_candidates.append({
+                                  "source": "directory_index",
+                                  "scw_id": scw,
+                                  "filename": fname,
+                                  "url": abs_url,
+                                  "score": score
+                              })
+              for fname in explicit_names:
+                  product_candidates.append({
+                      "source": "explicit_locked_name",
+                      "scw_id": scw,
+                      "filename": fname,
+                      "url": base_url + fname,
+                      "score": candidate_score(fname)
+                  })
+
+          seen = set()
+          unique_candidates = []
+          for r in sorted(product_candidates, key=lambda x: (-x["score"], x["scw_id"], x["filename"])):
+              key = (r["scw_id"], r["url"])
+              if key not in seen:
+                  seen.add(key)
+                  unique_candidates.append(r)
+
+          write_csv("R13MPV_R2_SCW_DIRECTORY_DISCOVERY.csv", discovered_rows, ["scw_id", "directory_url", "index_ok", "final_index_url", "index_error", "href_count"])
+
+          probe_rows = []
+          download_rows = []
+          downloaded_products = []
+          max_bytes = 350 * 1024 * 1024
+          max_downloads = 80
+
+          data_dir = out / "downloaded_products"
+          data_dir.mkdir(exist_ok=True)
+
+          for r in unique_candidates[:200]:
+              h = url_head(r["url"])
+              probe = dict(r)
+              probe.update({
+                  "head_ok": h["ok"],
+                  "head_status": h["status"],
+                  "content_type": h["content_type"],
+                  "content_length": h["content_length"],
+                  "allowed_by_size": bool(h["ok"] and (h["content_length"] is None or h["content_length"] <= max_bytes)),
+                  "error": h["error"]
+              })
+              probe_rows.append(probe)
+
+              if not probe["allowed_by_size"] or len(downloaded_products) >= max_downloads:
+                  continue
+
+              local_name = f"{r['scw_id']}__{r['filename']}"
+              local_path = data_dir / local_name
+
+              try:
+                  urlretrieve(r["url"], local_path)
+                  file_sha = sha256_file(local_path)
+                  downloaded_products.append({
+                      "scw_id": r["scw_id"],
+                      "filename": r["filename"],
+                      "url": r["url"],
+                      "local_path": str(local_path),
+                      "size_bytes": local_path.stat().st_size,
+                      "sha256": file_sha,
+                      "score": r["score"]
+                  })
+                  download_rows.append({
+                      "scw_id": r["scw_id"],
+                      "filename": r["filename"],
+                      "url": r["url"],
+                      "download_ok": True,
+                      "local_name": local_name,
+                      "size_bytes": local_path.stat().st_size,
+                      "sha256": file_sha,
+                      "error": ""
+                  })
+              except Exception as e:
+                  download_rows.append({
+                      "scw_id": r["scw_id"],
+                      "filename": r["filename"],
+                      "url": r["url"],
+                      "download_ok": False,
+                      "local_name": local_name,
+                      "size_bytes": "",
+                      "sha256": "",
+                      "error": repr(e)[:500]
+                  })
+
+          write_csv("R13MPV_R2_PRODUCT_CANDIDATE_HEAD_PROBE.csv", probe_rows, ["source", "scw_id", "filename", "url", "score", "head_ok", "head_status", "content_type", "content_length", "allowed_by_size", "error"])
+          write_csv("R13MPV_R2_PRODUCT_DOWNLOAD_AUDIT.csv", download_rows, ["scw_id", "filename", "url", "download_ok", "local_name", "size_bytes", "sha256", "error"])
+
+          # Separate manifest so the big FITS files can be deleted before artifact packaging.
+          write_csv("R13MPV_R2_DOWNLOADED_DATA_MANIFEST_NO_DATA_FILES.csv", downloaded_products, ["scw_id", "filename", "url", "local_path", "size_bytes", "sha256", "score"])
+
+          def fits_profile_and_find(path, scw_id, filename):
+              rows, arrays, energy_candidates = [], [], []
+              try:
+                  with fits.open(path, memmap=False) as hdul:
+                      for hdu_i, hdu in enumerate(hdul):
+                          cols = []
+                          data = getattr(hdu, "data", None)
+                          if hasattr(hdu, "columns") and hdu.columns is not None:
+                              try:
+                                  cols = list(hdu.columns.names)
+                              except Exception:
+                                  cols = []
+                          shape, nrows = "", ""
+                          try:
+                              if data is not None:
+                                  shape = str(np.asarray(data).shape)
+                                  nrows = len(data)
+                          except Exception:
+                              pass
+
+                          rows.append({
+                              "scw_id": scw_id,
+                              "filename": filename,
+                              "hdu_index": hdu_i,
+                              "hdu_name": getattr(hdu, "name", ""),
+                              "hdu_class": hdu.__class__.__name__,
+                              "columns_json": json.dumps(cols),
+                              "shape": shape,
+                              "n_rows": nrows
+                          })
+
+                          if data is None:
+                              continue
+
+                          col_upper = {str(c).upper(): c for c in cols}
+                          lo_col = None
+                          hi_col = None
+
+                          for k in ["E_MIN", "E_LO", "ENERG_LO", "ENERGY_LO", "CHANNEL_E_MIN", "EMIN", "E_LOW", "EBOUND_LO"]:
+                              if k in col_upper:
+                                  lo_col = col_upper[k]
+                                  break
+                          for k in ["E_MAX", "E_HI", "ENERG_HI", "ENERGY_HI", "CHANNEL_E_MAX", "EMAX", "E_HIGH", "EBOUND_HI"]:
+                              if k in col_upper:
+                                  hi_col = col_upper[k]
+                                  break
+
+                          if lo_col and hi_col:
+                              try:
+                                  emin = np.asarray(data[lo_col], dtype=float).ravel()
+                                  emax = np.asarray(data[hi_col], dtype=float).ravel()
+                                  if len(emin) == len(emax) and len(emin) > 0 and np.nanmin(emin) <= 508.0 and np.nanmax(emax) >= 514.0:
+                                      energy_candidates.append({
+                                          "scw_id": scw_id,
+                                          "filename": filename,
+                                          "hdu_index": hdu_i,
+                                          "hdu_name": getattr(hdu, "name", ""),
+                                          "method": "table_columns",
+                                          "lo_col": lo_col,
+                                          "hi_col": hi_col,
+                                          "emin": emin,
+                                          "emax": emax
+                                      })
+                              except Exception:
+                                  pass
+
+                          if cols:
+                              for col in cols:
+                                  try:
+                                      arr = np.asarray(data[col], dtype=float)
+                                      if arr.size > 0:
+                                          arrays.append({
+                                              "scw_id": scw_id,
+                                              "filename": filename,
+                                              "hdu_index": hdu_i,
+                                              "hdu_name": getattr(hdu, "name", ""),
+                                              "array_name": col,
+                                              "array": arr
+                                          })
+                                  except Exception:
+                                      pass
+                          else:
+                              try:
+                                  arr = np.asarray(data, dtype=float)
+                                  if arr.size > 0:
+                                      arrays.append({
+                                          "scw_id": scw_id,
+                                          "filename": filename,
+                                          "hdu_index": hdu_i,
+                                          "hdu_name": getattr(hdu, "name", ""),
+                                          "array_name": "IMAGE_OR_PRIMARY_ARRAY",
+                                          "array": arr
+                                      })
+                              except Exception:
+                                  pass
+              except Exception as e:
+                  run_errors.append(f"fits_open_error {filename} {scw_id}: {repr(e)}")
+              return rows, arrays, energy_candidates
+
+          fits_rows = []
+          all_arrays = []
+          all_energy_candidates = []
+          opened_fits_count = 0
+
+          for item in downloaded_products:
+              p = Path(item["local_path"])
+              rows, arrays, ecands = fits_profile_and_find(p, item["scw_id"], item["filename"])
+              if rows:
+                  opened_fits_count += 1
+              fits_rows.extend(rows)
+              all_arrays.extend(arrays)
+              all_energy_candidates.extend(ecands)
+
+          write_csv("R13MPV_R2_FITS_OPEN_PROFILE.csv", fits_rows, ["scw_id", "filename", "hdu_index", "hdu_name", "hdu_class", "columns_json", "shape", "n_rows"])
+
+          selected_energy = None
+          for e in all_energy_candidates:
+              emin, emax = e["emin"], e["emax"]
+              line_idx = np.where((emax > 508.0) & (emin < 514.0))[0]
+              lower_idx = np.where((emax > 490.0) & (emin < 500.0))[0]
+              upper_idx = np.where((emax > 522.0) & (emin < 532.0))[0]
+              if len(line_idx) > 0 and len(lower_idx) > 0 and len(upper_idx) > 0:
+                  selected_energy = e
+                  break
+
+          energy_profile_rows = []
+          readout_rows = []
+          safe_energy_mapping_found = False
+
+          if selected_energy is not None:
+              emin, emax = selected_energy["emin"], selected_energy["emax"]
+              safe_energy_mapping_found = True
+
+              line_idx = np.where((emax > 508.0) & (emin < 514.0))[0]
+              lower_idx = np.where((emax > 490.0) & (emin < 500.0))[0]
+              upper_idx = np.where((emax > 522.0) & (emin < 532.0))[0]
+
+              line_set = set(map(int, line_idx))
+              lower_set = set(map(int, lower_idx))
+              upper_set = set(map(int, upper_idx))
+
+              for i in range(len(emin)):
+                  if i < 10 or (emax[i] > 480.0 and emin[i] < 540.0):
+                      energy_profile_rows.append({
+                          "bin_index": i,
+                          "emin_keV": float(emin[i]),
+                          "emax_keV": float(emax[i]),
+                          "overlap_line": bool(i in line_set),
+                          "overlap_lower": bool(i in lower_set),
+                          "overlap_upper": bool(i in upper_set)
+                      })
+
+              for a in all_arrays:
+                  arr = a["array"]
+                  if arr.size == 0:
+                      continue
+
+                  possible_axes = [ax for ax, dim in enumerate(arr.shape) if dim == len(emin)]
+                  if not possible_axes:
+                      continue
+
+                  energy_axis = possible_axes[-1]
+
+                  try:
+                      line_val = float(np.nansum(np.take(arr, line_idx, axis=energy_axis)))
+                      lower_val = float(np.nansum(np.take(arr, lower_idx, axis=energy_axis)))
+                      upper_val = float(np.nansum(np.take(arr, upper_idx, axis=energy_axis)))
+                      side_mean = 0.5 * (lower_val + upper_val)
+                      ratio = line_val / side_mean if side_mean not in [0, None] and not math.isnan(side_mean) else None
+                      target_scoped = a["scw_id"] in TARGET_SCW_IDS
+
+                      readout_rows.append({
+                          "scw_id": a["scw_id"],
+                          "filename": a["filename"],
+                          "hdu_index": a["hdu_index"],
+                          "hdu_name": a["hdu_name"],
+                          "array_name": a["array_name"],
+                          "array_shape": str(arr.shape),
+                          "energy_axis": energy_axis,
+                          "line_508_514_value": line_val,
+                          "line_bin_count": len(line_idx),
+                          "lower_490_500_value": lower_val,
+                          "lower_bin_count": len(lower_idx),
+                          "upper_522_532_value": upper_val,
+                          "upper_bin_count": len(upper_idx),
+                          "sideband_mean": side_mean,
+                          "line_to_sideband_mean_ratio": ratio,
+                          "target_scoped": target_scoped,
+                          "claim": "NO_CLAIM_NUMERIC_GUARDED_READOUT_ONLY"
+                      })
+                  except Exception as e:
+                      run_errors.append("readout_error: " + repr(e)[:500])
+
+          write_csv("R13MPV_R2_ENERGY_BOUNDARY_PROFILE_AROUND_511.csv", energy_profile_rows, ["bin_index", "emin_keV", "emax_keV", "overlap_line", "overlap_lower", "overlap_upper"])
+
+          if not readout_rows:
+              readout_rows_out = [{
+                  "scw_id": "",
+                  "filename": "",
+                  "hdu_index": "",
+                  "hdu_name": "",
+                  "array_name": "",
+                  "array_shape": "",
+                  "energy_axis": "",
+                  "line_508_514_value": "",
+                  "line_bin_count": "",
+                  "lower_490_500_value": "",
+                  "lower_bin_count": "",
+                  "upper_522_532_value": "",
+                  "upper_bin_count": "",
+                  "sideband_mean": "",
+                  "line_to_sideband_mean_ratio": "",
+                  "target_scoped": "",
+                  "claim": "NO_SAFE_READOUT_EXTRACTED"
+              }]
+          else:
+              readout_rows_out = readout_rows
+
+          write_csv(
+              "R13MPV_R2_GUARDED_511_READOUT_VALUES.csv",
+              readout_rows_out,
+              ["scw_id", "filename", "hdu_index", "hdu_name", "array_name", "array_shape", "energy_axis",
+               "line_508_514_value", "line_bin_count", "lower_490_500_value", "lower_bin_count",
+               "upper_522_532_value", "upper_bin_count", "sideband_mean",
+               "line_to_sideband_mean_ratio", "target_scoped", "claim"]
+          )
+
+          target_rows = [r for r in readout_rows if r.get("target_scoped")]
+
+          if target_rows:
+              line_sum = sum(float(r["line_508_514_value"]) for r in target_rows if r["line_508_514_value"] is not None)
+              lower_sum = sum(float(r["lower_490_500_value"]) for r in target_rows if r["lower_490_500_value"] is not None)
+              upper_sum = sum(float(r["upper_522_532_value"]) for r in target_rows if r["upper_522_532_value"] is not None)
+              side_mean = 0.5 * (lower_sum + upper_sum)
+              ratio = line_sum / side_mean if side_mean not in [0, None] and not math.isnan(side_mean) else None
+          else:
+              line_sum = lower_sum = upper_sum = side_mean = ratio = None
+
+          detection_candidate = bool(
+              target_rows and
+              safe_energy_mapping_found and
+              ratio is not None and
+              ratio >= MIN_RATIO
+          )
+
+          summary = {
+              "downloaded_products": len(downloaded_products),
+              "opened_fits_count": opened_fits_count,
+              "safe_energy_mapping_found": safe_energy_mapping_found,
+              "energy_boundary_source": {
+                  "scw_id": selected_energy["scw_id"],
+                  "filename": selected_energy["filename"],
+                  "hdu_index": selected_energy["hdu_index"],
+                  "method": selected_energy["method"]
+              } if selected_energy is not None else {},
+              "readout_rows": len(readout_rows),
+              "target_scoped_readout_rows": len(target_rows),
+              "target_line_sum": line_sum,
+              "target_lower_sum": lower_sum,
+              "target_upper_sum": upper_sum,
+              "target_sideband_mean": side_mean,
+              "target_line_to_sideband_ratio": ratio,
+              "minimum_detection_candidate_ratio": MIN_RATIO,
+              "detection_candidate": detection_candidate,
+              "small_artifact_mode": True,
+              "downloaded_data_files_removed_before_packaging": True
+          }
+
+          write_json("R13MPV_R2_GUARDED_NUMERIC_SUMMARY.json", summary)
+
+          if detection_candidate:
+              decision = "GUARDED_511_TARGET_FILTERED_DETECTION_CANDIDATE"
+              next_stage = "EXTERNAL_REPLICATION_OR_OFFTIME_NULLS_REQUIRED_BEFORE_EVIDENCE_CLAIM"
+          elif safe_energy_mapping_found and target_rows:
+              decision = "NO_GUARDED_511_TARGET_FILTERED_DETECTION_UNDER_LOCKED_CONDITIONS"
+              next_stage = "STOP_OR_EXTERNAL_REPLICATION_WITH_SAME_LOCKED_RULES"
+          elif opened_fits_count > 0:
+              decision = "NO_SAFE_511_TARGET_FILTERED_DETECTION_CAN_BE_CLAIMED_FROM_OPENED_PRODUCTS"
+              next_stage = "STOP_UNLESS_OFFICIAL_OSA_OBSGROUP_CAN_GENERATE_ENERGY_BOUNDARIES"
+          else:
+              decision = "FINAL_TECHNICAL_BLOCK_SPI_DATA_OPEN_FAILED"
+              next_stage = "STOP_OR_EXTERNAL_OSA_RUNNER_REQUIRED"
+
+          final_stop(
+              decision,
+              next_stage,
+              osa_runtime=osa_runtime,
+              target_scw_ids=TARGET_SCW_IDS,
+              downloaded_products=len(downloaded_products),
+              opened_fits_count=opened_fits_count,
+              safe_energy_mapping_found=safe_energy_mapping_found,
+              target_scoped_readout_rows=len(target_rows),
+              diagnostic_value_rows=len(readout_rows),
+              numeric_summary=summary,
+              detection_candidate=detection_candidate,
+              downloads_science_data=True,
+              opens_fits=opened_fits_count > 0,
+              reads_science_values=bool(readout_rows),
+              small_artifact_mode=True,
+              run_errors_count=len(run_errors),
+              run_errors=run_errors
+          )
+          PYCODE
+
+          python3 "$OUT/controller.py" > "$OUT/R13MPV_R2_CONTROLLER_STDOUT.txt" 2> "$OUT/R13MPV_R2_CONTROLLER_STDERR.txt"
+          CODE=$?
+          echo "controller_exit_code=$CODE" > "$OUT/R13MPV_R2_STEP_STATUS.log"
+
+          if [ ! -f "$OUT/R13MPV_R2_FINAL_DECISION.json" ]; then
+            cat > "$OUT/R13MPV_R2_FINAL_DECISION.json" <<'JSON'
+          {
+            "stage": "ACIRM_R13MPV_R2_SMALL_ARTIFACT_FINAL",
+            "decision": "CONTROLLER_FAILED_BEFORE_FINAL_DECISION",
+            "next_stage": "STOP_REPAIR_FROM_STDOUT_STDERR",
+            "claim_ceiling": "no reliable final result"
+          }
+          JSON
+          fi
+
+          cat > "$OUT/R13MPV_R2_GO_NO_GO.csv" <<'CSV'
+          question,decision,reason
+          Does R13MPV-R2 open data?,YES,It attempts to download and open locked SPI public products only.
+          Does R13MPV-R2 include downloaded FITS data in artifact?,NO,downloaded_products is removed before ZIP packaging.
+          Does R13MPV-R2 change energy windows?,NO,Windows are locked at 508-514, 490-500, 522-532 keV.
+          Can R13MPV-R2 announce detection without safe energy mapping?,NO,Energy-boundary mapping is mandatory.
+          Can R13MPV-R2 announce target detection without target-scoped products?,NO,Target-scoped readout is mandatory.
+          Can R13MPV-R2 claim proof/discovery/evidence?,NO,At most guarded detection candidate requiring replication/nulls.
+          CSV
+
+          cd "$GITHUB_WORKSPACE"
+          ZIP="$GITHUB_WORKSPACE/${STAGE}_RESULTS.zip"
+          SHA="$ZIP.sha256.txt"
+          rm -f "$ZIP" "$SHA"
+
+          # مهم جدًا: حذف ملفات البيانات الكبيرة بعد قراءتها وقبل رفع artifact.
+          rm -rf "$OUT/downloaded_products"
+
+          zip -r "$ZIP" "$(basename "$OUT")"
+          sha256sum "$ZIP" > "$SHA"
+          exit 0
+
+      - name: Upload artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ACIRM_R13MPV_R2_SMALL_ARTIFACT_FINAL_RESULTS
+          path: |
+            ACIRM_R13MPV_R2_SMALL_ARTIFACT_FINAL_RESULTS.zip
+            ACIRM_R13MPV_R2_SMALL_ARTIFACT_FINAL_RESULTS.zip.sha256.txt
+          retention-days: 7
