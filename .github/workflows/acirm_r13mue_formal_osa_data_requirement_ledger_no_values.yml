@@ -1,0 +1,352 @@
+name: ACIRM R13MUE formal OSA data requirement ledger no values
+
+on:
+  workflow_dispatch:
+
+jobs:
+  requirement-ledger:
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Lock no-values scope
+        shell: bash
+        run: |
+          set -euo pipefail
+          STAGE="ACIRM_R13MUE_GITHUB_ACTIONS_FORMAL_OSA_DATA_REQUIREMENT_LEDGER_NO_VALUES"
+          OUT="$GITHUB_WORKSPACE/${STAGE}_OUTPUT"
+          mkdir -p "$OUT"
+          cat > "$OUT/R13MUE_ROUTE_LOCK.json" <<'JSON'
+          {
+            "stage": "ACIRM_R13MUE_GITHUB_ACTIONS_FORMAL_OSA_DATA_REQUIREMENT_LEDGER_NO_VALUES",
+            "opens_science_values": false,
+            "downloads_science_products": false,
+            "downloads_fits": false,
+            "reads_fits_tables": false,
+            "purpose": "Build a formal OSA/SPI data requirement ledger before any values",
+            "forbidden": [
+              "SPI spectra",
+              "SPI images",
+              "511 keV flux/count/intensity values",
+              "FITS science product opening",
+              "FITS table reading",
+              "science-window value extraction",
+              "particle-production claim"
+            ],
+            "claim_ceiling": "formal OSA data requirement ledger only"
+          }
+          JSON
+
+      - name: System info
+        shell: bash
+        run: |
+          set -euo pipefail
+          STAGE="ACIRM_R13MUE_GITHUB_ACTIONS_FORMAL_OSA_DATA_REQUIREMENT_LEDGER_NO_VALUES"
+          OUT="$GITHUB_WORKSPACE/${STAGE}_OUTPUT"
+          {
+            echo "date_utc=$(date -u)"
+            echo "runner_os=$RUNNER_OS"
+            echo "runner_arch=$RUNNER_ARCH"
+            echo "kernel=$(uname -a)"
+            docker --version || true
+            df -h
+          } > "$OUT/R13MUE_SYSTEM_INFO.txt"
+
+      - name: Free disk space safely
+        shell: bash
+        run: |
+          set -euo pipefail
+          STAGE="ACIRM_R13MUE_GITHUB_ACTIONS_FORMAL_OSA_DATA_REQUIREMENT_LEDGER_NO_VALUES"
+          OUT="$GITHUB_WORKSPACE/${STAGE}_OUTPUT"
+          {
+            echo "Before cleanup:"
+            df -h
+          } > "$OUT/R13MUE_DISK_CLEANUP_LOG.txt"
+
+          sudo rm -rf /usr/share/dotnet || true
+          sudo rm -rf /usr/local/lib/android || true
+          sudo rm -rf /opt/ghc || true
+          sudo rm -rf /usr/local/.ghcup || true
+          docker system prune -af || true
+
+          {
+            echo "After cleanup:"
+            df -h
+          } >> "$OUT/R13MUE_DISK_CLEANUP_LOG.txt"
+
+      - name: Pull official OSA Docker image
+        shell: bash
+        timeout-minutes: 90
+        run: |
+          set -euo pipefail
+          STAGE="ACIRM_R13MUE_GITHUB_ACTIONS_FORMAL_OSA_DATA_REQUIREMENT_LEDGER_NO_VALUES"
+          OUT="$GITHUB_WORKSPACE/${STAGE}_OUTPUT"
+          OSA_IMAGE="integralsw/osa:11.2-2-g667521a3-20220403-190332-refcat-43.0-OSA11.0-66-g149047e"
+          echo "$OSA_IMAGE" > "$OUT/R13MUE_OSA_IMAGE_USED.txt"
+          docker pull "$OSA_IMAGE" 2>&1 | tee "$OUT/R13MUE_DOCKER_PULL_OSA.log"
+
+      - name: Inspect OSA docs commands and route metadata no values
+        shell: bash
+        run: |
+          set -euo pipefail
+          STAGE="ACIRM_R13MUE_GITHUB_ACTIONS_FORMAL_OSA_DATA_REQUIREMENT_LEDGER_NO_VALUES"
+          OUT="$GITHUB_WORKSPACE/${STAGE}_OUTPUT"
+          OSA_IMAGE="$(cat "$OUT/R13MUE_OSA_IMAGE_USED.txt")"
+
+          docker run --rm "$OSA_IMAGE" /bin/bash -lc '
+          set +e
+          echo ACIRM_R13MUE_INSPECT_START
+          echo "NO_FITS_OPENING_NO_SCIENCE_VALUES"
+
+          echo "ENVIRONMENT_BEGIN"
+          env | sort | egrep "OSA|ISDC|REP|HEADAS|COMMONLOG|CURRENT|DAL|SPI|IC|IDX|CAT|AUX|SCW|RESP|IRF|RMF" || true
+          echo "ENVIRONMENT_END"
+
+          echo "COMMAND_PATHS_BEGIN"
+          which spi_science_analysis || true
+          which og_create || true
+          which dal_list || true
+          which dal_verify || true
+          which idx_find || true
+          which cat_extract || true
+          echo "COMMAND_PATHS_END"
+
+          echo "COMMAND_HELP_BEGIN"
+          for cmd in spi_science_analysis og_create dal_list dal_verify idx_find cat_extract; do
+            echo "### HELP_FOR_${cmd}"
+            if command -v "$cmd" >/dev/null 2>&1; then
+              "$cmd" --help 2>&1 | head -200 || true
+              "$cmd" -h 2>&1 | head -200 || true
+            else
+              echo "MISSING_${cmd}"
+            fi
+          done
+          echo "COMMAND_HELP_END"
+
+          echo "DOC_CANDIDATES_BEGIN"
+          find / -maxdepth 6 -type f \( \
+            -iname "*spi*manual*" -o -iname "*spi*guide*" -o -iname "*cookbook*" -o \
+            -iname "*osa*manual*" -o -iname "*osa*guide*" -o -iname "*analysis*" -o \
+            -iname "*idx*" -o -iname "*cat*" -o -iname "*ic*" -o \
+            -iname "*response*" -o -iname "*resp*" -o -iname "*rmf*" -o -iname "*irf*" \
+          \) 2>/dev/null | sort | head -2000
+          echo "DOC_CANDIDATES_END"
+
+          echo "DIR_CANDIDATES_BEGIN"
+          find / -maxdepth 6 -type d \( \
+            -iname "ic" -o -iname "idx" -o -iname "cat" -o -iname "aux" -o -iname "scw" -o \
+            -iname "*ic*" -o -iname "*idx*" -o -iname "*cat*" -o -iname "*resp*" -o \
+            -iname "*response*" -o -iname "*rmf*" -o -iname "*irf*" -o -iname "*spi*" \
+          \) 2>/dev/null | sort | head -1500
+          echo "DIR_CANDIDATES_END"
+
+          echo "NO_VALUES_CONFIRMATION"
+          echo "No FITS files were opened. No spectra/images/flux/counts were requested."
+          echo ACIRM_R13MUE_INSPECT_END
+          ' > "$OUT/R13MUE_OSA_REQUIREMENT_SOURCE_INSPECT.txt" 2>&1 || true
+
+      - name: Build formal requirement ledger no values
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+          import csv
+          import json
+          import os
+
+          root = Path(os.environ["GITHUB_WORKSPACE"])
+          out = root / "ACIRM_R13MUE_GITHUB_ACTIONS_FORMAL_OSA_DATA_REQUIREMENT_LEDGER_NO_VALUES_OUTPUT"
+          txt_path = out / "R13MUE_OSA_REQUIREMENT_SOURCE_INSPECT.txt"
+          txt = txt_path.read_text(errors="replace") if txt_path.exists() else ""
+          low = txt.lower()
+
+          def present(*tokens):
+              return any(t.lower() in low for t in tokens)
+
+          requirements = [
+              {
+                  "requirement_id": "REQ-OSA-ENV",
+                  "component": "OSA runtime environment",
+                  "required_before_values": True,
+                  "observed_in_metadata": present("osa", "spi_science_analysis", "dal_list"),
+                  "evidence_tokens": "osa; spi_science_analysis; dal_list",
+                  "status": "PASS_IF_SPI_AND_DAL_VISIBLE",
+                  "notes": "R13MUC/R13MUD already showed OSA/SPI command visibility."
+              },
+              {
+                  "requirement_id": "REQ-SPI-CMD",
+                  "component": "SPI analysis command",
+                  "required_before_values": True,
+                  "observed_in_metadata": present("spi_science_analysis"),
+                  "evidence_tokens": "spi_science_analysis",
+                  "status": "PASS_IF_VISIBLE",
+                  "notes": "Required before any SPI spectral extraction can be attempted."
+              },
+              {
+                  "requirement_id": "REQ-DAL",
+                  "component": "DAL tools",
+                  "required_before_values": True,
+                  "observed_in_metadata": present("dal_list", "dal_verify"),
+                  "evidence_tokens": "dal_list; dal_verify",
+                  "status": "PASS_IF_VISIBLE",
+                  "notes": "DAL tools are needed for OSA data access/verification."
+              },
+              {
+                  "requirement_id": "REQ-IC",
+                  "component": "Instrument characteristics tree IC",
+                  "required_before_values": True,
+                  "observed_in_metadata": present("/ic", " ic", "ic tree", "instrument characteristics"),
+                  "evidence_tokens": "/ic; instrument characteristics; ic tree",
+                  "status": "LOCK_REQUIRED_NOT_VALUES",
+                  "notes": "Exact IC route/version must be locked before values."
+              },
+              {
+                  "requirement_id": "REQ-IDX",
+                  "component": "Index tree IDX",
+                  "required_before_values": True,
+                  "observed_in_metadata": present("idx", "idx_find"),
+                  "evidence_tokens": "idx; idx_find",
+                  "status": "LOCK_REQUIRED_NOT_VALUES",
+                  "notes": "Exact IDX route/version must be locked before values."
+              },
+              {
+                  "requirement_id": "REQ-CAT",
+                  "component": "Catalog tree CAT",
+                  "required_before_values": True,
+                  "observed_in_metadata": present("cat", "cat_extract"),
+                  "evidence_tokens": "cat; cat_extract",
+                  "status": "LOCK_REQUIRED_NOT_VALUES",
+                  "notes": "Exact CAT route/version must be locked before values."
+              },
+              {
+                  "requirement_id": "REQ-AUX",
+                  "component": "Auxiliary data AUX",
+                  "required_before_values": True,
+                  "observed_in_metadata": present("aux"),
+                  "evidence_tokens": "aux",
+                  "status": "LOCK_REQUIRED_NOT_VALUES",
+                  "notes": "AUX route must be available for official science-window analysis."
+              },
+              {
+                  "requirement_id": "REQ-SCW",
+                  "component": "Science-window data SCW",
+                  "required_before_values": True,
+                  "observed_in_metadata": present("scw"),
+                  "evidence_tokens": "scw",
+                  "status": "LOCK_REQUIRED_NOT_VALUES",
+                  "notes": "SCW product acquisition must be designed separately; this stage does not download SCW."
+              },
+              {
+                  "requirement_id": "REQ-RESPONSE",
+                  "component": "SPI response files IRF/RMF/response",
+                  "required_before_values": True,
+                  "observed_in_metadata": present("response", "resp", "rmf", "irf"),
+                  "evidence_tokens": "response; resp; rmf; irf",
+                  "status": "LOCK_REQUIRED_NOT_VALUES",
+                  "notes": "Exact SPI response route/version must be locked before 511 keV spectral values."
+              },
+              {
+                  "requirement_id": "REQ-BACKGROUND",
+                  "component": "SPI instrumental and diffuse background method",
+                  "required_before_values": True,
+                  "observed_in_metadata": present("background", "bkg"),
+                  "evidence_tokens": "background; bkg",
+                  "status": "METHOD_LOCK_REQUIRED_NOT_VALUES",
+                  "notes": "Background treatment is a method requirement, not just a file requirement."
+              },
+              {
+                  "requirement_id": "REQ-LINE-WINDOW",
+                  "component": "511 keV line window and sidebands",
+                  "required_before_values": True,
+                  "observed_in_metadata": present("511", "kev", "line", "sideband", "continuum"),
+                  "evidence_tokens": "511; keV; line; sideband; continuum",
+                  "status": "METHOD_LOCK_REQUIRED_NOT_VALUES",
+                  "notes": "Line/continuum windows must be predeclared before values."
+              },
+              {
+                  "requirement_id": "REQ-NO-VALUES",
+                  "component": "No science values opened in this stage",
+                  "required_before_values": True,
+                  "observed_in_metadata": present("no fits files were opened", "no spectra/images/flux/counts"),
+                  "evidence_tokens": "no fits files were opened; no spectra/images/flux/counts",
+                  "status": "PASS_NO_VALUES",
+                  "notes": "This stage is ledger-only."
+              }
+          ]
+
+          ledger_csv = out / "R13MUE_FORMAL_OSA_DATA_REQUIREMENT_LEDGER.csv"
+          with ledger_csv.open("w", newline="", encoding="utf-8") as f:
+              cols = ["requirement_id", "component", "required_before_values", "observed_in_metadata", "evidence_tokens", "status", "notes"]
+              w = csv.DictWriter(f, fieldnames=cols)
+              w.writeheader()
+              for row in requirements:
+                  w.writerow(row)
+
+          hard_blockers = []
+          for row in requirements:
+              if row["required_before_values"] and row["status"] in ["LOCK_REQUIRED_NOT_VALUES", "METHOD_LOCK_REQUIRED_NOT_VALUES"]:
+                  hard_blockers.append(row["requirement_id"])
+
+          command_ready = all(
+              row["observed_in_metadata"] for row in requirements
+              if row["requirement_id"] in ["REQ-OSA-ENV", "REQ-SPI-CMD", "REQ-DAL"]
+          )
+          no_values_ok = [r for r in requirements if r["requirement_id"] == "REQ-NO-VALUES"][0]["observed_in_metadata"]
+
+          if command_ready and no_values_ok:
+              ledger_decision = "FORMAL_REQUIREMENT_LEDGER_BUILT_COMMAND_ROUTE_READY_VALUES_STILL_BLOCKED"
+              next_stage = "R13MUF_MINIMAL_OFFICIAL_DATA_TREE_ACQUISITION_DESIGN_NO_VALUES"
+          else:
+              ledger_decision = "FORMAL_REQUIREMENT_LEDGER_BUILT_ROUTE_REPAIR_REQUIRED_NO_VALUES"
+              next_stage = "R13MUF_REPAIR_REQUIREMENT_LEDGER_OR_ROUTE_INSPECT_NO_VALUES"
+
+          decision = {
+              "stage": "ACIRM_R13MUE_GITHUB_ACTIONS_FORMAL_OSA_DATA_REQUIREMENT_LEDGER_NO_VALUES",
+              "ledger_decision": ledger_decision,
+              "next_stage": next_stage,
+              "command_ready": command_ready,
+              "no_values_confirmed": no_values_ok,
+              "hard_blockers_before_values": hard_blockers,
+              "n_requirements": len(requirements),
+              "science_values_authorized": False,
+              "new_values_opened": False,
+              "claim_ceiling": "formal OSA data requirement ledger only; no SPI/511 values"
+          }
+          (out / "R13MUE_LEDGER_DECISION.json").write_text(json.dumps(decision, indent=2), encoding="utf-8")
+          print(json.dumps(decision, indent=2))
+          PY
+
+      - name: Package results
+        shell: bash
+        run: |
+          set -euo pipefail
+          STAGE="ACIRM_R13MUE_GITHUB_ACTIONS_FORMAL_OSA_DATA_REQUIREMENT_LEDGER_NO_VALUES"
+          OUT="$GITHUB_WORKSPACE/${STAGE}_OUTPUT"
+          ZIP="$GITHUB_WORKSPACE/${STAGE}_RESULTS.zip"
+          SHA="$ZIP.sha256.txt"
+
+          cat > "$OUT/R13MUE_GO_NO_GO.csv" <<'CSV'
+          question,decision,reason
+          Open SPI/511 science values now?,NO,This stage is formal requirement ledger only.
+          Are command-level OSA/SPI routes ready?,SEE_DECISION,Read R13MUE_LEDGER_DECISION.json.
+          Are data trees and response locked?,NO,They are listed as hard blockers before values.
+          Can this prove 511 keV or particle production?,NO,No values opened.
+          CSV
+
+          cd "$GITHUB_WORKSPACE"
+          rm -f "$ZIP" "$SHA"
+          zip -r "$ZIP" "$(basename "$OUT")"
+          sha256sum "$ZIP" > "$SHA"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ACIRM_R13MUE_GITHUB_ACTIONS_FORMAL_OSA_DATA_REQUIREMENT_LEDGER_NO_VALUES_RESULTS
+          path: |
+            ACIRM_R13MUE_GITHUB_ACTIONS_FORMAL_OSA_DATA_REQUIREMENT_LEDGER_NO_VALUES_RESULTS.zip
+            ACIRM_R13MUE_GITHUB_ACTIONS_FORMAL_OSA_DATA_REQUIREMENT_LEDGER_NO_VALUES_RESULTS.zip.sha256.txt
+          retention-days: 7
