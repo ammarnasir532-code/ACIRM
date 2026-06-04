@@ -1,0 +1,413 @@
+name: ACIRM R13MPS MPE index discovery no values
+
+on:
+  workflow_dispatch:
+
+jobs:
+  mpe-index-discovery:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+
+    steps:
+      - name: Discover MPE index links without values
+        shell: bash
+        run: |
+          set +e
+          STAGE="ACIRM_R13MPS_MPE_INDEX_DISCOVERY_NO_VALUES"
+          OUT="$GITHUB_WORKSPACE/${STAGE}_OUTPUT"
+          mkdir -p "$OUT"
+
+          cat > "$OUT/r13mps_index_discovery.py" <<'PYCODE'
+          from pathlib import Path
+          from urllib.parse import urljoin
+          from urllib.request import Request, urlopen
+          import csv
+          import json
+          import os
+          import re
+          import traceback
+
+          STAGE = "ACIRM_R13MPS_MPE_INDEX_DISCOVERY_NO_VALUES"
+          out = Path(os.environ.get("GITHUB_WORKSPACE", ".")) / (STAGE + "_OUTPUT")
+          out.mkdir(parents=True, exist_ok=True)
+
+          TARGET_REV = "2504"
+          BASE_MAIN = "https://www-cms.mpe.mpg.de/gamma/instruments/integral/spi_public_service/data/"
+
+          INDEX_URLS = [
+              {
+                  "energy_set": "18-2000keV_.5keV",
+                  "url": "https://www-cms.mpe.mpg.de/gamma/instruments/integral/spi_public_service/data/18-2000keV_.5keV/index.html",
+                  "priority": 1
+              },
+              {
+                  "energy_set": "18-2000keV_.5keV",
+                  "url": "http://www.mpe.mpg.de/gamma/instruments/integral/spi_public_service/data/18-2000keV_.5keV/index.html",
+                  "priority": 2
+              },
+              {
+                  "energy_set": "18-8000keV_1keV",
+                  "url": "https://www-cms.mpe.mpg.de/gamma/instruments/integral/spi_public_service/data/18-8000keV_1keV/index.html",
+                  "priority": 3
+              },
+              {
+                  "energy_set": "18-8000keV_1keV",
+                  "url": "http://www.mpe.mpg.de/gamma/instruments/integral/spi_public_service/data/18-8000keV_1keV/index.html",
+                  "priority": 4
+              }
+          ]
+
+          def write_json(name, obj):
+              (out / name).write_text(json.dumps(obj, indent=2, ensure_ascii=False), encoding="utf-8")
+
+          def write_csv(name, rows, columns):
+              with (out / name).open("w", newline="", encoding="utf-8") as f:
+                  w = csv.DictWriter(f, fieldnames=columns)
+                  w.writeheader()
+                  for row in rows:
+                      w.writerow({c: row.get(c, "") for c in columns})
+
+          def final_stop(decision, next_stage, **kwargs):
+              obj = {
+                  "stage": STAGE,
+                  "decision": decision,
+                  "next_stage": next_stage,
+                  "claim_ceiling": "MPE index/link discovery only; no FITS, no tarball download, no science values, no detection claim"
+              }
+              obj.update(kwargs)
+              write_json("R13MPS_FINAL_DECISION.json", obj)
+              print(json.dumps(obj, indent=2, ensure_ascii=False))
+              return obj
+
+          def fetch_text(url, max_bytes=3000000, timeout=45):
+              req = Request(url, headers={
+                  "User-Agent": "ACIRM-R13MPS-index-discovery-no-values",
+                  "Accept": "text/html,text/plain,*/*"
+              })
+              with urlopen(req, timeout=timeout) as r:
+                  data = r.read(max_bytes + 1)
+                  if len(data) > max_bytes:
+                      data = data[:max_bytes]
+                  return {
+                      "ok": True,
+                      "status": getattr(r, "status", ""),
+                      "final_url": r.geturl(),
+                      "content_type": r.headers.get("Content-Type", ""),
+                      "content_length_header": r.headers.get("Content-Length", ""),
+                      "chars": len(data),
+                      "text": data.decode("utf-8", errors="replace"),
+                      "error": ""
+                  }
+
+          def extract_hrefs(html):
+              rows = []
+              for m in re.finditer(r"<a\s+[^>]*href=[\"']([^\"']+)[\"'][^>]*>(.*?)</a>", html, flags=re.I | re.S):
+                  href = m.group(1).strip()
+                  label = re.sub(r"<[^>]+>", "", m.group(2))
+                  label = re.sub(r"\s+", " ", label).strip()
+                  rows.append({"href": href, "label": label})
+              if not rows:
+                  for m in re.finditer(r"href=[\"']([^\"']+)[\"']", html, flags=re.I):
+                      rows.append({"href": m.group(1).strip(), "label": ""})
+              return rows
+
+          def limited_probe(url, timeout=45):
+              req = Request(url, headers={
+                  "User-Agent": "ACIRM-R13MPS-link-probe-no-values",
+                  "Accept": "*/*",
+                  "Range": "bytes=0-1023"
+              })
+              try:
+                  with urlopen(req, timeout=timeout) as r:
+                      data = r.read(1024)
+                      return {
+                          "probe_ok": True,
+                          "status": getattr(r, "status", ""),
+                          "final_url": r.geturl(),
+                          "content_type": r.headers.get("Content-Type", ""),
+                          "content_length_header": r.headers.get("Content-Length", ""),
+                          "accept_ranges": r.headers.get("Accept-Ranges", ""),
+                          "content_range": r.headers.get("Content-Range", ""),
+                          "bytes_read_limited": len(data),
+                          "error": ""
+                      }
+              except Exception as e:
+                  return {
+                      "probe_ok": False,
+                      "status": "",
+                      "final_url": "",
+                      "content_type": "",
+                      "content_length_header": "",
+                      "accept_ranges": "",
+                      "content_range": "",
+                      "bytes_read_limited": 0,
+                      "error": repr(e)[:500]
+                  }
+
+          firewall = {
+              "stage": STAGE,
+              "purpose": "discover actual MPE revolution 2504 link from index pages instead of guessing tarball path",
+              "opens_fits": False,
+              "downloads_tarball": False,
+              "reads_science_values": False,
+              "target_rev": TARGET_REV,
+              "forbidden": [
+                  "FITS opening",
+                  "tarball extraction",
+                  "science value reading",
+                  "511 detection claim",
+                  "evidence/proof/discovery claim"
+              ]
+          }
+          write_json("R13MPS_FIREWALL.json", firewall)
+          write_csv("R13MPS_INDEX_URLS.csv", INDEX_URLS, ["energy_set", "url", "priority"])
+
+          run_errors = []
+          index_rows = []
+          href_rows = []
+          target_rows = []
+
+          for item in INDEX_URLS:
+              energy_set = item["energy_set"]
+              index_url = item["url"]
+              priority = item["priority"]
+              try:
+                  fetched = fetch_text(index_url)
+                  index_rows.append({
+                      "energy_set": energy_set,
+                      "index_url": index_url,
+                      "priority": priority,
+                      "ok": fetched["ok"],
+                      "status": fetched["status"],
+                      "final_url": fetched["final_url"],
+                      "content_type": fetched["content_type"],
+                      "content_length_header": fetched["content_length_header"],
+                      "chars_read": fetched["chars"],
+                      "contains_target_rev": TARGET_REV in fetched["text"],
+                      "error": ""
+                  })
+                  hrefs = extract_hrefs(fetched["text"])
+                  for h in hrefs:
+                      abs_url = urljoin(fetched["final_url"], h["href"])
+                      label = h["label"]
+                      href = h["href"]
+                      target_like = (
+                          TARGET_REV in href or
+                          TARGET_REV in label or
+                          re.search(r"(^|[^0-9])" + re.escape(TARGET_REV) + r"([^0-9]|$)", href + " " + label) is not None
+                      )
+                      row = {
+                          "energy_set": energy_set,
+                          "index_url": index_url,
+                          "priority": priority,
+                          "href": href,
+                          "label": label,
+                          "absolute_url": abs_url,
+                          "target_like": target_like
+                      }
+                      href_rows.append(row)
+                      if target_like:
+                          target_rows.append(row)
+              except Exception as e:
+                  index_rows.append({
+                      "energy_set": energy_set,
+                      "index_url": index_url,
+                      "priority": priority,
+                      "ok": False,
+                      "status": "",
+                      "final_url": "",
+                      "content_type": "",
+                      "content_length_header": "",
+                      "chars_read": 0,
+                      "contains_target_rev": False,
+                      "error": repr(e)[:500]
+                  })
+                  run_errors.append("index_fetch_error_" + energy_set + ": " + repr(e))
+                  run_errors.append(traceback.format_exc()[:1000])
+
+          write_csv(
+              "R13MPS_INDEX_FETCH_AUDIT.csv",
+              index_rows,
+              ["energy_set", "index_url", "priority", "ok", "status", "final_url", "content_type", "content_length_header", "chars_read", "contains_target_rev", "error"]
+          )
+          write_csv(
+              "R13MPS_ALL_HREFS_FROM_INDEXES.csv",
+              href_rows,
+              ["energy_set", "index_url", "priority", "href", "label", "absolute_url", "target_like"]
+          )
+          write_csv(
+              "R13MPS_TARGET_REV_HREF_CANDIDATES.csv",
+              target_rows,
+              ["energy_set", "index_url", "priority", "href", "label", "absolute_url", "target_like"]
+          )
+
+          candidate_urls = []
+          for row in sorted(target_rows, key=lambda r: int(r["priority"])):
+              candidate_urls.append({
+                  "source": "index_href",
+                  "energy_set": row["energy_set"],
+                  "priority": row["priority"],
+                  "candidate_url": row["absolute_url"],
+                  "href": row["href"],
+                  "label": row["label"]
+              })
+
+          direct_patterns = [
+              "{base}{rev}.tgz",
+              "{base}{rev}.tar.gz",
+              "{base}{rev}.tar",
+              "{base}{rev}/{rev}.tgz",
+              "{base}{rev}/",
+              "{base}rev{rev}.tgz",
+              "{base}revolution_{rev}.tgz"
+          ]
+          for item in INDEX_URLS:
+              index_url = item["url"]
+              base = index_url.rsplit("/", 1)[0] + "/"
+              for pat in direct_patterns:
+                  candidate_urls.append({
+                      "source": "direct_pattern",
+                      "energy_set": item["energy_set"],
+                      "priority": item["priority"] + 100,
+                      "candidate_url": pat.format(base=base, rev=TARGET_REV),
+                      "href": "",
+                      "label": ""
+                  })
+
+          seen = set()
+          unique_candidates = []
+          for row in sorted(candidate_urls, key=lambda r: int(r["priority"])):
+              u = row["candidate_url"]
+              if u not in seen:
+                  seen.add(u)
+                  unique_candidates.append(row)
+
+          probe_rows = []
+          selected = None
+          for row in unique_candidates:
+              probe = limited_probe(row["candidate_url"])
+              outrow = dict(row)
+              outrow.update(probe)
+              ctype = str(probe.get("content_type", "")).lower()
+              ok = bool(probe.get("probe_ok")) and str(probe.get("status")) in ["200", "206"]
+              looks_downloadable = ok and ("text/html" not in ctype)
+              outrow["looks_downloadable_tarball_or_binary"] = looks_downloadable
+              probe_rows.append(outrow)
+              if selected is None and looks_downloadable:
+                  selected = outrow
+
+          write_csv(
+              "R13MPS_TARGET_CANDIDATE_LIMITED_PROBES_NO_VALUES.csv",
+              probe_rows,
+              ["source", "energy_set", "priority", "candidate_url", "href", "label", "probe_ok", "status", "final_url", "content_type", "content_length_header", "accept_ranges", "content_range", "bytes_read_limited", "looks_downloadable_tarball_or_binary", "error"]
+          )
+
+          directory_like = [
+              r for r in probe_rows
+              if r.get("probe_ok") and "text/html" in str(r.get("content_type", "")).lower()
+          ]
+          write_csv(
+              "R13MPS_DIRECTORY_LIKE_TARGET_PAGES.csv",
+              directory_like,
+              ["source", "energy_set", "priority", "candidate_url", "href", "label", "probe_ok", "status", "final_url", "content_type", "content_length_header", "accept_ranges", "content_range", "bytes_read_limited", "looks_downloadable_tarball_or_binary", "error"]
+          )
+
+          if selected is not None:
+              decision = "MPE_TARGET_REV2504_DOWNLOADABLE_LINK_DISCOVERED_NO_VALUES"
+              next_stage = "R13MPT_DOWNLOAD_SELECTED_MPE_TARBALL_AND_CHECK_REQUIRED_FILES_NO_CLAIM"
+              selected_url = selected["final_url"] or selected["candidate_url"]
+              selected_energy_set = selected["energy_set"]
+          elif target_rows:
+              decision = "MPE_TARGET_REV2504_INDEX_HREFS_FOUND_BUT_NO_DOWNLOADABLE_LINK_CONFIRMED_NO_VALUES"
+              next_stage = "R13MPT_SECOND_LEVEL_MPE_DIRECTORY_PARSE_OR_MANUAL_LINK_REPAIR"
+              selected_url = ""
+              selected_energy_set = ""
+          else:
+              decision = "MPE_INDEX_REACHABLE_BUT_REV2504_NOT_LINKED_NO_VALUES"
+              next_stage = "R13MPT_USE_OFFICIAL_OSA_CONTAINER_OR_DIFFERENT_REVOLUTION_ROUTE"
+              selected_url = ""
+              selected_energy_set = ""
+
+          final_stop(
+              decision,
+              next_stage,
+              target_rev=TARGET_REV,
+              index_pages_tested=len(INDEX_URLS),
+              index_pages_ok=sum(1 for r in index_rows if r.get("ok")),
+              href_rows=len(href_rows),
+              target_href_candidates=len(target_rows),
+              probe_candidates=len(probe_rows),
+              downloadable_probe_candidates=sum(1 for r in probe_rows if r.get("looks_downloadable_tarball_or_binary")),
+              selected_energy_set=selected_energy_set,
+              selected_url=selected_url,
+              selected_probe=selected or {},
+              directory_like_target_pages=len(directory_like),
+              downloaded_tarball=False,
+              opened_fits=False,
+              read_science_values=False,
+              run_errors_count=len(run_errors),
+              run_errors=run_errors
+          )
+          PYCODE
+
+          python3 "$OUT/r13mps_index_discovery.py" > "$OUT/R13MPS_RUNNER_STDOUT.txt" 2> "$OUT/R13MPS_RUNNER_STDERR.txt"
+          CODE=$?
+          echo "runner_exit_code=$CODE" > "$OUT/R13MPS_STEP_STATUS.log"
+
+          if [ ! -f "$OUT/R13MPS_FINAL_DECISION.json" ]; then
+            cat > "$OUT/R13MPS_FINAL_DECISION.json" <<'JSON'
+          {
+            "stage": "ACIRM_R13MPS_MPE_INDEX_DISCOVERY_NO_VALUES",
+            "decision": "RUNNER_FAILED_BEFORE_FINAL_DECISION",
+            "next_stage": "R13MPT_REPAIR_INDEX_DISCOVERY_USING_STDOUT_STDERR",
+            "claim_ceiling": "no values; no claim"
+          }
+          JSON
+          fi
+          exit 0
+
+      - name: Package results
+        if: always()
+        shell: bash
+        run: |
+          set +e
+          STAGE="ACIRM_R13MPS_MPE_INDEX_DISCOVERY_NO_VALUES"
+          OUT="$GITHUB_WORKSPACE/${STAGE}_OUTPUT"
+          ZIP="$GITHUB_WORKSPACE/${STAGE}_RESULTS.zip"
+          SHA="$ZIP.sha256.txt"
+          mkdir -p "$OUT"
+
+          if [ ! -f "$OUT/R13MPS_FINAL_DECISION.json" ]; then
+            cat > "$OUT/R13MPS_FINAL_DECISION.json" <<'JSON'
+          {
+            "stage": "ACIRM_R13MPS_MPE_INDEX_DISCOVERY_NO_VALUES",
+            "decision": "PACKAGING_REACHED_WITHOUT_FINAL_DECISION",
+            "next_stage": "R13MPT_REPAIR_WORKFLOW_PACKAGING_LOGS",
+            "claim_ceiling": "no values; no claim"
+          }
+          JSON
+          fi
+
+          cat > "$OUT/R13MPS_GO_NO_GO.csv" <<'CSV'
+          question,decision,reason
+          Does R13MPS download tarballs?,NO,Only index pages and limited 1024-byte link probes.
+          Does R13MPS open FITS files?,NO,No FITS access in this stage.
+          Does R13MPS read science values?,NO,No science values are opened.
+          Can R13MPS claim 511 detection?,NO,It is only link discovery.
+          CSV
+
+          cd "$GITHUB_WORKSPACE"
+          rm -f "$ZIP" "$SHA"
+          zip -r "$ZIP" "$(basename "$OUT")"
+          sha256sum "$ZIP" > "$SHA"
+          exit 0
+
+      - name: Upload artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ACIRM_R13MPS_MPE_INDEX_DISCOVERY_NO_VALUES_RESULTS
+          path: |
+            ACIRM_R13MPS_MPE_INDEX_DISCOVERY_NO_VALUES_RESULTS.zip
+            ACIRM_R13MPS_MPE_INDEX_DISCOVERY_NO_VALUES_RESULTS.zip.sha256.txt
+          retention-days: 7
