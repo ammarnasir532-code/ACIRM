@@ -1,0 +1,192 @@
+name: ACIRM R13MUC GHA OSA Docker preflight no values
+
+on:
+  workflow_dispatch:
+
+jobs:
+  osa-preflight:
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Lock no-values scope
+        shell: bash
+        run: |
+          set -euo pipefail
+          STAGE="ACIRM_R13MUC_GITHUB_ACTIONS_OSA_DOCKER_PREFLIGHT_NO_VALUES"
+          OUT="$GITHUB_WORKSPACE/${STAGE}_OUTPUT"
+          mkdir -p "$OUT"
+          cat > "$OUT/R13MUC_ROUTE_LOCK.json" <<'JSON'
+          {
+            "stage": "ACIRM_R13MUC_GITHUB_ACTIONS_OSA_DOCKER_PREFLIGHT_NO_VALUES",
+            "opens_science_values": false,
+            "downloads_science_products": false,
+            "downloads_fits": false,
+            "purpose": "GitHub Actions Docker OSA/SPI environment preflight only",
+            "forbidden": [
+              "SPI spectra",
+              "SPI images",
+              "511 keV flux/count/intensity values",
+              "FITS science products",
+              "particle-production claim"
+            ],
+            "claim_ceiling": "OSA/SPI environment preflight only"
+          }
+          JSON
+
+      - name: System and disk info
+        shell: bash
+        run: |
+          set -euo pipefail
+          STAGE="ACIRM_R13MUC_GITHUB_ACTIONS_OSA_DOCKER_PREFLIGHT_NO_VALUES"
+          OUT="$GITHUB_WORKSPACE/${STAGE}_OUTPUT"
+          {
+            echo "date_utc=$(date -u)"
+            echo "runner_os=$RUNNER_OS"
+            echo "runner_arch=$RUNNER_ARCH"
+            echo "kernel=$(uname -a)"
+            echo "docker_version="
+            docker --version || true
+            echo "disk="
+            df -h
+            echo "memory="
+            free -h || true
+          } > "$OUT/R13MUC_SYSTEM_INFO.txt"
+
+      - name: Free disk space safely
+        shell: bash
+        run: |
+          set -euo pipefail
+          STAGE="ACIRM_R13MUC_GITHUB_ACTIONS_OSA_DOCKER_PREFLIGHT_NO_VALUES"
+          OUT="$GITHUB_WORKSPACE/${STAGE}_OUTPUT"
+          {
+            echo "Before cleanup:"
+            df -h
+          } > "$OUT/R13MUC_DISK_CLEANUP_LOG.txt"
+
+          sudo rm -rf /usr/share/dotnet || true
+          sudo rm -rf /usr/local/lib/android || true
+          sudo rm -rf /opt/ghc || true
+          sudo rm -rf /usr/local/.ghcup || true
+          docker system prune -af || true
+
+          {
+            echo "After cleanup:"
+            df -h
+          } >> "$OUT/R13MUC_DISK_CLEANUP_LOG.txt"
+
+      - name: Pull official OSA Docker image
+        shell: bash
+        timeout-minutes: 90
+        run: |
+          set -euo pipefail
+          STAGE="ACIRM_R13MUC_GITHUB_ACTIONS_OSA_DOCKER_PREFLIGHT_NO_VALUES"
+          OUT="$GITHUB_WORKSPACE/${STAGE}_OUTPUT"
+          OSA_IMAGE="integralsw/osa:11.2-2-g667521a3-20220403-190332-refcat-43.0-OSA11.0-66-g149047e"
+          echo "$OSA_IMAGE" > "$OUT/R13MUC_OSA_IMAGE_USED.txt"
+          docker pull "$OSA_IMAGE" 2>&1 | tee "$OUT/R13MUC_DOCKER_PULL_OSA.log"
+          docker image inspect "$OSA_IMAGE" > "$OUT/R13MUC_DOCKER_IMAGE_INSPECT.json"
+
+      - name: Inspect OSA and SPI environment no values
+        shell: bash
+        run: |
+          set -euo pipefail
+          STAGE="ACIRM_R13MUC_GITHUB_ACTIONS_OSA_DOCKER_PREFLIGHT_NO_VALUES"
+          OUT="$GITHUB_WORKSPACE/${STAGE}_OUTPUT"
+          OSA_IMAGE="$(cat "$OUT/R13MUC_OSA_IMAGE_USED.txt")"
+
+          docker run --rm "$OSA_IMAGE" /bin/bash -lc '
+          set +e
+          echo ACIRM_OSA_INSPECT_START
+          whoami
+          pwd
+          uname -a
+          echo "PATH=$PATH"
+          env | sort | egrep "OSA|ISDC|REP|HEADAS|COMMONLOG|CURRENT|DAL|SPI" || true
+          which spi_science_analysis || true
+          which ibis_science_analysis || true
+          which og_create || true
+          which dal_list || true
+          find / -maxdepth 5 -type f -name "*spi*science*analysis*" 2>/dev/null | head -30
+          find / -maxdepth 5 -type f -name "dal_list" 2>/dev/null | head -30
+          echo ACIRM_OSA_INSPECT_END
+          ' > "$OUT/R13MUC_OSA_SPI_COMMAND_INSPECT.txt" 2>&1 || true
+
+      - name: Classify readiness no values
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+          import json
+          import os
+
+          root = Path(os.environ["GITHUB_WORKSPACE"])
+          out = root / "ACIRM_R13MUC_GITHUB_ACTIONS_OSA_DOCKER_PREFLIGHT_NO_VALUES_OUTPUT"
+          txt_path = out / "R13MUC_OSA_SPI_COMMAND_INSPECT.txt"
+          txt = txt_path.read_text(errors="replace").lower() if txt_path.exists() else ""
+
+          has_spi = "spi_science_analysis" in txt
+          has_dal = "dal_list" in txt
+          has_osa = ("osa" in txt) or ("isdc" in txt)
+          has_env = ("rep_base" in txt) or ("headas" in txt) or ("commonlog" in txt)
+
+          if has_spi and has_dal and has_osa:
+              readiness = "GITHUB_ACTIONS_DOCKER_OSA_SPI_ENVIRONMENT_PRESENT_VALUES_STILL_BLOCKED"
+              next_stage = "R13MUD_IC_IDX_CAT_RESPONSE_ROUTE_LOCK_NO_VALUES"
+          elif has_osa:
+              readiness = "GITHUB_ACTIONS_DOCKER_OSA_ENVIRONMENT_PARTIAL_SPI_COMMANDS_UNCONFIRMED_VALUES_BLOCKED"
+              next_stage = "R13MUD_REPAIR_OSA_ENVIRONMENT_NO_VALUES"
+          else:
+              readiness = "GITHUB_ACTIONS_DOCKER_OSA_ENVIRONMENT_NOT_CONFIRMED_VALUES_NO_GO"
+              next_stage = "STOP_OR_REPAIR_GITHUB_ACTIONS_OSA_ROUTE"
+
+          decision = {
+              "stage": "ACIRM_R13MUC_GITHUB_ACTIONS_OSA_DOCKER_PREFLIGHT_NO_VALUES",
+              "readiness": readiness,
+              "next_stage": next_stage,
+              "has_spi_science_analysis_text": has_spi,
+              "has_dal_list_text": has_dal,
+              "has_osa_or_isdc_text": has_osa,
+              "has_environment_hints": has_env,
+              "science_values_authorized": False,
+              "new_values_opened": False,
+              "claim_ceiling": "GitHub Actions Docker OSA/SPI environment preflight only; no SPI/511 values"
+          }
+          (out / "R13MUC_GITHUB_ACTIONS_OSA_SPI_READINESS_DECISION.json").write_text(json.dumps(decision, indent=2), encoding="utf-8")
+          print(json.dumps(decision, indent=2))
+          PY
+
+      - name: Package results
+        shell: bash
+        run: |
+          set -euo pipefail
+          STAGE="ACIRM_R13MUC_GITHUB_ACTIONS_OSA_DOCKER_PREFLIGHT_NO_VALUES"
+          OUT="$GITHUB_WORKSPACE/${STAGE}_OUTPUT"
+          ZIP="$GITHUB_WORKSPACE/${STAGE}_RESULTS.zip"
+          SHA="$ZIP.sha256.txt"
+
+          cat > "$OUT/R13MUC_GITHUB_ACTIONS_GO_NO_GO.csv" <<'CSV'
+          question,decision,reason
+          Open SPI/511 science values now?,NO,This is environment preflight only.
+          Did Docker OSA image pull/run?,SEE_READINESS,Read R13MUC_GITHUB_ACTIONS_OSA_SPI_READINESS_DECISION.json.
+          Are IC/IDX/CAT and response data ready?,NO,Next stage only if OSA environment is present.
+          Can this prove 511 keV or particle production?,NO,No values opened.
+          CSV
+
+          cd "$GITHUB_WORKSPACE"
+          rm -f "$ZIP" "$SHA"
+          zip -r "$ZIP" "$(basename "$OUT")"
+          sha256sum "$ZIP" > "$SHA"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ACIRM_R13MUC_GITHUB_ACTIONS_OSA_DOCKER_PREFLIGHT_NO_VALUES_RESULTS
+          path: |
+            ACIRM_R13MUC_GITHUB_ACTIONS_OSA_DOCKER_PREFLIGHT_NO_VALUES_RESULTS.zip
+            ACIRM_R13MUC_GITHUB_ACTIONS_OSA_DOCKER_PREFLIGHT_NO_VALUES_RESULTS.zip.sha256.txt
+          retention-days: 7
