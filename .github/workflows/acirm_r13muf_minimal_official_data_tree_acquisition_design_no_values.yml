@@ -1,0 +1,401 @@
+name: ACIRM R13MUF minimal official data tree acquisition design no values
+
+on:
+  workflow_dispatch:
+
+jobs:
+  acquisition-design:
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Lock no-values scope
+        shell: bash
+        run: |
+          set -euo pipefail
+          STAGE="ACIRM_R13MUF_GITHUB_ACTIONS_MINIMAL_OFFICIAL_DATA_TREE_ACQUISITION_DESIGN_NO_VALUES"
+          OUT="$GITHUB_WORKSPACE/${STAGE}_OUTPUT"
+          mkdir -p "$OUT"
+          cat > "$OUT/R13MUF_ROUTE_LOCK.json" <<'JSON'
+          {
+            "stage": "ACIRM_R13MUF_GITHUB_ACTIONS_MINIMAL_OFFICIAL_DATA_TREE_ACQUISITION_DESIGN_NO_VALUES",
+            "opens_science_values": false,
+            "downloads_science_products": false,
+            "downloads_fits": false,
+            "reads_fits_tables": false,
+            "purpose": "Design and preflight official INTEGRAL/OSA data tree routes without downloading science products",
+            "forbidden": [
+              "SPI spectra",
+              "SPI images",
+              "511 keV flux/count/intensity values",
+              "FITS download",
+              "FITS science product opening",
+              "FITS table reading",
+              "science-window value extraction",
+              "particle-production claim"
+            ],
+            "claim_ceiling": "official data route acquisition design only"
+          }
+          JSON
+
+      - name: System info
+        shell: bash
+        run: |
+          set -euo pipefail
+          STAGE="ACIRM_R13MUF_GITHUB_ACTIONS_MINIMAL_OFFICIAL_DATA_TREE_ACQUISITION_DESIGN_NO_VALUES"
+          OUT="$GITHUB_WORKSPACE/${STAGE}_OUTPUT"
+          {
+            echo "date_utc=$(date -u)"
+            echo "runner_os=$RUNNER_OS"
+            echo "runner_arch=$RUNNER_ARCH"
+            echo "kernel=$(uname -a)"
+            docker --version || true
+            python3 --version || true
+            df -h
+          } > "$OUT/R13MUF_SYSTEM_INFO.txt"
+
+      - name: Create formal acquisition design ledger
+        shell: bash
+        run: |
+          set -euo pipefail
+          STAGE="ACIRM_R13MUF_GITHUB_ACTIONS_MINIMAL_OFFICIAL_DATA_TREE_ACQUISITION_DESIGN_NO_VALUES"
+          OUT="$GITHUB_WORKSPACE/${STAGE}_OUTPUT"
+          python3 - <<'PY'
+          from pathlib import Path
+          import csv
+          import json
+          import os
+
+          root = Path(os.environ["GITHUB_WORKSPACE"])
+          out = root / "ACIRM_R13MUF_GITHUB_ACTIONS_MINIMAL_OFFICIAL_DATA_TREE_ACQUISITION_DESIGN_NO_VALUES_OUTPUT"
+
+          rows = [
+              {
+                  "route_id": "ROOT-HEASARC-INTEGRAL-DATA",
+                  "component": "official_integral_data_root",
+                  "primary_url": "https://heasarc.gsfc.nasa.gov/FTP/integral/data/",
+                  "allowed_now": "HEAD_OR_SMALL_HTML_INDEX_ONLY",
+                  "forbidden_now": "NO_FITS_NO_SCIENCE_PRODUCTS_NO_BULK_DOWNLOAD",
+                  "needed_before_values": True,
+                  "purpose": "Primary public official data tree root candidate."
+              },
+              {
+                  "route_id": "TREE-IC",
+                  "component": "instrument_characteristics_ic",
+                  "primary_url": "https://heasarc.gsfc.nasa.gov/FTP/integral/data/ic/",
+                  "allowed_now": "HEAD_OR_SMALL_HTML_INDEX_ONLY",
+                  "forbidden_now": "NO_FITS_OPEN_NO_VALUES",
+                  "needed_before_values": True,
+                  "purpose": "Instrument characteristics tree candidate required by OSA."
+              },
+              {
+                  "route_id": "TREE-IDX",
+                  "component": "index_idx",
+                  "primary_url": "https://heasarc.gsfc.nasa.gov/FTP/integral/data/idx/",
+                  "allowed_now": "HEAD_OR_SMALL_HTML_INDEX_ONLY",
+                  "forbidden_now": "NO_FITS_OPEN_NO_VALUES",
+                  "needed_before_values": True,
+                  "purpose": "Index tree candidate required for archive navigation."
+              },
+              {
+                  "route_id": "TREE-CAT",
+                  "component": "catalog_cat",
+                  "primary_url": "https://heasarc.gsfc.nasa.gov/FTP/integral/data/cat/",
+                  "allowed_now": "HEAD_OR_SMALL_HTML_INDEX_ONLY",
+                  "forbidden_now": "NO_FITS_OPEN_NO_VALUES",
+                  "needed_before_values": True,
+                  "purpose": "Catalog tree candidate required by OSA workflows."
+              },
+              {
+                  "route_id": "TREE-AUX",
+                  "component": "auxiliary_aux",
+                  "primary_url": "https://heasarc.gsfc.nasa.gov/FTP/integral/data/aux/",
+                  "allowed_now": "HEAD_OR_SMALL_HTML_INDEX_ONLY",
+                  "forbidden_now": "NO_FITS_OPEN_NO_VALUES",
+                  "needed_before_values": True,
+                  "purpose": "Auxiliary data tree candidate."
+              },
+              {
+                  "route_id": "TREE-SCW",
+                  "component": "science_windows_scw",
+                  "primary_url": "https://heasarc.gsfc.nasa.gov/FTP/integral/data/scw/",
+                  "allowed_now": "HEAD_OR_SMALL_HTML_INDEX_ONLY",
+                  "forbidden_now": "NO_FITS_DOWNLOAD_NO_SCIENCE_VALUES",
+                  "needed_before_values": True,
+                  "purpose": "Science-window tree route candidate. Exact SCWs must be selected later by metadata only."
+              },
+              {
+                  "route_id": "TREE-RESP-IN-IC",
+                  "component": "spi_response_irf_rmf_candidate",
+                  "primary_url": "https://heasarc.gsfc.nasa.gov/FTP/integral/data/ic/",
+                  "allowed_now": "SEARCH_NAMES_ONLY_IN_SMALL_INDEX_IF_AVAILABLE",
+                  "forbidden_now": "NO_RESPONSE_FITS_DOWNLOAD_NO_VALUES",
+                  "needed_before_values": True,
+                  "purpose": "SPI response/IRF/RMF files are expected to be tied to IC/OSA calibration routes; exact filenames must be locked later."
+              },
+              {
+                  "route_id": "METHOD-BACKGROUND",
+                  "component": "spi_background_method",
+                  "primary_url": "METHOD_NOT_URL",
+                  "allowed_now": "DOCUMENT_METHOD_REQUIREMENTS_ONLY",
+                  "forbidden_now": "NO_BACKGROUND_FIT_NO_VALUES",
+                  "needed_before_values": True,
+                  "purpose": "Background treatment is a method lock, not a file route only."
+              },
+              {
+                  "route_id": "METHOD-LINE-WINDOW",
+                  "component": "511kev_line_and_sideband_windows",
+                  "primary_url": "METHOD_NOT_URL",
+                  "allowed_now": "DOCUMENT_METHOD_REQUIREMENTS_ONLY",
+                  "forbidden_now": "NO_LINE_FLUX_NO_COUNTS_NO_VALUES",
+                  "needed_before_values": True,
+                  "purpose": "Line/continuum windows must be predeclared before any values."
+              }
+          ]
+
+          path = out / "R13MUF_MINIMAL_OFFICIAL_DATA_TREE_ACQUISITION_DESIGN.csv"
+          with path.open("w", newline="", encoding="utf-8") as f:
+              cols = ["route_id", "component", "primary_url", "allowed_now", "forbidden_now", "needed_before_values", "purpose"]
+              w = csv.DictWriter(f, fieldnames=cols)
+              w.writeheader()
+              w.writerows(rows)
+
+          (out / "R13MUF_DESIGN_SUMMARY.json").write_text(json.dumps({
+              "stage": "ACIRM_R13MUF_GITHUB_ACTIONS_MINIMAL_OFFICIAL_DATA_TREE_ACQUISITION_DESIGN_NO_VALUES",
+              "n_routes": len(rows),
+              "opens_science_values": False,
+              "downloads_fits": False,
+              "next_expected": "route reachability checks only"
+          }, indent=2), encoding="utf-8")
+          PY
+
+      - name: Check official route reachability no values
+        shell: bash
+        run: |
+          set -euo pipefail
+          STAGE="ACIRM_R13MUF_GITHUB_ACTIONS_MINIMAL_OFFICIAL_DATA_TREE_ACQUISITION_DESIGN_NO_VALUES"
+          OUT="$GITHUB_WORKSPACE/${STAGE}_OUTPUT"
+          python3 - <<'PY'
+          from pathlib import Path
+          import csv
+          import os
+          import urllib.request
+          import json
+
+          root = Path(os.environ["GITHUB_WORKSPACE"])
+          out = root / "ACIRM_R13MUF_GITHUB_ACTIONS_MINIMAL_OFFICIAL_DATA_TREE_ACQUISITION_DESIGN_NO_VALUES_OUTPUT"
+          design = out / "R13MUF_MINIMAL_OFFICIAL_DATA_TREE_ACQUISITION_DESIGN.csv"
+
+          def small_get(url, timeout=25, max_bytes=300000):
+              req = urllib.request.Request(url, headers={
+                  "User-Agent": "ACIRM-R13MUF-route-preflight-no-values",
+                  "Accept": "text/html,text/plain,*/*"
+              })
+              with urllib.request.urlopen(req, timeout=timeout) as r:
+                  data = r.read(max_bytes + 1)
+                  if len(data) > max_bytes:
+                      data = data[:max_bytes]
+                  text = data.decode("utf-8", errors="replace")
+                  return {
+                      "ok": True,
+                      "status": getattr(r, "status", ""),
+                      "final_url": r.geturl(),
+                      "content_type": r.headers.get("Content-Type", ""),
+                      "chars": len(text),
+                      "snippet": text[:500].replace("\n", " ").replace("\r", " "),
+                      "error": ""
+                  }
+
+          rows = list(csv.DictReader(design.open(encoding="utf-8")))
+          result_rows = []
+
+          for row in rows:
+              url = row["primary_url"]
+              if not url.startswith("http"):
+                  result_rows.append({
+                      "route_id": row["route_id"],
+                      "component": row["component"],
+                      "url": url,
+                      "tested": False,
+                      "ok": False,
+                      "status": "",
+                      "content_type": "",
+                      "chars": 0,
+                      "contains_fits_name": False,
+                      "contains_directory_listing_terms": False,
+                      "error": "not_a_url_method_requirement"
+                  })
+                  continue
+
+              try:
+                  res = small_get(url)
+                  low = res["snippet"].lower()
+                  result_rows.append({
+                      "route_id": row["route_id"],
+                      "component": row["component"],
+                      "url": url,
+                      "tested": True,
+                      "ok": res["ok"],
+                      "status": res["status"],
+                      "content_type": res["content_type"],
+                      "chars": res["chars"],
+                      "contains_fits_name": ".fits" in low or ".fit" in low or ".fits.gz" in low,
+                      "contains_directory_listing_terms": "index of" in low or "parent directory" in low or "href" in low,
+                      "error": res["error"]
+                  })
+              except Exception as e:
+                  result_rows.append({
+                      "route_id": row["route_id"],
+                      "component": row["component"],
+                      "url": url,
+                      "tested": True,
+                      "ok": False,
+                      "status": "",
+                      "content_type": "",
+                      "chars": 0,
+                      "contains_fits_name": False,
+                      "contains_directory_listing_terms": False,
+                      "error": repr(e)[:500]
+                  })
+
+          out_csv = out / "R13MUF_OFFICIAL_ROUTE_REACHABILITY_NO_VALUES.csv"
+          with out_csv.open("w", newline="", encoding="utf-8") as f:
+              cols = ["route_id", "component", "url", "tested", "ok", "status", "content_type", "chars", "contains_fits_name", "contains_directory_listing_terms", "error"]
+              w = csv.DictWriter(f, fieldnames=cols)
+              w.writeheader()
+              w.writerows(result_rows)
+
+          ok_count = sum(1 for r in result_rows if r["ok"])
+          tested_count = sum(1 for r in result_rows if r["tested"])
+          (out / "R13MUF_ROUTE_REACHABILITY_SUMMARY.json").write_text(json.dumps({
+              "tested_count": tested_count,
+              "ok_count": ok_count,
+              "no_values_opened": True,
+              "fits_names_may_appear_in_directory_listing_only": any(r["contains_fits_name"] for r in result_rows),
+              "science_products_downloaded": False
+          }, indent=2), encoding="utf-8")
+          PY
+
+      - name: Pull OSA image and inspect minimal local route hints no values
+        shell: bash
+        timeout-minutes: 100
+        run: |
+          set -euo pipefail
+          STAGE="ACIRM_R13MUF_GITHUB_ACTIONS_MINIMAL_OFFICIAL_DATA_TREE_ACQUISITION_DESIGN_NO_VALUES"
+          OUT="$GITHUB_WORKSPACE/${STAGE}_OUTPUT"
+          OSA_IMAGE="integralsw/osa:11.2-2-g667521a3-20220403-190332-refcat-43.0-OSA11.0-66-g149047e"
+          echo "$OSA_IMAGE" > "$OUT/R13MUF_OSA_IMAGE_USED.txt"
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /usr/local/.ghcup || true
+          docker system prune -af || true
+          docker pull "$OSA_IMAGE" 2>&1 | tee "$OUT/R13MUF_DOCKER_PULL_OSA.log"
+
+          docker run --rm "$OSA_IMAGE" /bin/bash -lc '
+          set +e
+          echo ACIRM_R13MUF_OSA_LOCAL_HINTS_START
+          echo "NO_FITS_OPENING_NO_SCIENCE_VALUES"
+          env | sort | egrep "REP|OSA|ISDC|IC|IDX|CAT|AUX|SCW|RESP|IRF|RMF|SPI|DAL" || true
+          which spi_science_analysis || true
+          which dal_list || true
+          find / -maxdepth 5 -type d \( -iname "ic" -o -iname "idx" -o -iname "cat" -o -iname "aux" -o -iname "scw" -o -iname "*response*" -o -iname "*spi*" \) 2>/dev/null | sort | head -1000
+          echo "No FITS files were opened. No spectra/images/flux/counts were requested."
+          echo ACIRM_R13MUF_OSA_LOCAL_HINTS_END
+          ' > "$OUT/R13MUF_OSA_LOCAL_ROUTE_HINTS.txt" 2>&1 || true
+
+      - name: Classify acquisition design no values
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+          import csv
+          import json
+          import os
+
+          root = Path(os.environ["GITHUB_WORKSPACE"])
+          out = root / "ACIRM_R13MUF_GITHUB_ACTIONS_MINIMAL_OFFICIAL_DATA_TREE_ACQUISITION_DESIGN_NO_VALUES_OUTPUT"
+
+          reach_path = out / "R13MUF_OFFICIAL_ROUTE_REACHABILITY_NO_VALUES.csv"
+          reach_rows = list(csv.DictReader(reach_path.open(encoding="utf-8"))) if reach_path.exists() else []
+          ok_routes = [r["route_id"] for r in reach_rows if str(r.get("ok")).lower() == "true"]
+
+          hints = (out / "R13MUF_OSA_LOCAL_ROUTE_HINTS.txt").read_text(errors="replace").lower() if (out / "R13MUF_OSA_LOCAL_ROUTE_HINTS.txt").exists() else ""
+          has_osa_start_end = "acirm_r13muf_osa_local_hints_start" in hints and "acirm_r13muf_osa_local_hints_end" in hints
+          has_spi_cmd = "spi_science_analysis" in hints
+          has_dal = "dal_list" in hints
+          no_values_confirmed = "no fits files were opened" in hints and "no spectra/images/flux/counts" in hints
+
+          required_tree_routes = ["ROOT-HEASARC-INTEGRAL-DATA", "TREE-IC", "TREE-IDX", "TREE-CAT", "TREE-AUX", "TREE-SCW"]
+          reachable_required = [r for r in required_tree_routes if r in ok_routes]
+          missing_required = [r for r in required_tree_routes if r not in ok_routes]
+
+          if has_spi_cmd and has_dal and no_values_confirmed and len(reachable_required) >= 3:
+              acquisition_decision = "MINIMAL_OFFICIAL_DATA_TREE_DESIGN_READY_PARTIAL_ROUTE_REACHABILITY_VALUES_STILL_BLOCKED"
+              next_stage = "R13MUG_METADATA_ONLY_SCW_COVERAGE_AND_ROUTE_SELECTION_NO_VALUES"
+          elif has_spi_cmd and has_dal and no_values_confirmed:
+              acquisition_decision = "MINIMAL_OFFICIAL_DATA_TREE_DESIGN_BUILT_ROUTE_REACHABILITY_WEAK_VALUES_BLOCKED"
+              next_stage = "R13MUG_REPAIR_OFFICIAL_ROUTE_URLS_NO_VALUES"
+          else:
+              acquisition_decision = "MINIMAL_OFFICIAL_DATA_TREE_DESIGN_REPAIR_REQUIRED_NO_VALUES"
+              next_stage = "R13MUG_REPAIR_OSA_OR_NO_VALUES_CONFIRMATION"
+
+          decision = {
+              "stage": "ACIRM_R13MUF_GITHUB_ACTIONS_MINIMAL_OFFICIAL_DATA_TREE_ACQUISITION_DESIGN_NO_VALUES",
+              "acquisition_decision": acquisition_decision,
+              "next_stage": next_stage,
+              "ok_routes": ok_routes,
+              "reachable_required_routes": reachable_required,
+              "missing_required_routes": missing_required,
+              "has_spi_science_analysis": has_spi_cmd,
+              "has_dal_list": has_dal,
+              "no_values_confirmed": no_values_confirmed,
+              "science_values_authorized": False,
+              "new_values_opened": False,
+              "hard_blockers_before_values": [
+                  "exact_SCW_selection_not_locked",
+                  "exact_IC_version_not_locked",
+                  "exact_IDX_version_not_locked",
+                  "exact_CAT_version_not_locked",
+                  "exact_AUX_route_not_locked",
+                  "exact_SPI_response_IRF_RMF_not_locked",
+                  "background_method_not_locked",
+                  "511_line_window_and_sidebands_not_locked"
+              ],
+              "claim_ceiling": "minimal official data tree acquisition design only; no SPI/511 values"
+          }
+          (out / "R13MUF_ACQUISITION_DESIGN_DECISION.json").write_text(json.dumps(decision, indent=2), encoding="utf-8")
+          print(json.dumps(decision, indent=2))
+          PY
+
+      - name: Package results
+        shell: bash
+        run: |
+          set -euo pipefail
+          STAGE="ACIRM_R13MUF_GITHUB_ACTIONS_MINIMAL_OFFICIAL_DATA_TREE_ACQUISITION_DESIGN_NO_VALUES"
+          OUT="$GITHUB_WORKSPACE/${STAGE}_OUTPUT"
+          ZIP="$GITHUB_WORKSPACE/${STAGE}_RESULTS.zip"
+          SHA="$ZIP.sha256.txt"
+
+          cat > "$OUT/R13MUF_GO_NO_GO.csv" <<'CSV'
+          question,decision,reason
+          Open SPI/511 science values now?,NO,This stage is acquisition design only.
+          Download FITS now?,NO,FITS downloads remain forbidden in this stage.
+          Are official route roots partly reachable?,SEE_DECISION,Read R13MUF_ACQUISITION_DESIGN_DECISION.json.
+          Can this prove 511 keV or particle production?,NO,No values opened.
+          CSV
+
+          cd "$GITHUB_WORKSPACE"
+          rm -f "$ZIP" "$SHA"
+          zip -r "$ZIP" "$(basename "$OUT")"
+          sha256sum "$ZIP" > "$SHA"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ACIRM_R13MUF_GITHUB_ACTIONS_MINIMAL_OFFICIAL_DATA_TREE_ACQUISITION_DESIGN_NO_VALUES_RESULTS
+          path: |
+            ACIRM_R13MUF_GITHUB_ACTIONS_MINIMAL_OFFICIAL_DATA_TREE_ACQUISITION_DESIGN_NO_VALUES_RESULTS.zip
+            ACIRM_R13MUF_GITHUB_ACTIONS_MINIMAL_OFFICIAL_DATA_TREE_ACQUISITION_DESIGN_NO_VALUES_RESULTS.zip.sha256.txt
+          retention-days: 7
