@@ -1,0 +1,612 @@
+name: ACIRM R13MPQ deep SPI spectra column mapping or OSA decision
+
+on:
+  workflow_dispatch:
+
+jobs:
+  deep-mapping-or-osa:
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+
+    steps:
+      - name: Prepare output and firewall
+        shell: bash
+        run: |
+          set +e
+          STAGE="ACIRM_R13MPQ_DEEP_SPI_SPECTRA_COLUMN_MAPPING_OR_OSA_DECISION"
+          OUT="$GITHUB_WORKSPACE/${STAGE}_OUTPUT"
+          mkdir -p "$OUT"
+          cat > "$OUT/R13MPQ_AUTHORIZATION_AND_FIREWALL.json" <<'JSON'
+          {
+            "stage": "ACIRM_R13MPQ_DEEP_SPI_SPECTRA_COLUMN_MAPPING_OR_OSA_DECISION",
+            "inherits_from": "R13MUP opened 8 locked spi_spectra.fits.gz products but could not map 511 keV from columns",
+            "purpose": "Deeply inspect SPI spectra columns E_RANGE and COUNTS; extract a 511 diagnostic only if energy mapping is explicit and safe; otherwise stop and require official mapping/OSA.",
+            "allowed_scope": "read only the 8 prelocked spi_spectra.fits.gz products and only locked energy windows",
+            "locked_line_window_keV": [508.0, 514.0],
+            "locked_lower_sideband_keV": [490.0, 500.0],
+            "locked_upper_sideband_keV": [522.0, 532.0],
+            "forbidden_claims_even_if_nonzero": [
+              "proof",
+              "discovery",
+              "evidence",
+              "confirmed 511 keV detection",
+              "particle production",
+              "ACIRM established"
+            ],
+            "hard_stops": [
+              "no broad search",
+              "no post-hoc energy-window changes",
+              "no source switching",
+              "no event-file opening",
+              "no non-SPI spectra products",
+              "no claim promotion"
+            ],
+            "claim_ceiling": "mapping/readout feasibility or guarded diagnostic only; no detection claim"
+          }
+          JSON
+          echo "prepare_step_completed_utc=$(date -u)" > "$OUT/R13MPQ_STEP_STATUS.log"
+          exit 0
+
+      - name: Install dependencies
+        shell: bash
+        run: |
+          set +e
+          STAGE="ACIRM_R13MPQ_DEEP_SPI_SPECTRA_COLUMN_MAPPING_OR_OSA_DECISION"
+          OUT="$GITHUB_WORKSPACE/${STAGE}_OUTPUT"
+          mkdir -p "$OUT"
+          {
+            echo "install_start_utc=$(date -u)"
+            python3 --version
+            python3 -m pip --version
+            python3 -m pip install --upgrade pip
+            python3 -m pip install --no-cache-dir astropy numpy
+            python3 -c "import json, astropy, numpy; print(json.dumps({'astropy_import_ok': True, 'astropy_version': astropy.__version__, 'numpy_import_ok': True, 'numpy_version': numpy.__version__}, indent=2))"
+            echo "install_end_utc=$(date -u)"
+          } > "$OUT/R13MPQ_DEPENDENCY_INSTALL_LOG.txt" 2>&1
+          CODE=$?
+          echo "dependency_step_exit_code=$CODE" >> "$OUT/R13MPQ_DEPENDENCY_INSTALL_LOG.txt"
+          echo "dependency_step_exit_code=$CODE" >> "$OUT/R13MPQ_STEP_STATUS.log"
+          exit 0
+
+      - name: Run deep SPI spectra mapping
+        shell: bash
+        run: |
+          set +e
+          STAGE="ACIRM_R13MPQ_DEEP_SPI_SPECTRA_COLUMN_MAPPING_OR_OSA_DECISION"
+          OUT="$GITHUB_WORKSPACE/${STAGE}_OUTPUT"
+          mkdir -p "$OUT"
+
+          cat > "$OUT/r13mpq_runner.py" <<'PYCODE'
+          from pathlib import Path
+          from urllib.request import Request, urlopen, urlretrieve
+          import csv
+          import json
+          import math
+          import os
+          import re
+          import sys
+          import tempfile
+          import traceback
+
+          STAGE = "ACIRM_R13MPQ_DEEP_SPI_SPECTRA_COLUMN_MAPPING_OR_OSA_DECISION"
+          out = Path(os.environ.get("GITHUB_WORKSPACE", ".")) / (STAGE + "_OUTPUT")
+          out.mkdir(parents=True, exist_ok=True)
+
+          def write_json(name, obj):
+              (out / name).write_text(json.dumps(obj, indent=2, ensure_ascii=False), encoding="utf-8")
+
+          def write_csv(name, rows, columns):
+              with (out / name).open("w", newline="", encoding="utf-8") as f:
+                  w = csv.DictWriter(f, fieldnames=columns)
+                  w.writeheader()
+                  for row in rows:
+                      w.writerow({c: row.get(c, "") for c in columns})
+
+          def append_status(text):
+              with (out / "R13MPQ_STEP_STATUS.log").open("a", encoding="utf-8") as f:
+                  f.write(text + "\n")
+
+          def final_stop(decision, next_stage, **kwargs):
+              final = {
+                  "stage": STAGE,
+                  "decision": decision,
+                  "next_stage": next_stage,
+                  "claim_ceiling": "mapping/readout feasibility or guarded diagnostic only; no detection/evidence/proof/discovery claim"
+              }
+              final.update(kwargs)
+              write_json("R13MPQ_FINAL_DECISION.json", final)
+              print(json.dumps(final, indent=2))
+              return final
+
+          run_errors = []
+          append_status("runner_started")
+
+          locked_context = {
+              "target_day_start_utc": "2022-05-18T00:00:00.000Z",
+              "target_day_stop_utc": "2022-05-19T00:00:00.000Z",
+              "line_window_keV": [508.0, 514.0],
+              "lower_sideband_keV": [490.0, 500.0],
+              "upper_sideband_keV": [522.0, 532.0],
+              "strict_pm1h_product_claim": "FORBIDDEN",
+              "scope": "8 locked spi_spectra.fits.gz candidates from R13MUN-R2/R13MUP only"
+          }
+          write_json("R13MPQ_LOCKED_CONTEXT.json", locked_context)
+
+          candidates = [
+              {"scw_id": "250400090010", "url": "https://heasarc.gsfc.nasa.gov/FTP/integral/data/scw/2504/250400090010.001/spi_spectra.fits.gz"},
+              {"scw_id": "250400020010", "url": "https://heasarc.gsfc.nasa.gov/FTP/integral/data/scw/2504/250400020010.001/spi_spectra.fits.gz"},
+              {"scw_id": "250400080010", "url": "https://heasarc.gsfc.nasa.gov/FTP/integral/data/scw/2504/250400080010.001/spi_spectra.fits.gz"},
+              {"scw_id": "250400030010", "url": "https://heasarc.gsfc.nasa.gov/FTP/integral/data/scw/2504/250400030010.001/spi_spectra.fits.gz"},
+              {"scw_id": "250400070021", "url": "https://heasarc.gsfc.nasa.gov/FTP/integral/data/scw/2504/250400070021.001/spi_spectra.fits.gz"},
+              {"scw_id": "250400040010", "url": "https://heasarc.gsfc.nasa.gov/FTP/integral/data/scw/2504/250400040010.001/spi_spectra.fits.gz"},
+              {"scw_id": "250400060010", "url": "https://heasarc.gsfc.nasa.gov/FTP/integral/data/scw/2504/250400060010.001/spi_spectra.fits.gz"},
+              {"scw_id": "250400050010", "url": "https://heasarc.gsfc.nasa.gov/FTP/integral/data/scw/2504/250400050010.001/spi_spectra.fits.gz"}
+          ]
+          for r in candidates:
+              r["product"] = "spi_spectra.fits.gz"
+              r["locked_by"] = "R13MUN_R2_R13MUP_LOCKED_SPI_SPECTRA_PRODUCTS"
+          write_csv("R13MPQ_LOCKED_SPI_SPECTRA_CANDIDATES_8.csv", candidates, ["scw_id", "product", "url", "locked_by"])
+
+          dependency = {"numpy_import_ok": False, "numpy_version": "", "astropy_import_ok": False, "astropy_version": ""}
+          try:
+              import numpy as np
+              dependency["numpy_import_ok"] = True
+              dependency["numpy_version"] = np.__version__
+              from astropy.io import fits
+              import astropy
+              dependency["astropy_import_ok"] = True
+              dependency["astropy_version"] = astropy.__version__
+          except Exception as e:
+              run_errors.append("dependency_import_error: " + repr(e))
+              run_errors.append(traceback.format_exc()[:2000])
+              write_json("R13MPQ_DEPENDENCY_STATUS.json", dependency)
+              final_stop(
+                  "DEPENDENCY_IMPORT_FAILED_VALUES_NOT_OPENED",
+                  "R13MPR_USE_OSA_CONTAINER_OR_PURE_PYTHON_FITS_READER",
+                  locked_candidates=len(candidates),
+                  downloaded_products=0,
+                  opened_products=0,
+                  mapping_safe=False,
+                  diagnostic_value_rows=0,
+                  read_science_values=False,
+                  run_errors_count=len(run_errors),
+                  run_errors=run_errors
+              )
+              sys.exit(0)
+          write_json("R13MPQ_DEPENDENCY_STATUS.json", dependency)
+
+          def json_preview(x, max_len=500):
+              try:
+                  s = json.dumps(x, default=str)
+              except Exception:
+                  s = str(x)
+              return s[:max_len]
+
+          def head_info(url):
+              try:
+                  req = Request(url, method="HEAD", headers={"User-Agent": "ACIRM-R13MPQ-deep-mapping"})
+                  with urlopen(req, timeout=30) as r:
+                      length = r.headers.get("Content-Length", "")
+                      ctype = r.headers.get("Content-Type", "")
+                      status = getattr(r, "status", "")
+                      return status, ctype, int(length) if str(length).isdigit() else None, ""
+              except Exception as e:
+                  return "", "", None, repr(e)[:500]
+
+          def parse_erange_value(v):
+              # Return (low, high, method, confidence) or (None, None, reason, False).
+              try:
+                  arr = np.asarray(v)
+                  if arr.shape == (2,):
+                      a = float(arr[0])
+                      b = float(arr[1])
+                      if a < b and -1e6 < a < 1e6 and -1e6 < b < 1e6:
+                          return a, b, "numeric_pair", True
+                  if arr.size == 2 and arr.ndim > 0:
+                      flat = arr.astype(float).ravel()
+                      a = float(flat[0])
+                      b = float(flat[1])
+                      if a < b and -1e6 < a < 1e6 and -1e6 < b < 1e6:
+                          return a, b, "numeric_pair_flat", True
+                  if arr.size == 1:
+                      s = str(arr.item())
+                  else:
+                      s = str(v)
+              except Exception:
+                  s = str(v)
+              nums = re.findall(r"[-+]?\d+(?:\.\d+)?", s)
+              if len(nums) >= 2:
+                  try:
+                      a = float(nums[0])
+                      b = float(nums[1])
+                      if a < b and -1e6 < a < 1e6 and -1e6 < b < 1e6:
+                          return a, b, "string_two_numbers", True
+                  except Exception:
+                      pass
+              return None, None, "unparsed", False
+
+          def safe_counts_scalar_or_sum(x):
+              try:
+                  arr = np.asarray(x, dtype=float)
+                  if arr.size == 0:
+                      return None
+                  return float(np.nansum(arr))
+              except Exception:
+                  return None
+
+          product_rows = []
+          hdu_rows = []
+          column_rows = []
+          erange_rows = []
+          readout_rows = []
+          mapping_attempt_rows = []
+
+          mapped_rows_total = 0
+          explicit_keV_like_rows = 0
+          downloaded_count = 0
+          opened_count = 0
+          diagnostic_value_rows = 0
+          read_science_values = False
+
+          for idx, cand in enumerate(candidates, 1):
+              scw_id = cand["scw_id"]
+              url = cand["url"]
+              append_status(f"candidate_{idx}_start_{scw_id}")
+              status, ctype, content_length, head_error = head_info(url)
+              if head_error:
+                  run_errors.append(f"head_error_{scw_id}: {head_error}")
+
+              tmp = None
+              try:
+                  if content_length is not None and content_length > 80 * 1024 * 1024:
+                      product_rows.append({
+                          "scw_id": scw_id, "url": url, "head_status": status, "content_type": ctype,
+                          "content_length_bytes": content_length, "download_status": "SKIPPED_TOO_LARGE",
+                          "open_status": "NOT_OPENED", "error": ""
+                      })
+                      continue
+
+                  with tempfile.NamedTemporaryFile(suffix=".fits.gz", delete=False) as tf:
+                      tmp = Path(tf.name)
+                  urlretrieve(url, tmp)
+                  downloaded_count += 1
+
+                  with fits.open(tmp, memmap=False) as hdul:
+                      opened_count += 1
+                      for hdu_index, hdu in enumerate(hdul):
+                          hname = getattr(hdu, "name", "")
+                          hclass = hdu.__class__.__name__
+                          header = hdu.header
+                          cols = []
+                          if hasattr(hdu, "columns") and hdu.columns is not None:
+                              try:
+                                  cols = list(hdu.columns.names)
+                              except Exception:
+                                  cols = []
+                          nrows = ""
+                          try:
+                              nrows = len(hdu.data) if hdu.data is not None else ""
+                          except Exception:
+                              nrows = ""
+
+                          selected_header = {}
+                          for key in header.keys():
+                              ku = str(key).upper()
+                              if (
+                                  ku.startswith("T") or "ENER" in ku or "E_" in ku or "CHAN" in ku or
+                                  "COUN" in ku or "SPEC" in ku or "KEV" in ku or "GAIN" in ku or "RANGE" in ku
+                              ):
+                                  try:
+                                      selected_header[str(key)] = str(header[key])
+                                  except Exception:
+                                      pass
+
+                          hdu_rows.append({
+                              "scw_id": scw_id,
+                              "hdu_index": hdu_index,
+                              "hdu_name": hname,
+                              "hdu_class": hclass,
+                              "n_columns": len(cols),
+                              "columns_json": json.dumps(cols),
+                              "n_rows": nrows,
+                              "selected_header_json": json.dumps(selected_header)[:5000]
+                          })
+
+                          if not cols or getattr(hdu, "data", None) is None:
+                              continue
+
+                          for col in cols:
+                              try:
+                                  data = hdu.data[col]
+                                  arr = np.asarray(data)
+                                  dtype = str(arr.dtype)
+                                  shape = str(arr.shape)
+                                  first_values = []
+                                  for j in range(min(5, len(arr))):
+                                      first_values.append(str(arr[j])[:200])
+                                  unique_preview = ""
+                                  try:
+                                      flat = arr.ravel()
+                                      if flat.size <= 200:
+                                          uniq = np.unique(flat)
+                                          unique_preview = json_preview([str(x) for x in uniq[:20]], 1000)
+                                      else:
+                                          unique_preview = "too_many_or_array"
+                                  except Exception:
+                                      unique_preview = ""
+                                  idx1 = cols.index(col) + 1
+                                  column_rows.append({
+                                      "scw_id": scw_id,
+                                      "hdu_index": hdu_index,
+                                      "hdu_name": hname,
+                                      "column": col,
+                                      "dtype": dtype,
+                                      "shape": shape,
+                                      "first_values_json": json.dumps(first_values)[:1500],
+                                      "unique_preview": unique_preview,
+                                      "tunit_guess": str(header.get("TUNIT" + str(idx1), "")),
+                                      "tform_guess": str(header.get("TFORM" + str(idx1), "")),
+                                      "tdim_guess": str(header.get("TDIM" + str(idx1), "")),
+                                      "error": ""
+                                  })
+                              except Exception as e:
+                                  column_rows.append({
+                                      "scw_id": scw_id,
+                                      "hdu_index": hdu_index,
+                                      "hdu_name": hname,
+                                      "column": col,
+                                      "dtype": "",
+                                      "shape": "",
+                                      "first_values_json": "",
+                                      "unique_preview": "",
+                                      "tunit_guess": "",
+                                      "tform_guess": "",
+                                      "tdim_guess": "",
+                                      "error": repr(e)[:500]
+                                  })
+
+                          col_upper = {str(c).upper(): c for c in cols}
+                          if "E_RANGE" in col_upper and "COUNTS" in col_upper:
+                              e_col = col_upper["E_RANGE"]
+                              c_col = col_upper["COUNTS"]
+                              e_data = hdu.data[e_col]
+                              c_data = hdu.data[c_col]
+                              n = len(e_data)
+                              parsed = []
+                              for row_i in range(n):
+                                  low, high, parse_method, safe = parse_erange_value(e_data[row_i])
+                                  counts_sum = safe_counts_scalar_or_sum(c_data[row_i])
+                                  raw_e_preview = str(e_data[row_i])[:200]
+                                  raw_c_shape = str(np.asarray(c_data[row_i]).shape)
+                                  raw_c_preview = str(c_data[row_i])[:200]
+                                  erange_rows.append({
+                                      "scw_id": scw_id,
+                                      "hdu_index": hdu_index,
+                                      "hdu_name": hname,
+                                      "row_index": row_i,
+                                      "raw_E_RANGE_preview": raw_e_preview,
+                                      "parsed_low": low,
+                                      "parsed_high": high,
+                                      "parse_method": parse_method,
+                                      "parse_safe": safe,
+                                      "COUNTS_shape": raw_c_shape,
+                                      "COUNTS_sum": counts_sum,
+                                      "COUNTS_preview": raw_c_preview
+                                  })
+                                  if safe and low is not None and high is not None and counts_sum is not None:
+                                      parsed.append((row_i, low, high, counts_sum, parse_method))
+                                      mapped_rows_total += 1
+                                      if -5.0 <= low <= 10000.0 and 0.0 <= high <= 10000.0 and high > low:
+                                          explicit_keV_like_rows += 1
+
+                              window_defs = {
+                                  "line_508_514": (508.0, 514.0),
+                                  "lower_490_500": (490.0, 500.0),
+                                  "upper_522_532": (522.0, 532.0)
+                              }
+                              overlap_any = False
+                              for _, low, high, _, _ in parsed:
+                                  for _, (wlo, whi) in window_defs.items():
+                                      if high > wlo and low < whi:
+                                          overlap_any = True
+
+                              mapping_attempt_rows.append({
+                                  "scw_id": scw_id,
+                                  "hdu_index": hdu_index,
+                                  "hdu_name": hname,
+                                  "parsed_rows": len(parsed),
+                                  "overlap_any_locked_window": overlap_any,
+                                  "mapping_safe_for_guarded_readout": overlap_any,
+                                  "reason": "safe only if parsed E_RANGE overlaps locked energy windows"
+                              })
+
+                              if overlap_any:
+                                  sums = {}
+                                  bins = {}
+                                  for name, (wlo, whi) in window_defs.items():
+                                      val = 0.0
+                                      nb = 0
+                                      for _, low, high, counts_sum, _ in parsed:
+                                          if high > wlo and low < whi:
+                                              val += counts_sum
+                                              nb += 1
+                                      sums[name] = val if nb > 0 else None
+                                      bins[name] = nb
+                                  line_val = sums["line_508_514"]
+                                  low_val = sums["lower_490_500"]
+                                  high_val = sums["upper_522_532"]
+                                  side_mean = None
+                                  ratio = None
+                                  if low_val is not None and high_val is not None:
+                                      side_mean = 0.5 * (low_val + high_val)
+                                      if side_mean not in [0, None] and not (isinstance(side_mean, float) and math.isnan(side_mean)):
+                                          ratio = line_val / side_mean if line_val is not None else None
+                                  diagnostic_value_rows += 1
+                                  read_science_values = True
+                                  readout_rows.append({
+                                      "scw_id": scw_id,
+                                      "url": url,
+                                      "hdu_index": hdu_index,
+                                      "hdu_name": hname,
+                                      "energy_column": e_col,
+                                      "value_column": c_col,
+                                      "mapping_method": "E_RANGE_direct_parse",
+                                      "line_508_514_value": line_val,
+                                      "line_bins": bins["line_508_514"],
+                                      "lower_490_500_value": low_val,
+                                      "lower_bins": bins["lower_490_500"],
+                                      "upper_522_532_value": high_val,
+                                      "upper_bins": bins["upper_522_532"],
+                                      "sideband_mean": side_mean,
+                                      "line_to_sideband_mean_ratio": ratio,
+                                      "claim": "NO_DETECTION_CLAIM_DIAGNOSTIC_VALUE_ONLY"
+                                  })
+
+                  product_rows.append({
+                      "scw_id": scw_id, "url": url, "head_status": status, "content_type": ctype,
+                      "content_length_bytes": content_length, "download_status": "DOWNLOADED",
+                      "open_status": "OPENED", "error": ""
+                  })
+                  append_status(f"candidate_{idx}_opened_{scw_id}")
+              except Exception as e:
+                  product_rows.append({
+                      "scw_id": scw_id, "url": url, "head_status": status, "content_type": ctype,
+                      "content_length_bytes": content_length, "download_status": "FAILED",
+                      "open_status": "FAILED_OR_NOT_OPENED", "error": repr(e)[:500]
+                  })
+                  run_errors.append("product_error_" + scw_id + ": " + repr(e))
+                  run_errors.append(traceback.format_exc()[:1000])
+                  append_status(f"candidate_{idx}_failed_{scw_id}")
+              finally:
+                  try:
+                      if tmp is not None and tmp.exists():
+                          tmp.unlink()
+                  except Exception:
+                      pass
+
+          if not readout_rows:
+              readout_rows.append({
+                  "scw_id": "",
+                  "url": "",
+                  "hdu_index": "",
+                  "hdu_name": "",
+                  "energy_column": "",
+                  "value_column": "",
+                  "mapping_method": "",
+                  "line_508_514_value": "",
+                  "line_bins": "",
+                  "lower_490_500_value": "",
+                  "lower_bins": "",
+                  "upper_522_532_value": "",
+                  "upper_bins": "",
+                  "sideband_mean": "",
+                  "line_to_sideband_mean_ratio": "",
+                  "claim": "NO_DIAGNOSTIC_VALUE_EXTRACTED_NO_DETECTION_CLAIM"
+              })
+
+          write_csv("R13MPQ_PRODUCT_DOWNLOAD_OPEN_AUDIT.csv", product_rows, ["scw_id", "url", "head_status", "content_type", "content_length_bytes", "download_status", "open_status", "error"])
+          write_csv("R13MPQ_HDU_DEEP_STRUCTURE.csv", hdu_rows, ["scw_id", "hdu_index", "hdu_name", "hdu_class", "n_columns", "columns_json", "n_rows", "selected_header_json"])
+          write_csv("R13MPQ_COLUMN_DEEP_PROFILE.csv", column_rows, ["scw_id", "hdu_index", "hdu_name", "column", "dtype", "shape", "first_values_json", "unique_preview", "tunit_guess", "tform_guess", "tdim_guess", "error"])
+          write_csv("R13MPQ_E_RANGE_COUNTS_PROFILE.csv", erange_rows, ["scw_id", "hdu_index", "hdu_name", "row_index", "raw_E_RANGE_preview", "parsed_low", "parsed_high", "parse_method", "parse_safe", "COUNTS_shape", "COUNTS_sum", "COUNTS_preview"])
+          write_csv("R13MPQ_MAPPING_ATTEMPT_AUDIT.csv", mapping_attempt_rows, ["scw_id", "hdu_index", "hdu_name", "parsed_rows", "overlap_any_locked_window", "mapping_safe_for_guarded_readout", "reason"])
+          write_csv("R13MPQ_GUARDED_511_READOUT_IF_MAPPING_SAFE.csv", readout_rows, ["scw_id", "url", "hdu_index", "hdu_name", "energy_column", "value_column", "mapping_method", "line_508_514_value", "line_bins", "lower_490_500_value", "lower_bins", "upper_522_532_value", "upper_bins", "sideband_mean", "line_to_sideband_mean_ratio", "claim"])
+
+          opened_count = sum(1 for r in product_rows if r.get("open_status") == "OPENED")
+          downloaded_count = sum(1 for r in product_rows if r.get("download_status") == "DOWNLOADED")
+          mapping_safe = diagnostic_value_rows > 0
+
+          if diagnostic_value_rows > 0:
+              decision = "E_RANGE_MAPPING_SAFE_GUARDED_511_VALUES_EXTRACTED_NO_CLAIM"
+              next_stage = "R13MPR_VALIDATE_EXTRACTED_511_VALUES_WITH_OFFTIME_CONTROLS_AND_NULLS"
+          elif opened_count > 0 and mapped_rows_total > 0:
+              decision = "E_RANGE_PARSED_BUT_NO_LOCKED_511_OR_SIDEBAND_OVERLAP_NO_CLAIM"
+              next_stage = "R13MPR_OFFICIAL_E_RANGE_TO_KEV_MAPPING_OR_OSA_REQUIRED"
+          elif opened_count > 0:
+              decision = "SPI_SPECTRA_OPENED_E_RANGE_NOT_DIRECT_KEV_MAPPING_OSA_REQUIRED_NO_CLAIM"
+              next_stage = "R13MPR_OFFICIAL_OSA_PRODUCT_GENERATION_REQUIRED"
+          elif downloaded_count > 0:
+              decision = "PRODUCTS_DOWNLOADED_BUT_NOT_OPENED_NO_CLAIM"
+              next_stage = "R13MPR_REPAIR_FITS_OPENING"
+          else:
+              decision = "PRODUCTS_NOT_DOWNLOADED_NO_CLAIM"
+              next_stage = "R13MPR_REPAIR_NETWORK_OR_OSA_CONTAINER"
+
+          final_stop(
+              decision,
+              next_stage,
+              locked_candidates=len(candidates),
+              downloaded_products=downloaded_count,
+              opened_products=opened_count,
+              erange_profile_rows=len(erange_rows),
+              erange_mapped_rows_total=mapped_rows_total,
+              explicit_keV_like_rows=explicit_keV_like_rows,
+              mapping_safe=mapping_safe,
+              diagnostic_value_rows=diagnostic_value_rows,
+              read_science_values=read_science_values,
+              run_errors_count=len(run_errors),
+              run_errors=run_errors
+          )
+          append_status("runner_completed")
+          PYCODE
+
+          python3 "$OUT/r13mpq_runner.py" > "$OUT/R13MPQ_RUNNER_STDOUT.txt" 2> "$OUT/R13MPQ_RUNNER_STDERR.txt"
+          CODE=$?
+          echo "runner_exit_code=$CODE" >> "$OUT/R13MPQ_STEP_STATUS.log"
+
+          if [ ! -f "$OUT/R13MPQ_FINAL_DECISION.json" ]; then
+            cat > "$OUT/R13MPQ_FINAL_DECISION.json" <<'JSON'
+          {
+            "stage": "ACIRM_R13MPQ_DEEP_SPI_SPECTRA_COLUMN_MAPPING_OR_OSA_DECISION",
+            "decision": "RUNNER_FAILED_BEFORE_FINAL_DECISION",
+            "next_stage": "R13MPR_REPAIR_RUNNER_USING_STDOUT_STDERR",
+            "claim_ceiling": "no claim"
+          }
+          JSON
+          fi
+          exit 0
+
+      - name: Package results
+        if: always()
+        shell: bash
+        run: |
+          set +e
+          STAGE="ACIRM_R13MPQ_DEEP_SPI_SPECTRA_COLUMN_MAPPING_OR_OSA_DECISION"
+          OUT="$GITHUB_WORKSPACE/${STAGE}_OUTPUT"
+          ZIP="$GITHUB_WORKSPACE/${STAGE}_RESULTS.zip"
+          SHA="$ZIP.sha256.txt"
+          mkdir -p "$OUT"
+
+          if [ ! -f "$OUT/R13MPQ_FINAL_DECISION.json" ]; then
+            cat > "$OUT/R13MPQ_FINAL_DECISION.json" <<'JSON'
+          {
+            "stage": "ACIRM_R13MPQ_DEEP_SPI_SPECTRA_COLUMN_MAPPING_OR_OSA_DECISION",
+            "decision": "PACKAGING_REACHED_WITHOUT_FINAL_DECISION",
+            "next_stage": "R13MPR_REPAIR_WORKFLOW_PACKAGING_LOGS",
+            "claim_ceiling": "no claim"
+          }
+          JSON
+          fi
+
+          cat > "$OUT/R13MPQ_GO_NO_GO.csv" <<'CSV'
+          question,decision,reason
+          Does R13MPQ claim 511 keV detection?,NO,Only mapping/readout feasibility is allowed.
+          Does R13MPQ change the 511 window?,NO,Windows are locked from R13MUK/R13MUN.
+          Does R13MPQ perform broad search?,NO,Only 8 locked spi_spectra products are opened.
+          If mapping is unsafe, can we interpret values?,NO,Official mapping or OSA is required.
+          CSV
+
+          cd "$GITHUB_WORKSPACE"
+          rm -f "$ZIP" "$SHA"
+          zip -r "$ZIP" "$(basename "$OUT")"
+          sha256sum "$ZIP" > "$SHA"
+          exit 0
+
+      - name: Upload artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ACIRM_R13MPQ_DEEP_SPI_SPECTRA_COLUMN_MAPPING_OR_OSA_DECISION_RESULTS
+          path: |
+            ACIRM_R13MPQ_DEEP_SPI_SPECTRA_COLUMN_MAPPING_OR_OSA_DECISION_RESULTS.zip
+            ACIRM_R13MPQ_DEEP_SPI_SPECTRA_COLUMN_MAPPING_OR_OSA_DECISION_RESULTS.zip.sha256.txt
+          retention-days: 7
