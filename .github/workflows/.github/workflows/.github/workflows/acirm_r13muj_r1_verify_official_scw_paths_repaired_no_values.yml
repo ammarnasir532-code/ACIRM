@@ -1,4 +1,4 @@
-name: ACIRM R13MUJ verify official SCW paths for locked day manifest no values
+name: ACIRM R13MUJ R1 verify official SCW paths repaired no values
 
 on:
   workflow_dispatch:
@@ -16,12 +16,13 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          STAGE="ACIRM_R13MUJ_GITHUB_ACTIONS_VERIFY_OFFICIAL_SCW_PATHS_FOR_LOCKED_DAY_MANIFEST_NO_VALUES"
+          STAGE="ACIRM_R13MUJ_R1_GITHUB_ACTIONS_VERIFY_OFFICIAL_SCW_PATHS_REPAIRED_NO_VALUES"
           OUT="$GITHUB_WORKSPACE/${STAGE}_OUTPUT"
           mkdir -p "$OUT"
-          cat > "$OUT/R13MUJ_ROUTE_LOCK.json" <<'JSON'
+          cat > "$OUT/R13MUJ_R1_ROUTE_LOCK.json" <<'JSON'
           {
-            "stage": "ACIRM_R13MUJ_GITHUB_ACTIONS_VERIFY_OFFICIAL_SCW_PATHS_FOR_LOCKED_DAY_MANIFEST_NO_VALUES",
+            "stage": "ACIRM_R13MUJ_R1_GITHUB_ACTIONS_VERIFY_OFFICIAL_SCW_PATHS_REPAIRED_NO_VALUES",
+            "repair_reason": "R13MUJ original YAML failed because embedded CSV was not indented inside the YAML block scalar.",
             "opens_science_values": false,
             "downloads_science_products": false,
             "downloads_fits": false,
@@ -45,38 +46,47 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          STAGE="ACIRM_R13MUJ_GITHUB_ACTIONS_VERIFY_OFFICIAL_SCW_PATHS_FOR_LOCKED_DAY_MANIFEST_NO_VALUES"
+          STAGE="ACIRM_R13MUJ_R1_GITHUB_ACTIONS_VERIFY_OFFICIAL_SCW_PATHS_REPAIRED_NO_VALUES"
           OUT="$GITHUB_WORKSPACE/${STAGE}_OUTPUT"
-          cat > "$OUT/R13MUJ_INPUT_LOCKED_DAY_SCALE_SCW_MANIFEST_21_ROWS.csv" <<'CSV'
-scw_id_str,scw_ver_str,rev_dir_candidate,official_scw_dir_candidate_url,scw_type,good_spi,start_date,end_date
-250400110021,1,2504,https://heasarc.gsfc.nasa.gov/FTP/integral/data/scw/2504/250400110021.001/,slew,133,59717.7615575592,59717.763096912
-250400120010,1,2504,https://heasarc.gsfc.nasa.gov/FTP/integral/data/scw/2504/250400120010.001/,pointing,0,59717.763096912,59717.7631895046
-250400090021,1,2504,https://heasarc.gsfc.nasa.gov/FTP/integral/data/scw/2504/250400090021.001/,slew,132,59717.681337604,59717.6828653827
-250400090010,1,2504,https://heasarc.gsfc.nasa.gov/FTP/integral/data/scw/2504/250400090010.001/,pointing,3278,59717.6427611922,59717.681337604
-250400080021,1,2504,https://heasarc.gsfc.nasa.gov/FTP/integral/data/scw/2504/250400080021.001/,slew,133,59717.6412218394,59717.6427611922
-250400020010,1,2504,https://heasarc.gsfc.nasa.gov/FTP/integral/data/scw/2504/250400020010.001/,pointing,3472,59717.2947285785,59717.335712399
-250400010021,1,2504,https://heasarc.gsfc.nasa.gov/FTP/integral/data/scw/2504/250400010021.001/,slew,115,59717.2933975592,59717.2947285785
-250400010010,1,2504,https://heasarc.gsfc.nasa.gov/FTP/integral/data/scw/2504/250400010010.001/,pointing,770,59717.2794160694,59717.2933975592
-250400080010,1,2504,https://heasarc.gsfc.nasa.gov/FTP/integral/data/scw/2504/250400080010.001/,pointing,3248,59717.602691724,59717.6412218394
-250400020021,1,2504,https://heasarc.gsfc.nasa.gov/FTP/integral/data/scw/2504/250400020021.001/,slew,133,59717.335712399,59717.3372517518
-250400030010,1,2504,https://heasarc.gsfc.nasa.gov/FTP/integral/data/scw/2504/250400030010.001/,pointing,3299,59717.3372517518,59717.3758281635
-250400070021,1,2504,https://heasarc.gsfc.nasa.gov/FTP/integral/data/scw/2504/250400070021.001/,slew,7159,59717.5195782487,59717.602691724
-250400070010,1,2504,https://heasarc.gsfc.nasa.gov/FTP/integral/data/scw/2504/250400070010.001/,pointing,0,59717.5192888967,59717.5195782487
-250400030021,1,2504,https://heasarc.gsfc.nasa.gov/FTP/integral/data/scw/2504/250400030021.001/,slew,136,59717.3758281635,59717.3774022386
-250400060021,1,2504,https://heasarc.gsfc.nasa.gov/FTP/integral/data/scw/2504/250400060021.001/,slew,115,59717.5179578774,59717.5192888967
-250400040010,1,2504,https://heasarc.gsfc.nasa.gov/FTP/integral/data/scw/2504/250400040010.001/,pointing,5100,59717.3774022386,59717.4379115336
-250400060010,1,2504,https://heasarc.gsfc.nasa.gov/FTP/integral/data/scw/2504/250400060010.001/,pointing,3275,59717.4793583175,59717.5179578774
-250400040021,1,2504,https://heasarc.gsfc.nasa.gov/FTP/integral/data/scw/2504/250400040021.001/,slew,115,59717.4379115336,59717.4392425529
-250400050021,1,2504,https://heasarc.gsfc.nasa.gov/FTP/integral/data/scw/2504/250400050021.001/,slew,131,59717.4778421129,59717.4793583175
-250400000031,1,2504,https://heasarc.gsfc.nasa.gov/FTP/integral/data/scw/2504/250400000031.001/,slew,461,59717.2740804181,59717.2794160694
-250400050010,1,2504,https://heasarc.gsfc.nasa.gov/FTP/integral/data/scw/2504/250400050010.001/,pointing,3297,59717.4392425529,59717.4778421129
-CSV
+          python3 - <<'PY'
+          from pathlib import Path
+          import os
+
+          csv_text = """scw_id_str,scw_ver_str,rev_dir_candidate,official_scw_dir_candidate_url,scw_type,good_spi,start_date,end_date
+          250400110021,001,2504,https://heasarc.gsfc.nasa.gov/FTP/integral/data/scw/2504/250400110021.001/,slew,133,59717.7615575592,59717.763096912
+          250400120010,001,2504,https://heasarc.gsfc.nasa.gov/FTP/integral/data/scw/2504/250400120010.001/,pointing,0,59717.763096912,59717.7631895046
+          250400090021,001,2504,https://heasarc.gsfc.nasa.gov/FTP/integral/data/scw/2504/250400090021.001/,slew,132,59717.681337604,59717.6828653827
+          250400090010,001,2504,https://heasarc.gsfc.nasa.gov/FTP/integral/data/scw/2504/250400090010.001/,pointing,3278,59717.6427611922,59717.681337604
+          250400080021,001,2504,https://heasarc.gsfc.nasa.gov/FTP/integral/data/scw/2504/250400080021.001/,slew,133,59717.6412218394,59717.6427611922
+          250400020010,001,2504,https://heasarc.gsfc.nasa.gov/FTP/integral/data/scw/2504/250400020010.001/,pointing,3472,59717.2947285785,59717.335712399
+          250400010021,001,2504,https://heasarc.gsfc.nasa.gov/FTP/integral/data/scw/2504/250400010021.001/,slew,115,59717.2933975592,59717.2947285785
+          250400010010,001,2504,https://heasarc.gsfc.nasa.gov/FTP/integral/data/scw/2504/250400010010.001/,pointing,770,59717.2794160694,59717.2933975592
+          250400080010,001,2504,https://heasarc.gsfc.nasa.gov/FTP/integral/data/scw/2504/250400080010.001/,pointing,3248,59717.602691724,59717.6412218394
+          250400020021,001,2504,https://heasarc.gsfc.nasa.gov/FTP/integral/data/scw/2504/250400020021.001/,slew,133,59717.335712399,59717.3372517518
+          250400030010,001,2504,https://heasarc.gsfc.nasa.gov/FTP/integral/data/scw/2504/250400030010.001/,pointing,3299,59717.3372517518,59717.3758281635
+          250400070021,001,2504,https://heasarc.gsfc.nasa.gov/FTP/integral/data/scw/2504/250400070021.001/,slew,7159,59717.5195782487,59717.602691724
+          250400070010,001,2504,https://heasarc.gsfc.nasa.gov/FTP/integral/data/scw/2504/250400070010.001/,pointing,0,59717.5192888967,59717.5195782487
+          250400030021,001,2504,https://heasarc.gsfc.nasa.gov/FTP/integral/data/scw/2504/250400030021.001/,slew,136,59717.3758281635,59717.3774022386
+          250400060021,001,2504,https://heasarc.gsfc.nasa.gov/FTP/integral/data/scw/2504/250400060021.001/,slew,115,59717.5179578774,59717.5192888967
+          250400040010,001,2504,https://heasarc.gsfc.nasa.gov/FTP/integral/data/scw/2504/250400040010.001/,pointing,5100,59717.3774022386,59717.4379115336
+          250400060010,001,2504,https://heasarc.gsfc.nasa.gov/FTP/integral/data/scw/2504/250400060010.001/,pointing,3275,59717.4793583175,59717.5179578774
+          250400040021,001,2504,https://heasarc.gsfc.nasa.gov/FTP/integral/data/scw/2504/250400040021.001/,slew,115,59717.4379115336,59717.4392425529
+          250400050021,001,2504,https://heasarc.gsfc.nasa.gov/FTP/integral/data/scw/2504/250400050021.001/,slew,131,59717.4778421129,59717.4793583175
+          250400000031,001,2504,https://heasarc.gsfc.nasa.gov/FTP/integral/data/scw/2504/250400000031.001/,slew,461,59717.2740804181,59717.2794160694
+          250400050010,001,2504,https://heasarc.gsfc.nasa.gov/FTP/integral/data/scw/2504/250400050010.001/,pointing,3297,59717.4392425529,59717.4778421129
+          """
+
+          cleaned = "\n".join(line.strip() for line in csv_text.strip().splitlines()) + "\n"
+          out = Path(os.environ["GITHUB_WORKSPACE"]) / "ACIRM_R13MUJ_R1_GITHUB_ACTIONS_VERIFY_OFFICIAL_SCW_PATHS_REPAIRED_NO_VALUES_OUTPUT"
+          out.mkdir(parents=True, exist_ok=True)
+          (out / "R13MUJ_R1_INPUT_LOCKED_DAY_SCALE_SCW_MANIFEST_21_ROWS.csv").write_text(cleaned, encoding="utf-8")
+          PY
 
       - name: Verify official SCW path candidates metadata only
         shell: bash
         run: |
           set -euo pipefail
-          STAGE="ACIRM_R13MUJ_GITHUB_ACTIONS_VERIFY_OFFICIAL_SCW_PATHS_FOR_LOCKED_DAY_MANIFEST_NO_VALUES"
+          STAGE="ACIRM_R13MUJ_R1_GITHUB_ACTIONS_VERIFY_OFFICIAL_SCW_PATHS_REPAIRED_NO_VALUES"
           OUT="$GITHUB_WORKSPACE/${STAGE}_OUTPUT"
           python3 - <<'PY'
           from pathlib import Path
@@ -86,12 +96,12 @@ CSV
           import urllib.request
 
           root = Path(os.environ["GITHUB_WORKSPACE"])
-          out = root / "ACIRM_R13MUJ_GITHUB_ACTIONS_VERIFY_OFFICIAL_SCW_PATHS_FOR_LOCKED_DAY_MANIFEST_NO_VALUES_OUTPUT"
-          manifest_path = out / "R13MUJ_INPUT_LOCKED_DAY_SCALE_SCW_MANIFEST_21_ROWS.csv"
+          out = root / "ACIRM_R13MUJ_R1_GITHUB_ACTIONS_VERIFY_OFFICIAL_SCW_PATHS_REPAIRED_NO_VALUES_OUTPUT"
+          manifest_path = out / "R13MUJ_R1_INPUT_LOCKED_DAY_SCALE_SCW_MANIFEST_21_ROWS.csv"
 
           def small_get(url, timeout=25, max_bytes=300000):
               req = urllib.request.Request(url, headers={
-                  "User-Agent": "ACIRM-R13MUJ-official-scw-path-check-no-values",
+                  "User-Agent": "ACIRM-R13MUJ-R1-official-scw-path-check-no-values",
                   "Accept": "text/html,text/plain,*/*"
               })
               with urllib.request.urlopen(req, timeout=timeout) as r:
@@ -153,7 +163,7 @@ CSV
                       "error": repr(e)[:500]
                   })
 
-          with (out / "R13MUJ_OFFICIAL_SCW_PATH_VERIFICATION_METADATA_ONLY.csv").open("w", newline="", encoding="utf-8") as f:
+          with (out / "R13MUJ_R1_OFFICIAL_SCW_PATH_VERIFICATION_METADATA_ONLY.csv").open("w", newline="", encoding="utf-8") as f:
               cols = [
                   "scw_id","scw_ver","rev_dir","candidate_url","tested","ok","status","content_type",
                   "chars_limited","contains_index_terms","mentions_fits_name",
@@ -174,7 +184,7 @@ CSV
               "read_science_values": False,
               "science_values_authorized": False
           }
-          (out / "R13MUJ_PATH_VERIFICATION_SUMMARY.json").write_text(json.dumps(summary, indent=2), encoding="utf-8")
+          (out / "R13MUJ_R1_PATH_VERIFICATION_SUMMARY.json").write_text(json.dumps(summary, indent=2), encoding="utf-8")
           PY
 
       - name: Classify SCW path verification no values
@@ -188,8 +198,8 @@ CSV
           import os
 
           root = Path(os.environ["GITHUB_WORKSPACE"])
-          out = root / "ACIRM_R13MUJ_GITHUB_ACTIONS_VERIFY_OFFICIAL_SCW_PATHS_FOR_LOCKED_DAY_MANIFEST_NO_VALUES_OUTPUT"
-          verification_path = out / "R13MUJ_OFFICIAL_SCW_PATH_VERIFICATION_METADATA_ONLY.csv"
+          out = root / "ACIRM_R13MUJ_R1_GITHUB_ACTIONS_VERIFY_OFFICIAL_SCW_PATHS_REPAIRED_NO_VALUES_OUTPUT"
+          verification_path = out / "R13MUJ_R1_OFFICIAL_SCW_PATH_VERIFICATION_METADATA_ONLY.csv"
 
           rows = list(csv.DictReader(verification_path.open(encoding="utf-8"))) if verification_path.exists() else []
           ok_rows = [r for r in rows if str(r.get("ok")).lower() == "true"]
@@ -214,7 +224,7 @@ CSV
               next_stage = "R13MUK_REPAIR_SCW_PATH_FORMULA_OR_SOURCE_ROUTE_NO_VALUES"
 
           decision = {
-              "stage": "ACIRM_R13MUJ_GITHUB_ACTIONS_VERIFY_OFFICIAL_SCW_PATHS_FOR_LOCKED_DAY_MANIFEST_NO_VALUES",
+              "stage": "ACIRM_R13MUJ_R1_GITHUB_ACTIONS_VERIFY_OFFICIAL_SCW_PATHS_REPAIRED_NO_VALUES",
               "path_decision": path_decision,
               "next_stage": next_stage,
               "n_locked_scw_rows": len(rows),
@@ -236,7 +246,7 @@ CSV
               ],
               "claim_ceiling": "official SCW path verification metadata only; no SPI/511 values"
           }
-          (out / "R13MUJ_SCW_PATH_VERIFICATION_DECISION.json").write_text(json.dumps(decision, indent=2), encoding="utf-8")
+          (out / "R13MUJ_R1_SCW_PATH_VERIFICATION_DECISION.json").write_text(json.dumps(decision, indent=2), encoding="utf-8")
           print(json.dumps(decision, indent=2))
           PY
 
@@ -244,16 +254,16 @@ CSV
         shell: bash
         run: |
           set -euo pipefail
-          STAGE="ACIRM_R13MUJ_GITHUB_ACTIONS_VERIFY_OFFICIAL_SCW_PATHS_FOR_LOCKED_DAY_MANIFEST_NO_VALUES"
+          STAGE="ACIRM_R13MUJ_R1_GITHUB_ACTIONS_VERIFY_OFFICIAL_SCW_PATHS_REPAIRED_NO_VALUES"
           OUT="$GITHUB_WORKSPACE/${STAGE}_OUTPUT"
           ZIP="$GITHUB_WORKSPACE/${STAGE}_RESULTS.zip"
           SHA="$ZIP.sha256.txt"
 
-          cat > "$OUT/R13MUJ_GO_NO_GO.csv" <<'CSV'
+          cat > "$OUT/R13MUJ_R1_GO_NO_GO.csv" <<'CSV'
           question,decision,reason
           Open SPI/511 science values now?,NO,This stage verifies SCW paths only.
           Download FITS now?,NO,FITS downloads remain forbidden.
-          Are official locked SCW paths verified?,SEE_DECISION,Read R13MUJ_SCW_PATH_VERIFICATION_DECISION.json.
+          Are official locked SCW paths verified?,SEE_DECISION,Read R13MUJ_R1_SCW_PATH_VERIFICATION_DECISION.json.
           Can this prove 511 keV or particle production?,NO,No values opened.
           CSV
 
@@ -265,8 +275,8 @@ CSV
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: ACIRM_R13MUJ_GITHUB_ACTIONS_VERIFY_OFFICIAL_SCW_PATHS_FOR_LOCKED_DAY_MANIFEST_NO_VALUES_RESULTS
+          name: ACIRM_R13MUJ_R1_GITHUB_ACTIONS_VERIFY_OFFICIAL_SCW_PATHS_REPAIRED_NO_VALUES_RESULTS
           path: |
-            ACIRM_R13MUJ_GITHUB_ACTIONS_VERIFY_OFFICIAL_SCW_PATHS_FOR_LOCKED_DAY_MANIFEST_NO_VALUES_RESULTS.zip
-            ACIRM_R13MUJ_GITHUB_ACTIONS_VERIFY_OFFICIAL_SCW_PATHS_FOR_LOCKED_DAY_MANIFEST_NO_VALUES_RESULTS.zip.sha256.txt
+            ACIRM_R13MUJ_R1_GITHUB_ACTIONS_VERIFY_OFFICIAL_SCW_PATHS_REPAIRED_NO_VALUES_RESULTS.zip
+            ACIRM_R13MUJ_R1_GITHUB_ACTIONS_VERIFY_OFFICIAL_SCW_PATHS_REPAIRED_NO_VALUES_RESULTS.zip.sha256.txt
           retention-days: 7
