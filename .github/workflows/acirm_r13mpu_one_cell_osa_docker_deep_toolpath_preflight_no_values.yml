@@ -1,0 +1,401 @@
+name: ACIRM R13MPU one cell OSA Docker deep toolpath preflight no values
+
+on:
+  workflow_dispatch:
+
+jobs:
+  one-cell-osa-deep-preflight:
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+
+    steps:
+      - name: Run one cell OSA Docker deep toolpath preflight no values
+        shell: bash
+        run: |
+          set +e
+          STAGE="ACIRM_R13MPU_ONE_CELL_OSA_DOCKER_DEEP_TOOLPATH_PREFLIGHT_NO_VALUES"
+          OUT="$GITHUB_WORKSPACE/${STAGE}_OUTPUT"
+          mkdir -p "$OUT"
+
+          cat > "$OUT/R13MPU_FIREWALL.json" <<'JSON'
+          {
+            "stage": "ACIRM_R13MPU_ONE_CELL_OSA_DOCKER_DEEP_TOOLPATH_PREFLIGHT_NO_VALUES",
+            "inherits_from": "R13MPT pulled integralsw/osa:latest and ran the container but SPI tools were not visible in PATH.",
+            "purpose": "Do in one workflow what would otherwise be several repair cells: discover OSA Docker tags, pull usable image, inspect filesystem, find setup scripts, source candidate setup files, search for SPI executables, and test tool help without science data.",
+            "downloads_science_data": false,
+            "opens_fits": false,
+            "reads_science_values": false,
+            "runs_spi_science_analysis_on_data": false,
+            "allowed_actions": [
+              "docker tag discovery",
+              "docker pull",
+              "container filesystem inspection",
+              "PATH/setup discovery",
+              "command help/version checks only"
+            ],
+            "forbidden_claims": [
+              "511 keV detection",
+              "evidence",
+              "proof",
+              "discovery",
+              "particle production",
+              "ACIRM established"
+            ],
+            "claim_ceiling": "environment and toolpath preflight only"
+          }
+          JSON
+
+          cat > "$OUT/controller.py" <<'PYCODE'
+          from pathlib import Path
+          import csv
+          import json
+          import os
+          import re
+          import subprocess
+          import time
+          import urllib.request
+
+          STAGE = "ACIRM_R13MPU_ONE_CELL_OSA_DOCKER_DEEP_TOOLPATH_PREFLIGHT_NO_VALUES"
+          out = Path(os.environ.get("GITHUB_WORKSPACE", ".")) / (STAGE + "_OUTPUT")
+          out.mkdir(parents=True, exist_ok=True)
+
+          def write_json(name, obj):
+              (out / name).write_text(json.dumps(obj, indent=2, ensure_ascii=False), encoding="utf-8")
+
+          def write_csv(name, rows, columns):
+              with (out / name).open("w", newline="", encoding="utf-8") as f:
+                  w = csv.DictWriter(f, fieldnames=columns)
+                  w.writeheader()
+                  for r in rows:
+                      w.writerow({c: r.get(c, "") for c in columns})
+
+          def run_cmd(cmd, log_name, timeout=900):
+              log_path = out / log_name
+              t0 = time.time()
+              try:
+                  p = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=timeout)
+                  log_path.write_text(p.stdout, encoding="utf-8", errors="replace")
+                  return {"exit_code": p.returncode, "seconds": round(time.time() - t0, 2), "log": str(log_path), "stdout_tail": p.stdout[-3000:]}
+              except subprocess.TimeoutExpired as e:
+                  txt = (e.stdout or "") + "\nTIMEOUT\n"
+                  log_path.write_text(txt, encoding="utf-8", errors="replace")
+                  return {"exit_code": 124, "seconds": round(time.time() - t0, 2), "log": str(log_path), "stdout_tail": txt[-3000:]}
+
+          def dockerhub_tags():
+              tags = []
+              url = "https://hub.docker.com/v2/repositories/integralsw/osa/tags?page_size=100"
+              try:
+                  with urllib.request.urlopen(url, timeout=30) as r:
+                      data = json.loads(r.read().decode("utf-8", errors="replace"))
+                  for item in data.get("results", []):
+                      name = item.get("name", "")
+                      if name:
+                          tags.append(name)
+              except Exception as e:
+                  write_json("R13MPU_DOCKERHUB_TAG_DISCOVERY_ERROR.json", {"error": repr(e)})
+              return tags
+
+          def image_safe_name(image):
+              return re.sub(r"[^A-Za-z0-9_.-]+", "_", image)
+
+          def make_inside_script():
+              script = r'''#!/usr/bin/env bash
+          set +e
+          echo "CONTAINER_RUNTIME_OK"
+          echo "date_utc=$(date -u)"
+          echo "uname=$(uname -a)"
+          echo "whoami=$(whoami 2>/dev/null)"
+          echo "pwd=$(pwd)"
+          echo "PATH_INITIAL=$PATH"
+          echo "OS_RELEASE_START"
+          cat /etc/os-release 2>/dev/null || true
+          echo "OS_RELEASE_END"
+
+          TOOLS="spi_science_analysis og_create dal_list spiros ibis_science_analysis ii_spectra_extract"
+
+          echo "DIRECT_COMMAND_CHECK_START"
+          for t in $TOOLS; do
+            if command -v "$t" >/dev/null 2>&1; then
+              echo "DIRECT_FOUND|$t|$(command -v "$t")"
+            else
+              echo "DIRECT_MISSING|$t|"
+            fi
+          done
+          echo "DIRECT_COMMAND_CHECK_END"
+
+          echo "SETUP_CANDIDATES_START"
+          find / -maxdepth 7 -type f \( -iname "*setup*.sh" -o -iname "*init*.sh" -o -iname "osa*.sh" -o -iname "isdc*.sh" -o -iname "headas-init.sh" -o -iname "*.bash" \) 2>/dev/null | head -300 | while read f; do
+            echo "SETUP_CANDIDATE|$f"
+          done
+          echo "SETUP_CANDIDATES_END"
+
+          echo "EXECUTABLE_CANDIDATES_START"
+          for t in $TOOLS; do
+            find / -type f -name "$t" -perm /111 2>/dev/null | head -100 | while read f; do
+              echo "EXEC_FOUND|$t|$f"
+            done
+          done
+          echo "EXECUTABLE_CANDIDATES_END"
+
+          echo "DIRECTORY_HINTS_START"
+          for d in /isdc /opt /usr/local /usr/local/osa /usr/local/bin /opt/osa /headas /home /workdir /software; do
+            if [ -e "$d" ]; then
+              echo "DIR_EXISTS|$d"
+              ls -la "$d" 2>/dev/null | head -80 | sed "s/^/DIR_LIST|$d|/"
+            fi
+          done
+          echo "DIRECTORY_HINTS_END"
+
+          echo "SETUP_SOURCE_TEST_START"
+          CANDIDATES=$(find / -maxdepth 7 -type f \( -iname "*setup*.sh" -o -iname "*init*.sh" -o -iname "osa*.sh" -o -iname "isdc*.sh" -o -iname "headas-init.sh" -o -iname "*.bash" \) 2>/dev/null | head -120)
+          for s in $CANDIDATES; do
+            bash -lc "set +e; source '$s' >/dev/null 2>&1; for t in $TOOLS; do if command -v \$t >/dev/null 2>&1; then echo SETUP_FOUND_TOOL|'$s'|\$t|\$(command -v \$t); fi; done" 2>/dev/null
+          done
+          echo "SETUP_SOURCE_TEST_END"
+
+          echo "HELP_TEST_START"
+          for t in $TOOLS; do
+            P=$(command -v "$t" 2>/dev/null)
+            if [ -n "$P" ]; then
+              echo "HELP_TEST_DIRECT_START|$t|$P"
+              timeout 30 "$P" -h 2>&1 | head -80 || timeout 30 "$P" --help 2>&1 | head -80 || true
+              echo "HELP_TEST_DIRECT_END|$t|$P"
+            fi
+          done
+          for t in $TOOLS; do
+            find / -type f -name "$t" -perm /111 2>/dev/null | head -3 | while read P; do
+              echo "HELP_TEST_ABSPATH_START|$t|$P"
+              timeout 30 "$P" -h 2>&1 | head -80 || timeout 30 "$P" --help 2>&1 | head -80 || true
+              echo "HELP_TEST_ABSPATH_END|$t|$P"
+            done
+          done
+          echo "HELP_TEST_END"
+
+          echo "ENV_HINTS_START"
+          env | sort | grep -E "OSA|ISDC|REP_BASE|CURRENT_IC|HEADAS|PFILES|PATH|LD_LIBRARY_PATH" || true
+          echo "ENV_HINTS_END"
+          '''
+              path = out / "inside_container_inspect.sh"
+              path.write_text(script, encoding="utf-8")
+              os.chmod(path, 0o755)
+              return path
+
+          write_json("R13MPU_RUNTIME_FIREWALL_CONFIRMATION.json", {
+              "downloads_science_data": False,
+              "opens_fits": False,
+              "reads_science_values": False,
+              "runs_spi_science_analysis_on_data": False
+          })
+
+          run_cmd(["bash", "-lc", "docker --version && docker info"], "R13MPU_DOCKER_INFO.log", timeout=120)
+
+          discovered_tags = dockerhub_tags()
+          base_tags = ["latest", "11.2", "11.1", "11.0", "10.2", "12.0"]
+          priority_tags = []
+          for t in base_tags + discovered_tags:
+              if t and t not in priority_tags:
+                  priority_tags.append(t)
+          priority_tags = priority_tags[:12]
+          candidate_images = [f"integralsw/osa:{t}" for t in priority_tags]
+          write_json("R13MPU_DOCKER_TAGS_AND_IMAGE_CANDIDATES.json", {
+              "dockerhub_tags_discovered": discovered_tags,
+              "candidate_images": candidate_images
+          })
+
+          make_inside_script()
+
+          image_rows = []
+          tool_rows = []
+          selected = None
+          selected_reason = ""
+
+          for idx, image in enumerate(candidate_images, 1):
+              safe = image_safe_name(image)
+              pull = run_cmd(["docker", "pull", image], f"R13MPU_PULL_{safe}.log", timeout=1200)
+              row = {
+                  "priority": idx,
+                  "image": image,
+                  "pull_exit_code": pull["exit_code"],
+                  "pull_seconds": pull["seconds"],
+                  "container_exit_code": "",
+                  "container_seconds": "",
+                  "container_runtime_ok": False,
+                  "direct_spi_found": False,
+                  "exec_spi_found": False,
+                  "setup_spi_found": False,
+                  "direct_og_create_found": False,
+                  "exec_og_create_found": False,
+                  "setup_og_create_found": False,
+                  "direct_dal_list_found": False,
+                  "exec_dal_list_found": False,
+                  "setup_dal_list_found": False,
+                  "selected": False,
+                  "selection_reason": ""
+              }
+              if pull["exit_code"] != 0:
+                  image_rows.append(row)
+                  continue
+
+              container_log_name = f"R13MPU_CONTAINER_INSPECT_{safe}.log"
+              container_cmd = [
+                  "docker", "run", "--rm",
+                  "-v", f"{out}:/out",
+                  "--entrypoint", "/bin/bash",
+                  image,
+                  "/out/inside_container_inspect.sh"
+              ]
+              cont = run_cmd(container_cmd, container_log_name, timeout=900)
+              row["container_exit_code"] = cont["exit_code"]
+              row["container_seconds"] = cont["seconds"]
+
+              log_text = (out / container_log_name).read_text(encoding="utf-8", errors="replace")
+              row["container_runtime_ok"] = "CONTAINER_RUNTIME_OK" in log_text
+
+              for tool in ["spi_science_analysis", "og_create", "dal_list", "spiros"]:
+                  direct_found = f"DIRECT_FOUND|{tool}|" in log_text
+                  exec_found = f"EXEC_FOUND|{tool}|" in log_text
+                  setup_found = any(("SETUP_FOUND_TOOL|" in line and f"|{tool}|" in line) for line in log_text.splitlines())
+                  lines = [line for line in log_text.splitlines() if f"|{tool}|" in line][:20]
+                  tool_rows.append({
+                      "image": image,
+                      "tool": tool,
+                      "direct_found": direct_found,
+                      "exec_found": exec_found,
+                      "setup_found": setup_found,
+                      "paths_or_lines": "; ".join(lines)[:4000]
+                  })
+                  if tool == "spi_science_analysis":
+                      row["direct_spi_found"] = direct_found
+                      row["exec_spi_found"] = exec_found
+                      row["setup_spi_found"] = setup_found
+                  if tool == "og_create":
+                      row["direct_og_create_found"] = direct_found
+                      row["exec_og_create_found"] = exec_found
+                      row["setup_og_create_found"] = setup_found
+                  if tool == "dal_list":
+                      row["direct_dal_list_found"] = direct_found
+                      row["exec_dal_list_found"] = exec_found
+                      row["setup_dal_list_found"] = setup_found
+
+              spi_any = row["direct_spi_found"] or row["exec_spi_found"] or row["setup_spi_found"]
+              og_any = row["direct_og_create_found"] or row["exec_og_create_found"] or row["setup_og_create_found"]
+              dal_any = row["direct_dal_list_found"] or row["exec_dal_list_found"] or row["setup_dal_list_found"]
+
+              if selected is None and row["container_runtime_ok"] and spi_any and (og_any or dal_any):
+                  row["selected"] = True
+                  row["selection_reason"] = "SPI tool and at least one OSA support tool found by PATH, setup, or absolute executable search."
+                  selected = dict(row)
+                  selected_reason = row["selection_reason"]
+
+              image_rows.append(row)
+
+              if selected is not None:
+                  break
+
+          write_csv("R13MPU_IMAGE_AND_CONTAINER_AUDIT.csv", image_rows, [
+              "priority", "image", "pull_exit_code", "pull_seconds", "container_exit_code", "container_seconds",
+              "container_runtime_ok", "direct_spi_found", "exec_spi_found", "setup_spi_found",
+              "direct_og_create_found", "exec_og_create_found", "setup_og_create_found",
+              "direct_dal_list_found", "exec_dal_list_found", "setup_dal_list_found",
+              "selected", "selection_reason"
+          ])
+          write_csv("R13MPU_TOOL_DISCOVERY_ROWS.csv", tool_rows, [
+              "image", "tool", "direct_found", "exec_found", "setup_found", "paths_or_lines"
+          ])
+
+          if selected is None:
+              pulled_any = any(r["pull_exit_code"] == 0 for r in image_rows)
+              ran_any = any(bool(r["container_runtime_ok"]) for r in image_rows)
+              spi_any = any(bool(r["direct_spi_found"] or r["exec_spi_found"] or r["setup_spi_found"]) for r in image_rows)
+              if not pulled_any:
+                  decision = "NO_OSA_DOCKER_IMAGE_PULLABLE_AFTER_TAG_DISCOVERY_NO_VALUES"
+                  next_stage = "R13MPV_EXTERNAL_RUNNER_OR_APPTAINER_REQUIRED"
+              elif not ran_any:
+                  decision = "OSA_DOCKER_IMAGES_PULL_BUT_NO_CONTAINER_RUNTIME_NO_VALUES"
+                  next_stage = "R13MPV_REPAIR_DOCKER_RUNTIME_OR_USE_APPTAINER"
+              elif spi_any:
+                  decision = "SPI_TOOL_FOUND_BUT_REQUIRED_SUPPORT_TOOLS_NOT_CONFIRMED_NO_VALUES"
+                  next_stage = "R13MPV_USE_ABSOLUTE_PATH_OR_MANUAL_OSA_ENV_REPAIR"
+              else:
+                  decision = "OSA_DOCKER_AVAILABLE_BUT_SPI_EXECUTABLES_NOT_FOUND_AFTER_DEEP_SEARCH_NO_VALUES"
+                  next_stage = "R13MPV_OFFICIAL_OSA_INSTALL_OR_APPTAINER_ROUTE_REQUIRED"
+              selected_image = ""
+          else:
+              selected_image = selected["image"]
+              if selected["direct_spi_found"] and (selected["direct_og_create_found"] or selected["direct_dal_list_found"]):
+                  decision = "OSA_DOCKER_SPI_TOOLS_VISIBLE_IN_PATH_PREFLIGHT_PASSED_NO_VALUES"
+                  next_stage = "R13MPV_ONE_CELL_OSA_OBSGROUP_DRY_RUN_THEN_GUARDED_VALUE_ROUTE"
+              elif selected["setup_spi_found"] or selected["setup_og_create_found"] or selected["setup_dal_list_found"]:
+                  decision = "OSA_DOCKER_SPI_TOOLS_FOUND_AFTER_SETUP_SOURCE_PREFLIGHT_PASSED_NO_VALUES"
+                  next_stage = "R13MPV_ONE_CELL_SOURCE_SETUP_AND_OSA_OBSGROUP_DRY_RUN_NO_VALUES"
+              else:
+                  decision = "OSA_DOCKER_SPI_EXECUTABLES_FOUND_BY_ABSOLUTE_PATH_PREFLIGHT_PASSED_NO_VALUES"
+                  next_stage = "R13MPV_ONE_CELL_USE_ABSOLUTE_TOOL_PATHS_FOR_OSA_DRY_RUN_NO_VALUES"
+
+          final = {
+              "stage": STAGE,
+              "decision": decision,
+              "next_stage": next_stage,
+              "selected_image": selected_image,
+              "selected_reason": selected_reason,
+              "images_tested_count": len(image_rows),
+              "dockerhub_tags_discovered_count": len(discovered_tags),
+              "pull_any_ok": any(r["pull_exit_code"] == 0 for r in image_rows),
+              "container_runtime_any_ok": any(bool(r["container_runtime_ok"]) for r in image_rows),
+              "spi_science_analysis_any_found": any(bool(r["direct_spi_found"] or r["exec_spi_found"] or r["setup_spi_found"]) for r in image_rows),
+              "og_create_any_found": any(bool(r["direct_og_create_found"] or r["exec_og_create_found"] or r["setup_og_create_found"]) for r in image_rows),
+              "dal_list_any_found": any(bool(r["direct_dal_list_found"] or r["exec_dal_list_found"] or r["setup_dal_list_found"]) for r in image_rows),
+              "downloads_science_data": False,
+              "opens_fits": False,
+              "reads_science_values": False,
+              "runs_spi_science_analysis_on_data": False,
+              "claim_ceiling": "environment and toolpath preflight only; no 511 detection/evidence/proof/discovery claim"
+          }
+          write_json("R13MPU_FINAL_DECISION.json", final)
+          print(json.dumps(final, indent=2, ensure_ascii=False))
+          PYCODE
+
+          python3 "$OUT/controller.py" > "$OUT/R13MPU_CONTROLLER_STDOUT.txt" 2> "$OUT/R13MPU_CONTROLLER_STDERR.txt"
+          CODE=$?
+          echo "controller_exit_code=$CODE" > "$OUT/R13MPU_STEP_STATUS.log"
+
+          if [ ! -f "$OUT/R13MPU_FINAL_DECISION.json" ]; then
+            cat > "$OUT/R13MPU_FINAL_DECISION.json" <<'JSON'
+          {
+            "stage": "ACIRM_R13MPU_ONE_CELL_OSA_DOCKER_DEEP_TOOLPATH_PREFLIGHT_NO_VALUES",
+            "decision": "CONTROLLER_FAILED_BEFORE_FINAL_DECISION",
+            "next_stage": "R13MPV_REPAIR_CONTROLLER_FROM_STDOUT_STDERR",
+            "downloads_science_data": false,
+            "opens_fits": false,
+            "reads_science_values": false,
+            "claim_ceiling": "no values; no claim"
+          }
+          JSON
+          fi
+
+          cat > "$OUT/R13MPU_GO_NO_GO.csv" <<'CSV'
+          question,decision,reason
+          Does R13MPU download science data?,NO,Only Docker images and container filesystem are inspected.
+          Does R13MPU open FITS files?,NO,No FITS access in this stage.
+          Does R13MPU read science values?,NO,No science values are opened.
+          Does R13MPU run SPI analysis on data?,NO,Only tool discovery and help/path checks.
+          Can R13MPU claim 511 detection?,NO,It is environment/toolpath preflight only.
+          CSV
+
+          cd "$GITHUB_WORKSPACE"
+          ZIP="$GITHUB_WORKSPACE/${STAGE}_RESULTS.zip"
+          SHA="$ZIP.sha256.txt"
+          rm -f "$ZIP" "$SHA"
+          zip -r "$ZIP" "$(basename "$OUT")"
+          sha256sum "$ZIP" > "$SHA"
+          exit 0
+
+      - name: Upload artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ACIRM_R13MPU_ONE_CELL_OSA_DOCKER_DEEP_TOOLPATH_PREFLIGHT_NO_VALUES_RESULTS
+          path: |
+            ACIRM_R13MPU_ONE_CELL_OSA_DOCKER_DEEP_TOOLPATH_PREFLIGHT_NO_VALUES_RESULTS.zip
+            ACIRM_R13MPU_ONE_CELL_OSA_DOCKER_DEEP_TOOLPATH_PREFLIGHT_NO_VALUES_RESULTS.zip.sha256.txt
+          retention-days: 7
