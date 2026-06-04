@@ -1,0 +1,750 @@
+name: ACIRM R13MPY one cell full OSA discover generate read 511
+
+on:
+  workflow_dispatch:
+
+jobs:
+  full-osa-discover-generate-readout:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+
+    steps:
+      - name: R13MPY one cell discover OSA repo generate required products read 511 if possible
+        shell: bash
+        run: |
+          set +e
+          STAGE="ACIRM_R13MPY_ONE_CELL_FULL_OSA_DISCOVER_GENERATE_READ_511"
+          OUT="$GITHUB_WORKSPACE/${STAGE}_OUTPUT"
+          mkdir -p "$OUT"
+
+          cat > "$OUT/R13MPY_FIREWALL.json" <<'JSON'
+          {
+            "stage": "ACIRM_R13MPY_ONE_CELL_FULL_OSA_DISCOVER_GENERATE_READ_511",
+            "purpose": "One cell: discover/acquire IC IDX CAT AUX candidates, build OSA repository, download locked public SCW data, try og_create using multiple safe formats, search generated tree for energy_boundaries and evts_det_spec, and if both are found read locked 511 keV line/sidebands.",
+            "locked_line_window_keV": [508.0, 514.0],
+            "locked_lower_sideband_keV": [490.0, 500.0],
+            "locked_upper_sideband_keV": [522.0, 532.0],
+            "minimum_detection_candidate_ratio": 1.2,
+            "no_energy_window_retuning": true,
+            "artifact_policy": "Do not include downloaded FITS/IC/CAT/IDX/AUX/OSA work products in final artifact; keep only logs, manifests, CSV, JSON.",
+            "claim_ceiling": "guarded diagnostic candidate at most; no proof/discovery/evidence claim"
+          }
+          JSON
+
+          python3 -m pip install --user --no-cache-dir --upgrade numpy astropy requests > "$OUT/R13MPY_DEPENDENCY_INSTALL.log" 2>&1
+
+          cat > "$OUT/controller.py" <<'PYCODE'
+          from pathlib import Path
+          from urllib.request import Request, urlopen, urlretrieve
+          from urllib.parse import urljoin
+          import csv, datetime, gzip, hashlib, json, math, os, re, shutil, site, subprocess, sys, tarfile, time, zipfile
+
+          STAGE = "ACIRM_R13MPY_ONE_CELL_FULL_OSA_DISCOVER_GENERATE_READ_511"
+          out = Path(os.environ.get("GITHUB_WORKSPACE", ".")) / (STAGE + "_OUTPUT")
+          out.mkdir(parents=True, exist_ok=True)
+          site.addsitedir(site.getusersitepackages())
+
+          TARGET_SCW_IDS = [
+              "250400090010", "250400020010", "250400080010", "250400030010",
+              "250400070021", "250400040010", "250400060010", "250400050010"
+          ]
+          HEASARC_SCW_BASE = "https://heasarc.gsfc.nasa.gov/FTP/integral/data/scw/2504"
+          OSA_IMAGE = "integralsw/osa:latest"
+
+          LINE = (508.0, 514.0)
+          LOWER = (490.0, 500.0)
+          UPPER = (522.0, 532.0)
+          MIN_RATIO = 1.2
+
+          def write_json(name, obj):
+              (out / name).write_text(json.dumps(obj, indent=2, ensure_ascii=False), encoding="utf-8")
+
+          def write_csv(name, rows, columns):
+              with (out / name).open("w", newline="", encoding="utf-8") as f:
+                  w = csv.DictWriter(f, fieldnames=columns)
+                  w.writeheader()
+                  for r in rows:
+                      w.writerow({c: r.get(c, "") for c in columns})
+
+          def sha256_file(path):
+              h = hashlib.sha256()
+              with open(path, "rb") as f:
+                  for b in iter(lambda: f.read(1024 * 1024), b""):
+                      h.update(b)
+              return h.hexdigest()
+
+          def run_cmd(cmd, log_name, timeout=900, cwd=None):
+              t0 = time.time()
+              log_path = out / log_name
+              try:
+                  p = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=timeout, cwd=cwd)
+                  log_path.write_text(p.stdout, encoding="utf-8", errors="replace")
+                  return {"exit_code": p.returncode, "seconds": round(time.time()-t0, 2), "tail": p.stdout[-5000:]}
+              except subprocess.TimeoutExpired as e:
+                  txt = (e.stdout or "") + "\nTIMEOUT\n"
+                  log_path.write_text(txt, encoding="utf-8", errors="replace")
+                  return {"exit_code": 124, "seconds": round(time.time()-t0, 2), "tail": txt[-5000:]}
+
+          def final_stop(decision, next_stage, **kwargs):
+              obj = {
+                  "stage": STAGE,
+                  "decision": decision,
+                  "next_stage": next_stage,
+                  "claim_ceiling": "guarded diagnostic candidate at most; no proof/discovery/evidence claim",
+                  "timestamp": datetime.datetime.utcnow().isoformat() + "Z"
+              }
+              obj.update(kwargs)
+              write_json("R13MPY_FINAL_DECISION.json", obj)
+              print(json.dumps(obj, indent=2, ensure_ascii=False))
+              return obj
+
+          def fetch_text(url, timeout=40, max_bytes=2500000):
+              try:
+                  req = Request(url, headers={"User-Agent": "ACIRM-R13MPY-OSA-discovery", "Accept": "text/html,text/plain,*/*"})
+                  with urlopen(req, timeout=timeout) as r:
+                      data = r.read(max_bytes)
+                      return True, r.geturl(), data.decode("utf-8", errors="replace"), ""
+              except Exception as e:
+                  return False, "", "", repr(e)[:500]
+
+          def url_head_or_small_get(url, timeout=40):
+              try:
+                  req = Request(url, method="HEAD", headers={"User-Agent": "ACIRM-R13MPY-OSA-discovery"})
+                  with urlopen(req, timeout=timeout) as r:
+                      length = r.headers.get("Content-Length", "")
+                      return {"ok": True, "status": getattr(r, "status", ""), "content_type": r.headers.get("Content-Type", ""), "content_length": int(length) if str(length).isdigit() else None, "final_url": r.geturl(), "error": ""}
+              except Exception:
+                  try:
+                      req = Request(url, headers={"User-Agent": "ACIRM-R13MPY-OSA-discovery", "Range": "bytes=0-1023"})
+                      with urlopen(req, timeout=timeout) as r:
+                          data = r.read(1024)
+                          length = r.headers.get("Content-Length", "")
+                          return {"ok": True, "status": getattr(r, "status", ""), "content_type": r.headers.get("Content-Type", ""), "content_length": int(length) if str(length).isdigit() else None, "final_url": r.geturl(), "error": ""}
+                  except Exception as e:
+                      return {"ok": False, "status": "", "content_type": "", "content_length": None, "final_url": "", "error": repr(e)[:500]}
+
+          def extract_hrefs(html):
+              rows = []
+              for m in re.finditer(r"<a\s+[^>]*href=[\"']([^\"']+)[\"'][^>]*>(.*?)</a>", html, flags=re.I | re.S):
+                  href = m.group(1).strip()
+                  label = re.sub(r"<[^>]+>", "", m.group(2))
+                  label = re.sub(r"\s+", " ", label).strip()
+                  rows.append((href, label))
+              if not rows:
+                  for m in re.finditer(r"href=[\"']([^\"']+)[\"']", html, flags=re.I):
+                      rows.append((m.group(1).strip(), ""))
+              return rows
+
+          def safe_extract_archive(archive_path, dest_dir):
+              dest_dir.mkdir(parents=True, exist_ok=True)
+              low = archive_path.name.lower()
+              try:
+                  if tarfile.is_tarfile(archive_path):
+                      with tarfile.open(archive_path, "r:*") as t:
+                          for member in t.getmembers():
+                              member_path = dest_dir / member.name
+                              if not str(member_path.resolve()).startswith(str(dest_dir.resolve())):
+                                  continue
+                              t.extract(member, dest_dir)
+                      return True, ""
+                  if zipfile.is_zipfile(archive_path):
+                      with zipfile.ZipFile(archive_path) as z:
+                          for name in z.namelist():
+                              target = dest_dir / name
+                              if not str(target.resolve()).startswith(str(dest_dir.resolve())):
+                                  continue
+                              z.extract(name, dest_dir)
+                      return True, ""
+                  return False, "not_tar_or_zip"
+              except Exception as e:
+                  return False, repr(e)[:500]
+
+          write_json("R13MPY_LOCKED_CONTEXT.json", {
+              "target_scw_ids": TARGET_SCW_IDS,
+              "heasarc_scw_base": HEASARC_SCW_BASE,
+              "osa_image": OSA_IMAGE,
+              "locked_line_window_keV": list(LINE),
+              "locked_lower_sideband_keV": list(LOWER),
+              "locked_upper_sideband_keV": list(UPPER),
+              "minimum_detection_candidate_ratio": MIN_RATIO,
+              "single_cell": True
+          })
+
+          errors = []
+          try:
+              import numpy as np
+              from astropy.io import fits
+              import astropy
+              dep = {"ok": True, "numpy_version": np.__version__, "astropy_version": astropy.__version__}
+          except Exception as e:
+              dep = {"ok": False, "error": repr(e)}
+              final_stop("FINAL_TECHNICAL_BLOCK_DEPENDENCY_IMPORT_FAILED", "STOP_REPAIR_DEPENDENCIES", dependency_status=dep)
+              sys.exit(0)
+          write_json("R13MPY_DEPENDENCY_STATUS.json", dep)
+
+          # 1) OSA Docker and toolpath confirmation.
+          run_cmd(["docker", "pull", OSA_IMAGE], "R13MPY_DOCKER_PULL.log", timeout=1200)
+          tool_script = out / "osa_tool_check.sh"
+          tool_script.write_text("""#!/usr/bin/env bash
+          set +e
+          export PATH=/opt/osa/bin:$PATH
+          LIBGUI=$(find /opt /usr -name libGui.so 2>/dev/null | head -1)
+          if [ -n "$LIBGUI" ]; then export LD_LIBRARY_PATH=$(dirname "$LIBGUI"):/opt/osa/lib:/opt/osa/lib64:$LD_LIBRARY_PATH; else export LD_LIBRARY_PATH=/opt/osa/lib:/opt/osa/lib64:$LD_LIBRARY_PATH; fi
+          mkdir -p /tmp/pfiles
+          export PFILES=/tmp/pfiles
+          echo OSA_CONTAINER_RUNTIME_OK
+          printf 'PATH=%s\n' "$PATH"
+          printf 'LD_LIBRARY_PATH=%s\n' "$LD_LIBRARY_PATH"
+          for t in spi_science_analysis og_create dal_list spiros idx_find ibis_science_analysis; do
+            if command -v "$t" >/dev/null 2>&1; then printf 'TOOL_FOUND|%s|%s\n' "$t" "$(command -v "$t")";
+            elif [ -x "/opt/osa/bin/$t" ]; then printf 'TOOL_FOUND_ABSPATH|%s|/opt/osa/bin/%s\n' "$t" "$t";
+            else printf 'TOOL_MISSING|%s|\n' "$t"; fi
+          done
+          echo OG_CREATE_HELP_BEGIN
+          timeout 25 /opt/osa/bin/og_create -h 2>&1 | head -160 || true
+          echo OG_CREATE_HELP_END
+          echo SPI_SCIENCE_HELP_BEGIN
+          timeout 25 /opt/osa/bin/spi_science_analysis -h 2>&1 | head -160 || true
+          echo SPI_SCIENCE_HELP_END
+          """, encoding="utf-8")
+          os.chmod(tool_script, 0o755)
+          run_cmd(["docker", "run", "--rm", "-v", f"{out}:/out", "--entrypoint", "/bin/bash", OSA_IMAGE, "/out/osa_tool_check.sh"], "R13MPY_OSA_TOOL_CHECK.log", timeout=400)
+          tool_log = (out / "R13MPY_OSA_TOOL_CHECK.log").read_text(encoding="utf-8", errors="replace") if (out / "R13MPY_OSA_TOOL_CHECK.log").exists() else ""
+          osa_tools = {
+              "container_runtime_ok": "OSA_CONTAINER_RUNTIME_OK" in tool_log,
+              "spi_science_analysis_found": ("TOOL_FOUND|spi_science_analysis|" in tool_log or "TOOL_FOUND_ABSPATH|spi_science_analysis|" in tool_log),
+              "og_create_found": ("TOOL_FOUND|og_create|" in tool_log or "TOOL_FOUND_ABSPATH|og_create|" in tool_log),
+              "dal_list_found": ("TOOL_FOUND|dal_list|" in tool_log or "TOOL_FOUND_ABSPATH|dal_list|" in tool_log),
+              "spiros_found": ("TOOL_FOUND|spiros|" in tool_log or "TOOL_FOUND_ABSPATH|spiros|" in tool_log),
+              "idx_find_found": ("TOOL_FOUND|idx_find|" in tool_log or "TOOL_FOUND_ABSPATH|idx_find|" in tool_log)
+          }
+          write_json("R13MPY_OSA_TOOL_STATUS.json", osa_tools)
+
+          # 2) Build repo.
+          repo = Path(os.environ.get("GITHUB_WORKSPACE", ".")) / "isdc_repo_r13mpy"
+          work = Path(os.environ.get("GITHUB_WORKSPACE", ".")) / "osa_work_r13mpy"
+          for d in [repo/"ic", repo/"idx", repo/"cat", repo/"aux", repo/"scw"/"2504", work/"obs", work/"logs", work/"pfiles"]:
+              d.mkdir(parents=True, exist_ok=True)
+
+          # 3) Discover and acquire IC/IDX/CAT/AUX archives.
+          discovery_index_urls = [
+              "https://www.isdc.unige.ch/integral/download/osa/pub/osa_11.2/",
+              "https://www.isdc.unige.ch/integral/download/osa/pub/",
+              "https://heasarc.gsfc.nasa.gov/FTP/integral/data/",
+              "https://heasarc.gsfc.nasa.gov/FTP/integral/data/ic/",
+              "https://heasarc.gsfc.nasa.gov/FTP/integral/data/idx/",
+              "https://heasarc.gsfc.nasa.gov/FTP/integral/data/cat/",
+              "https://heasarc.gsfc.nasa.gov/FTP/integral/data/aux/",
+          ]
+          explicit_archive_urls = [
+              "https://www.isdc.unige.ch/integral/download/osa/pub/osa_11.2/osa_ic_11.2.tar.gz",
+              "https://www.isdc.unige.ch/integral/download/osa/pub/osa_11.2/osa_cat_11.2.tar.gz",
+              "https://www.isdc.unige.ch/integral/download/osa/pub/osa_11.2/osa_idx_11.2.tar.gz",
+              "https://www.isdc.unige.ch/integral/download/osa/pub/osa_11.2/OSA_IC.tar.gz",
+              "https://www.isdc.unige.ch/integral/download/osa/pub/osa_11.2/OSA_CAT.tar.gz",
+              "https://www.isdc.unige.ch/integral/download/osa/pub/osa_11.2/OSA_IDX.tar.gz",
+              "https://heasarc.gsfc.nasa.gov/FTP/integral/data/ic/ic_tree.tar.gz",
+              "https://heasarc.gsfc.nasa.gov/FTP/integral/data/idx/idx_tree.tar.gz",
+              "https://heasarc.gsfc.nasa.gov/FTP/integral/data/cat/cat_tree.tar.gz",
+              "https://heasarc.gsfc.nasa.gov/FTP/integral/data/aux/aux_tree.tar.gz",
+          ]
+
+          discovered_archive_candidates = []
+          index_rows = []
+          for idx_url in discovery_index_urls:
+              ok, final_url, html, err = fetch_text(idx_url)
+              hrefs = extract_hrefs(html) if ok else []
+              index_rows.append({"index_url": idx_url, "ok": ok, "final_url": final_url, "href_count": len(hrefs), "error": err})
+              if ok:
+                  for href, label in hrefs:
+                      abs_url = urljoin(final_url or idx_url, href)
+                      low = abs_url.lower()
+                      if any(k in low for k in ["osa_ic", "osa_cat", "osa_idx", "ic_tree", "cat_tree", "idx_tree", "aux_tree", "/ic/", "/cat/", "/idx/", "/aux/"]) and any(low.endswith(ext) for ext in [".tar.gz", ".tgz", ".tar", ".zip", ".gz"]):
+                          discovered_archive_candidates.append(abs_url)
+          for u in explicit_archive_urls:
+              discovered_archive_candidates.append(u)
+
+          seen = set()
+          archive_candidates = []
+          for u in discovered_archive_candidates:
+              if u not in seen:
+                  seen.add(u)
+                  archive_candidates.append(u)
+
+          write_csv("R13MPY_REPO_ARCHIVE_INDEX_DISCOVERY.csv", index_rows, ["index_url", "ok", "final_url", "href_count", "error"])
+
+          archive_probe_rows = []
+          archive_download_rows = []
+          max_archive_bytes = 1400 * 1024 * 1024
+          archive_dir = out / "repo_archives"
+          archive_dir.mkdir(exist_ok=True)
+
+          def classify_archive_url(u):
+              low = u.lower()
+              if "idx" in low:
+                  return "idx"
+              if "cat" in low:
+                  return "cat"
+              if "aux" in low:
+                  return "aux"
+              if "ic" in low or "osa_ic" in low:
+                  return "ic"
+              return "unknown"
+
+          acquired_kinds = set()
+          for u in archive_candidates:
+              kind = classify_archive_url(u)
+              h = url_head_or_small_get(u)
+              row = {"url": u, "kind": kind, "ok": h["ok"], "status": h["status"], "content_type": h["content_type"], "content_length": h["content_length"], "error": h["error"]}
+              archive_probe_rows.append(row)
+              if not h["ok"]:
+                  continue
+              if h["content_length"] is not None and h["content_length"] > max_archive_bytes:
+                  continue
+              # Keep going even if kind already acquired, but avoid too many downloads.
+              if kind in acquired_kinds and kind != "unknown":
+                  continue
+              local = archive_dir / re.sub(r"[^A-Za-z0-9_.-]+", "_", u.split("/")[-1] or ("archive_" + kind))
+              try:
+                  urlretrieve(u, local)
+                  ok_extract, ex_err = safe_extract_archive(local, repo / kind if kind in ["ic", "idx", "cat", "aux"] else repo)
+                  archive_download_rows.append({"url": u, "kind": kind, "download_ok": True, "size_bytes": local.stat().st_size, "sha256": sha256_file(local), "extract_ok": ok_extract, "extract_error": ex_err})
+                  if ok_extract and kind != "unknown":
+                      acquired_kinds.add(kind)
+              except Exception as e:
+                  archive_download_rows.append({"url": u, "kind": kind, "download_ok": False, "size_bytes": "", "sha256": "", "extract_ok": False, "extract_error": repr(e)[:500]})
+
+          write_csv("R13MPY_REPO_ARCHIVE_PROBES.csv", archive_probe_rows, ["url", "kind", "ok", "status", "content_type", "content_length", "error"])
+          write_csv("R13MPY_REPO_ARCHIVE_DOWNLOADS.csv", archive_download_rows, ["url", "kind", "download_ok", "size_bytes", "sha256", "extract_ok", "extract_error"])
+
+          repo_status = {}
+          for kind in ["ic", "idx", "cat", "aux"]:
+              d = repo / kind
+              files = [p for p in d.rglob("*") if p.is_file()]
+              dirs = [p for p in d.rglob("*") if p.is_dir()]
+              repo_status[kind] = {"dir_exists": d.exists(), "file_count": len(files), "dir_count": len(dirs), "sample_files": [str(p.relative_to(repo)) for p in files[:25]]}
+          write_json("R13MPY_REPO_STATUS_AFTER_ARCHIVE_DISCOVERY.json", repo_status)
+
+          # 4) Download locked public SCW products; index-discovered, not just explicit.
+          def scw_candidate_score(fname):
+              low = fname.lower()
+              score = 0
+              if fname in ["swg.fits", "swg.fits.gz"]:
+                  score += 100
+              if low.startswith("spi_"):
+                  score += 80
+              if "spectrum" in low or "spectra" in low or "spec" in low:
+                  score += 50
+              if "gti" in low or "hk" in low or "acs" in low or "oper" in low or "dead" in low or "events" in low:
+                  score += 25
+              if low.endswith(".fits") or low.endswith(".fits.gz"):
+                  score += 10
+              return score
+
+          explicit_scw_files = [
+              "swg.fits", "swg.fits.gz",
+              "spi_spectra.fits.gz", "spi_spectra.fits",
+              "spi_gti.fits.gz", "spi_gti.fits",
+              "spi_acs.fits.gz", "spi_acs.fits",
+              "spi_hk.fits.gz", "spi_hk.fits",
+              "spi_oper.fits.gz", "spi_oper.fits",
+              "spi_science_hk.fits.gz", "spi_science_hk.fits",
+              "spi_science_param.fits.gz", "spi_science_param.fits",
+              "spi_block.fits.gz", "spi_block.fits",
+              "spi_dead.fits.gz", "spi_dead.fits"
+          ]
+          scw_discovery_rows = []
+          scw_candidates = []
+          for scw in TARGET_SCW_IDS:
+              url = f"{HEASARC_SCW_BASE}/{scw}.001/"
+              ok, final_url, html, err = fetch_text(url)
+              hrefs = extract_hrefs(html) if ok else []
+              scw_discovery_rows.append({"scw_id": scw, "index_url": url, "ok": ok, "final_url": final_url, "href_count": len(hrefs), "error": err})
+              if ok:
+                  for href, label in hrefs:
+                      fname = Path(href).name
+                      if fname and (fname.endswith(".fits") or fname.endswith(".fits.gz")):
+                          score = scw_candidate_score(fname)
+                          if score > 0:
+                              scw_candidates.append({"source": "index", "scw_id": scw, "filename": fname, "url": urljoin(final_url or url, href), "score": score})
+              for fname in explicit_scw_files:
+                  scw_candidates.append({"source": "explicit", "scw_id": scw, "filename": fname, "url": url + fname, "score": scw_candidate_score(fname)})
+
+          seen = set()
+          uniq_scw_candidates = []
+          for c in sorted(scw_candidates, key=lambda r: (r["scw_id"], -r["score"], r["filename"])):
+              key = (c["scw_id"], c["url"])
+              if key not in seen:
+                  seen.add(key)
+                  uniq_scw_candidates.append(c)
+
+          write_csv("R13MPY_SCW_INDEX_DISCOVERY.csv", scw_discovery_rows, ["scw_id", "index_url", "ok", "final_url", "href_count", "error"])
+
+          scw_probe_rows = []
+          scw_download_rows = []
+          max_scw_file_bytes = 500 * 1024 * 1024
+          for c in uniq_scw_candidates:
+              h = url_head_or_small_get(c["url"])
+              prow = dict(c)
+              prow.update({"ok": h["ok"], "status": h["status"], "content_type": h["content_type"], "content_length": h["content_length"], "error": h["error"]})
+              scw_probe_rows.append(prow)
+              if not h["ok"] or (h["content_length"] is not None and h["content_length"] > max_scw_file_bytes):
+                  continue
+              dest = repo / "scw" / "2504" / f"{c['scw_id']}.001" / c["filename"]
+              dest.parent.mkdir(parents=True, exist_ok=True)
+              try:
+                  urlretrieve(c["url"], dest)
+                  scw_download_rows.append({"scw_id": c["scw_id"], "filename": c["filename"], "url": c["url"], "download_ok": True, "size_bytes": dest.stat().st_size, "sha256": sha256_file(dest), "error": ""})
+                  # OSA often expects uncompressed swg.fits; create if only gz is present.
+                  if dest.name.endswith(".gz"):
+                      out_unzip = dest.with_suffix("")
+                      if not out_unzip.exists() and dest.stat().st_size < 200 * 1024 * 1024:
+                          try:
+                              with gzip.open(dest, "rb") as fin, open(out_unzip, "wb") as fout:
+                                  shutil.copyfileobj(fin, fout)
+                          except Exception:
+                              pass
+              except Exception as e:
+                  scw_download_rows.append({"scw_id": c["scw_id"], "filename": c["filename"], "url": c["url"], "download_ok": False, "size_bytes": "", "sha256": "", "error": repr(e)[:500]})
+          write_csv("R13MPY_SCW_PRODUCT_PROBES.csv", scw_probe_rows, ["source", "scw_id", "filename", "url", "score", "ok", "status", "content_type", "content_length", "error"])
+          write_csv("R13MPY_SCW_PRODUCT_DOWNLOADS.csv", scw_download_rows, ["scw_id", "filename", "url", "download_ok", "size_bytes", "sha256", "error"])
+
+          # Build SCW list files: IDs, SWG paths, and URLs-ish.
+          scw_list_ids = work / "scw_ids.txt"
+          scw_list_ids.write_text("\n".join(TARGET_SCW_IDS) + "\n", encoding="utf-8")
+          swg_paths = []
+          for scw in TARGET_SCW_IDS:
+              p1 = repo / "scw" / "2504" / f"{scw}.001" / "swg.fits"
+              p2 = repo / "scw" / "2504" / f"{scw}.001" / "swg.fits.gz"
+              if p1.exists():
+                  swg_paths.append(str(p1))
+              elif p2.exists():
+                  swg_paths.append(str(p2))
+          scw_list_swg_abs = work / "swg_abs_paths.txt"
+          scw_list_swg_abs.write_text("\n".join(swg_paths) + "\n", encoding="utf-8")
+          scw_list_swg_container = work / "swg_container_paths.txt"
+          container_paths = [p.replace(str(repo), "/repo") for p in swg_paths]
+          scw_list_swg_container.write_text("\n".join(container_paths) + "\n", encoding="utf-8")
+
+          # 5) Multi-format og_create attempt + optional spi_science_analysis attempt.
+          osa_attempt_script = out / "osa_full_attempt.sh"
+          osa_attempt_script.write_text("""#!/usr/bin/env bash
+          set +e
+          export PATH=/opt/osa/bin:$PATH
+          LIBGUI=$(find /opt /usr -name libGui.so 2>/dev/null | head -1)
+          if [ -n "$LIBGUI" ]; then export LD_LIBRARY_PATH=$(dirname "$LIBGUI"):/opt/osa/lib:/opt/osa/lib64:$LD_LIBRARY_PATH; else export LD_LIBRARY_PATH=/opt/osa/lib:/opt/osa/lib64:$LD_LIBRARY_PATH; fi
+          export REP_BASE=/repo
+          export ISDC_REF_CAT=/repo/cat
+          export PFILES=/work/pfiles
+          mkdir -p /work/pfiles /work/obs /work/logs
+          echo R13MPY_OSA_ATTEMPT_START
+          printf 'REP_BASE=%s\n' "$REP_BASE"
+          printf 'ISDC_REF_CAT=%s\n' "$ISDC_REF_CAT"
+          printf 'REPO_TOP\n'
+          find /repo -maxdepth 3 -type d | sort | head -200
+          printf 'SCW_TREE_SAMPLE\n'
+          find /repo/scw -maxdepth 4 -type f | sort | head -120
+          printf 'IC_SAMPLE\n'
+          find /repo/ic -maxdepth 5 -type f | sort | head -40
+          printf 'IDX_SAMPLE\n'
+          find /repo/idx -maxdepth 5 -type f | sort | head -40
+          printf 'CAT_SAMPLE\n'
+          find /repo/cat -maxdepth 5 -type f | sort | head -40
+          for t in og_create spi_science_analysis dal_list spiros idx_find; do
+            if command -v "$t" >/dev/null 2>&1; then printf 'TOOL|%s|%s\n' "$t" "$(command -v "$t")"; fi
+          done
+
+          try_og() {
+            local label="$1"
+            shift
+            echo "TRY_OG_BEGIN|$label"
+            timeout 300 /opt/osa/bin/og_create "$@" > "/work/logs/og_${label}.log" 2>&1
+            local code=$?
+            echo "TRY_OG_EXIT|$label|$code"
+            tail -180 "/work/logs/og_${label}.log" || true
+            echo "TRY_OG_END|$label"
+            return $code
+          }
+
+          try_og ids_idxSwg idxSwg=/work/scw_ids.txt ogid=ACIRM_R13MPY_IDS baseDir=/work/obs instrument=SPI
+          try_og swg_container_idxSwg idxSwg=/work/swg_container_paths.txt ogid=ACIRM_R13MPY_SWG baseDir=/work/obs instrument=SPI
+          try_og ids_idxSwg_no_instr idxSwg=/work/scw_ids.txt ogid=ACIRM_R13MPY_IDS2 baseDir=/work/obs
+
+          echo TRY_SPI_SCIENCE_HELP
+          timeout 60 /opt/osa/bin/spi_science_analysis -h > /work/logs/spi_science_help.log 2>&1
+          echo SPI_SCIENCE_HELP_EXIT=$?
+          tail -120 /work/logs/spi_science_help.log || true
+
+          echo WORK_FILES_AFTER_ATTEMPTS
+          find /work -type f | sort | sed 's#^#WORK_FILE|#' | head -1200
+          echo R13MPY_OSA_ATTEMPT_END
+          """, encoding="utf-8")
+          os.chmod(osa_attempt_script, 0o755)
+
+          run_cmd([
+              "docker", "run", "--rm",
+              "-v", f"{out}:/out",
+              "-v", f"{repo}:/repo",
+              "-v", f"{work}:/work",
+              "--entrypoint", "/bin/bash",
+              OSA_IMAGE, "/out/osa_full_attempt.sh"
+          ], "R13MPY_OSA_FULL_GENERATION_ATTEMPT.log", timeout=1000)
+
+          # 6) Search all relevant trees for products.
+          product_rows = []
+          search_roots = [out, work, repo]
+          for root in search_roots:
+              if not root.exists():
+                  continue
+              for p in root.rglob("*"):
+                  if not p.is_file():
+                      continue
+                  low = p.name.lower()
+                  if ("energy_bound" in low or "evts_det_spec" in low or low in ["energy_boundaries.fits", "evts_det_spec.fits"]):
+                      product_rows.append({"path": str(p), "name": p.name, "size_bytes": p.stat().st_size, "sha256": sha256_file(p) if p.stat().st_size < 100*1024*1024 else "SKIPPED_LARGE"})
+          write_csv("R13MPY_REQUIRED_PRODUCT_SEARCH.csv", product_rows, ["path", "name", "size_bytes", "sha256"])
+
+          # 7) If both required products exist, read 511 immediately.
+          def parse_energy_file(path):
+              candidates = []
+              try:
+                  with fits.open(path, memmap=False) as hdul:
+                      for hdu_i, hdu in enumerate(hdul):
+                          data = getattr(hdu, "data", None)
+                          cols = []
+                          if hasattr(hdu, "columns") and hdu.columns is not None:
+                              try:
+                                  cols = list(hdu.columns.names)
+                              except Exception:
+                                  cols = []
+                          if data is None:
+                              continue
+                          cu = {str(c).upper(): c for c in cols}
+                          lo = hi = None
+                          for k in ["E_MIN", "E_LO", "ENERG_LO", "ENERGY_LO", "CHANNEL_E_MIN", "EMIN", "E_LOW", "EBOUND_LO"]:
+                              if k in cu:
+                                  lo = cu[k]; break
+                          for k in ["E_MAX", "E_HI", "ENERG_HI", "ENERGY_HI", "CHANNEL_E_MAX", "EMAX", "E_HIGH", "EBOUND_HI"]:
+                              if k in cu:
+                                  hi = cu[k]; break
+                          if lo and hi:
+                              emin = np.asarray(data[lo], dtype=float).ravel()
+                              emax = np.asarray(data[hi], dtype=float).ravel()
+                              if len(emin) == len(emax) and len(emin) > 0:
+                                  candidates.append({"path": str(path), "hdu_index": hdu_i, "hdu_name": getattr(hdu, "name", ""), "lo_col": lo, "hi_col": hi, "emin": emin, "emax": emax})
+              except Exception as e:
+                  errors.append("parse_energy_file_error: " + repr(e)[:500])
+              return candidates
+
+          def collect_numeric_arrays(path):
+              arrays = []
+              try:
+                  with fits.open(path, memmap=False) as hdul:
+                      for hdu_i, hdu in enumerate(hdul):
+                          data = getattr(hdu, "data", None)
+                          cols = []
+                          if hasattr(hdu, "columns") and hdu.columns is not None:
+                              try:
+                                  cols = list(hdu.columns.names)
+                              except Exception:
+                                  cols = []
+                          if data is None:
+                              continue
+                          if cols:
+                              for col in cols:
+                                  try:
+                                      arr = np.asarray(data[col], dtype=float)
+                                      if arr.size > 0:
+                                          arrays.append({"path": str(path), "hdu_index": hdu_i, "hdu_name": getattr(hdu, "name", ""), "array_name": col, "array": arr})
+                                  except Exception:
+                                      pass
+                          else:
+                              try:
+                                  arr = np.asarray(data, dtype=float)
+                                  if arr.size > 0:
+                                      arrays.append({"path": str(path), "hdu_index": hdu_i, "hdu_name": getattr(hdu, "name", ""), "array_name": "IMAGE_OR_PRIMARY_ARRAY", "array": arr})
+                              except Exception:
+                                  pass
+              except Exception as e:
+                  errors.append("collect_numeric_arrays_error: " + repr(e)[:500])
+              return arrays
+
+          energy_files = [Path(r["path"]) for r in product_rows if "energy_bound" in r["name"].lower()]
+          spec_files = [Path(r["path"]) for r in product_rows if "evts_det_spec" in r["name"].lower()]
+          readout_rows = []
+          energy_profile_rows = []
+          selected_energy_meta = {}
+          safe_energy_mapping_found = False
+
+          if energy_files and spec_files:
+              energy_candidates = []
+              for ef in energy_files:
+                  energy_candidates.extend(parse_energy_file(ef))
+              selected = None
+              for ec in energy_candidates:
+                  emin, emax = ec["emin"], ec["emax"]
+                  line_idx = np.where((emax > LINE[0]) & (emin < LINE[1]))[0]
+                  lower_idx = np.where((emax > LOWER[0]) & (emin < LOWER[1]))[0]
+                  upper_idx = np.where((emax > UPPER[0]) & (emin < UPPER[1]))[0]
+                  if len(line_idx) > 0 and len(lower_idx) > 0 and len(upper_idx) > 0:
+                      selected = ec
+                      break
+              if selected is not None:
+                  safe_energy_mapping_found = True
+                  emin, emax = selected["emin"], selected["emax"]
+                  selected_energy_meta = {"path": selected["path"], "hdu_index": selected["hdu_index"], "hdu_name": selected["hdu_name"], "lo_col": selected["lo_col"], "hi_col": selected["hi_col"], "bin_count": len(emin)}
+                  line_idx = np.where((emax > LINE[0]) & (emin < LINE[1]))[0]
+                  lower_idx = np.where((emax > LOWER[0]) & (emin < LOWER[1]))[0]
+                  upper_idx = np.where((emax > UPPER[0]) & (emin < UPPER[1]))[0]
+                  line_set, lower_set, upper_set = set(map(int, line_idx)), set(map(int, lower_idx)), set(map(int, upper_idx))
+                  for i in range(len(emin)):
+                      if i < 20 or (emax[i] > 480 and emin[i] < 540):
+                          energy_profile_rows.append({"bin_index": i, "emin_keV": float(emin[i]), "emax_keV": float(emax[i]), "overlap_line": i in line_set, "overlap_lower": i in lower_set, "overlap_upper": i in upper_set})
+
+                  for sf in spec_files:
+                      for a in collect_numeric_arrays(sf):
+                          arr = a["array"]
+                          axes = [ax for ax, dim in enumerate(arr.shape) if dim == len(emin)]
+                          if not axes:
+                              continue
+                          axis = axes[-1]
+                          try:
+                              line_val = float(np.nansum(np.take(arr, line_idx, axis=axis)))
+                              lower_val = float(np.nansum(np.take(arr, lower_idx, axis=axis)))
+                              upper_val = float(np.nansum(np.take(arr, upper_idx, axis=axis)))
+                              side_mean = 0.5 * (lower_val + upper_val)
+                              ratio = line_val / side_mean if side_mean > 0 else None
+                              candidate = bool(ratio is not None and ratio >= MIN_RATIO)
+                              readout_rows.append({
+                                  "energy_file": Path(selected["path"]).name,
+                                  "spec_file": Path(sf).name,
+                                  "hdu_index": a["hdu_index"],
+                                  "hdu_name": a["hdu_name"],
+                                  "array_name": a["array_name"],
+                                  "array_shape": str(arr.shape),
+                                  "energy_axis": axis,
+                                  "line_508_514_value": line_val,
+                                  "lower_490_500_value": lower_val,
+                                  "upper_522_532_value": upper_val,
+                                  "sideband_mean": side_mean,
+                                  "line_to_sideband_ratio": ratio,
+                                  "detection_candidate": candidate,
+                                  "claim": "GUARDED_DIAGNOSTIC_ONLY"
+                              })
+                          except Exception as e:
+                              errors.append("readout_error: " + repr(e)[:500])
+
+          write_csv("R13MPY_ENERGY_BOUNDARY_PROFILE_AROUND_511.csv", energy_profile_rows if energy_profile_rows else [{"bin_index":"","emin_keV":"","emax_keV":"","overlap_line":"","overlap_lower":"","overlap_upper":""}], ["bin_index", "emin_keV", "emax_keV", "overlap_line", "overlap_lower", "overlap_upper"])
+          write_csv("R13MPY_GUARDED_511_READOUT_VALUES.csv", readout_rows if readout_rows else [{"energy_file":"","spec_file":"","hdu_index":"","hdu_name":"","array_name":"","array_shape":"","energy_axis":"","line_508_514_value":"","lower_490_500_value":"","upper_522_532_value":"","sideband_mean":"","line_to_sideband_ratio":"","detection_candidate":"","claim":"NO_SAFE_READOUT_EXTRACTED"}], ["energy_file", "spec_file", "hdu_index", "hdu_name", "array_name", "array_shape", "energy_axis", "line_508_514_value", "lower_490_500_value", "upper_522_532_value", "sideband_mean", "line_to_sideband_ratio", "detection_candidate", "claim"])
+
+          if readout_rows:
+              line_sum = sum(float(r["line_508_514_value"]) for r in readout_rows if r["line_508_514_value"] is not None)
+              lower_sum = sum(float(r["lower_490_500_value"]) for r in readout_rows if r["lower_490_500_value"] is not None)
+              upper_sum = sum(float(r["upper_522_532_value"]) for r in readout_rows if r["upper_522_532_value"] is not None)
+              side_mean = 0.5 * (lower_sum + upper_sum)
+              ratio = line_sum / side_mean if side_mean > 0 else None
+              detection_candidate = bool(ratio is not None and ratio >= MIN_RATIO)
+          else:
+              line_sum = lower_sum = upper_sum = side_mean = ratio = None
+              detection_candidate = False
+
+          numeric_summary = {
+              "osa_tools": osa_tools,
+              "repo_status": repo_status,
+              "public_scw_products_downloaded": sum(1 for r in scw_download_rows if r.get("download_ok")),
+              "required_product_search_rows": len(product_rows),
+              "energy_boundaries_found_count": len(energy_files),
+              "evts_det_spec_found_count": len(spec_files),
+              "safe_energy_mapping_found": safe_energy_mapping_found,
+              "selected_energy": selected_energy_meta,
+              "readout_rows": len(readout_rows),
+              "line_sum": line_sum,
+              "lower_sum": lower_sum,
+              "upper_sum": upper_sum,
+              "sideband_mean": side_mean,
+              "line_to_sideband_ratio": ratio,
+              "minimum_detection_candidate_ratio": MIN_RATIO,
+              "detection_candidate": detection_candidate,
+              "errors_count": len(errors),
+              "errors": errors[:50]
+          }
+          write_json("R13MPY_GUARDED_NUMERIC_SUMMARY.json", numeric_summary)
+
+          if detection_candidate:
+              decision = "GUARDED_511_TARGET_FILTERED_DETECTION_CANDIDATE"
+              next_stage = "REPLICATION_AND_OFFTIME_NULLS_REQUIRED_BEFORE_ANY_EVIDENCE_CLAIM"
+          elif safe_energy_mapping_found and readout_rows:
+              decision = "NO_GUARDED_511_DETECTION_UNDER_GENERATED_PRODUCTS"
+              next_stage = "STOP_OR_EXTERNAL_REPLICATION_WITH_SAME_LOCKED_RULES"
+          elif energy_files and spec_files:
+              decision = "REQUIRED_PRODUCTS_FOUND_BUT_SAFE_511_READOUT_FAILED"
+              next_stage = "MANUAL_SCHEMA_REVIEW_OR_EXTERNAL_OSA_REPLICATION"
+          elif osa_tools.get("og_create_found") and osa_tools.get("spi_science_analysis_found"):
+              decision = "OSA_REPO_DISCOVERY_ATTEMPT_COMPLETE_REQUIRED_PRODUCTS_NOT_GENERATED"
+              next_stage = "FULL_ISDC_ARCHIVE_OR_LOCAL_OSA_INSTALL_REQUIRED"
+          else:
+              decision = "OSA_TOOLPATH_BLOCKED_REQUIRED_PRODUCTS_NOT_GENERATED"
+              next_stage = "REPAIR_OSA_CONTAINER_OR_EXTERNAL_RUNNER"
+
+          final_stop(
+              decision,
+              next_stage,
+              numeric_summary=numeric_summary,
+              archive_kinds_acquired=sorted(list(acquired_kinds)),
+              repo_status=repo_status,
+              required_products=product_rows[:50],
+              readout_executed=bool(readout_rows),
+              detection_candidate=detection_candidate
+          )
+
+          # 8) Cleanup before artifact.
+          for d in [repo, work, archive_dir]:
+              try:
+                  shutil.rmtree(d)
+              except Exception:
+                  pass
+          PYCODE
+
+          python3 "$OUT/controller.py" > "$OUT/R13MPY_CONTROLLER_STDOUT.txt" 2> "$OUT/R13MPY_CONTROLLER_STDERR.txt"
+          CODE=$?
+          echo "controller_exit_code=$CODE" > "$OUT/R13MPY_STEP_STATUS.log"
+
+          if [ ! -f "$OUT/R13MPY_FINAL_DECISION.json" ]; then
+            cat > "$OUT/R13MPY_FINAL_DECISION.json" <<'JSON'
+          {
+            "stage": "ACIRM_R13MPY_ONE_CELL_FULL_OSA_DISCOVER_GENERATE_READ_511",
+            "decision": "CONTROLLER_FAILED_BEFORE_FINAL_DECISION",
+            "next_stage": "STOP_REPAIR_FROM_STDOUT_STDERR",
+            "claim_ceiling": "no reliable result"
+          }
+          JSON
+          fi
+
+          cat > "$OUT/R13MPY_GO_NO_GO.csv" <<'CSV'
+          question,decision,reason
+          Does R13MPY discover/acquire IC IDX CAT AUX candidates?,YES,It probes index pages and explicit candidate archive URLs.
+          Does R13MPY attempt og_create using multiple safe input formats?,YES,It tries SCW IDs and SWG path lists.
+          Does R13MPY read 511 if energy_boundaries and evts_det_spec are generated?,YES,Readout is in the same cell and gated on required products.
+          Does R13MPY include downloaded data or OSA work products in the artifact?,NO,Large data/work/repo directories are removed before packaging.
+          Can R13MPY claim proof/discovery/evidence?,NO,At most guarded diagnostic candidate requiring replication/nulls.
+          CSV
+
+          cd "$GITHUB_WORKSPACE"
+          ZIP="$GITHUB_WORKSPACE/${STAGE}_RESULTS.zip"
+          SHA="$ZIP.sha256.txt"
+          rm -f "$ZIP" "$SHA"
+          rm -rf "$GITHUB_WORKSPACE/isdc_repo_r13mpy" "$GITHUB_WORKSPACE/osa_work_r13mpy"
+          rm -rf "$OUT/repo_archives"
+          zip -r "$ZIP" "$(basename "$OUT")"
+          sha256sum "$ZIP" > "$SHA"
+          exit 0
+
+      - name: Upload artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ACIRM_R13MPY_ONE_CELL_FULL_OSA_DISCOVER_GENERATE_READ_511_RESULTS
+          path: |
+            ACIRM_R13MPY_ONE_CELL_FULL_OSA_DISCOVER_GENERATE_READ_511_RESULTS.zip
+            ACIRM_R13MPY_ONE_CELL_FULL_OSA_DISCOVER_GENERATE_READ_511_RESULTS.zip.sha256.txt
+          retention-days: 7
