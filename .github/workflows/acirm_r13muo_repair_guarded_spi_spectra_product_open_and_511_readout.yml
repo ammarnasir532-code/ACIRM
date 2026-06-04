@@ -1,0 +1,494 @@
+name: ACIRM R13MUO repair guarded SPI spectra product open and 511 readout
+
+on:
+  workflow_dispatch:
+
+jobs:
+  repair-guarded-readout:
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+
+    steps:
+      - name: Initialize R13MUO package
+        shell: bash
+        run: |
+          set -euo pipefail
+          STAGE="ACIRM_R13MUO_REPAIR_GUARDED_SPI_SPECTRA_PRODUCT_OPEN_AND_511_READOUT"
+          OUT="$GITHUB_WORKSPACE/${STAGE}_OUTPUT"
+          mkdir -p "$OUT"
+          cat > "$OUT/R13MUO_AUTHORIZATION_AND_FIREWALL.json" <<'JSON'
+          {
+            "stage": "ACIRM_R13MUO_REPAIR_GUARDED_SPI_SPECTRA_PRODUCT_OPEN_AND_511_READOUT",
+            "inherits_from": "R13MUN-R2 found 8 safe precomputed spi_spectra.fits.gz candidates but could not import astropy",
+            "authorization": "explicit guarded value authorization carried from R13MUN",
+            "purpose": "Repair the guarded value-stage by installing astropy before product opening and reading only locked spi_spectra products if structurally safe",
+            "forbidden_claims_even_if_nonzero": [
+              "proof",
+              "discovery",
+              "evidence",
+              "confirmed 511 keV detection",
+              "particle production",
+              "ACIRM established"
+            ],
+            "hard_stops": [
+              "no blind broad search",
+              "no post-hoc window changes",
+              "no energy-window tuning",
+              "no source-switching",
+              "no uncontrolled full archive download",
+              "no event-file opening",
+              "no non-SPI spectra products"
+            ],
+            "claim_ceiling": "guarded diagnostic readout only; validation/nulls required later"
+          }
+          JSON
+
+      - name: Install Python FITS dependencies
+        shell: bash
+        run: |
+          set +e
+          STAGE="ACIRM_R13MUO_REPAIR_GUARDED_SPI_SPECTRA_PRODUCT_OPEN_AND_511_READOUT"
+          OUT="$GITHUB_WORKSPACE/${STAGE}_OUTPUT"
+          mkdir -p "$OUT"
+          {
+            echo "date_utc=$(date -u)"
+            python3 --version
+            python3 -m pip --version
+            python3 -m pip install --upgrade pip
+            python3 -m pip install astropy numpy
+            python3 - <<'PY'
+            import json
+            import astropy
+            import numpy
+            print(json.dumps({
+                "astropy_import_ok": True,
+                "astropy_version": astropy.__version__,
+                "numpy_version": numpy.__version__
+            }, indent=2))
+            PY
+          } > "$OUT/R13MUO_DEPENDENCY_INSTALL_LOG.txt" 2>&1
+          echo "dependency_step_exit_code=$?" >> "$OUT/R13MUO_DEPENDENCY_INSTALL_LOG.txt"
+          exit 0
+
+      - name: Run guarded SPI spectra readout repair
+        shell: bash
+        run: |
+          set +e
+          STAGE="ACIRM_R13MUO_REPAIR_GUARDED_SPI_SPECTRA_PRODUCT_OPEN_AND_511_READOUT"
+          OUT="$GITHUB_WORKSPACE/${STAGE}_OUTPUT"
+          mkdir -p "$OUT"
+
+          python3 - <<'PY'
+          from pathlib import Path
+          from urllib.request import Request, urlopen, urlretrieve
+          import csv
+          import json
+          import math
+          import os
+          import sys
+          import tempfile
+          import traceback
+
+          STAGE = "ACIRM_R13MUO_REPAIR_GUARDED_SPI_SPECTRA_PRODUCT_OPEN_AND_511_READOUT"
+          out = Path(os.environ.get("GITHUB_WORKSPACE", ".")) / (STAGE + "_OUTPUT")
+          out.mkdir(parents=True, exist_ok=True)
+
+          def write_json(name, obj):
+              (out / name).write_text(json.dumps(obj, indent=2, ensure_ascii=False), encoding="utf-8")
+
+          def write_csv(name, rows, columns):
+              with (out / name).open("w", newline="", encoding="utf-8") as f:
+                  w = csv.DictWriter(f, fieldnames=columns)
+                  w.writeheader()
+                  for row in rows:
+                      w.writerow({c: row.get(c, "") for c in columns})
+
+          locked_context = {
+              "target_day_start_utc": "2022-05-18T00:00:00.000Z",
+              "target_day_stop_utc": "2022-05-19T00:00:00.000Z",
+              "line_window_keV": [508.0, 514.0],
+              "lower_sideband_keV": [490.0, 500.0],
+              "upper_sideband_keV": [522.0, 532.0],
+              "strict_pm1h_product_claim": "FORBIDDEN",
+              "scope": "8 locked spi_spectra.fits.gz candidates from R13MUN-R2 only"
+          }
+          write_json("R13MUO_LOCKED_CONTEXT.json", locked_context)
+
+          candidates = [
+              {
+                  "scw_id": "250400090010",
+                  "url": "https://heasarc.gsfc.nasa.gov/FTP/integral/data/scw/2504/250400090010.001/spi_spectra.fits.gz"
+              },
+              {
+                  "scw_id": "250400020010",
+                  "url": "https://heasarc.gsfc.nasa.gov/FTP/integral/data/scw/2504/250400020010.001/spi_spectra.fits.gz"
+              },
+              {
+                  "scw_id": "250400080010",
+                  "url": "https://heasarc.gsfc.nasa.gov/FTP/integral/data/scw/2504/250400080010.001/spi_spectra.fits.gz"
+              },
+              {
+                  "scw_id": "250400030010",
+                  "url": "https://heasarc.gsfc.nasa.gov/FTP/integral/data/scw/2504/250400030010.001/spi_spectra.fits.gz"
+              },
+              {
+                  "scw_id": "250400070021",
+                  "url": "https://heasarc.gsfc.nasa.gov/FTP/integral/data/scw/2504/250400070021.001/spi_spectra.fits.gz"
+              },
+              {
+                  "scw_id": "250400040010",
+                  "url": "https://heasarc.gsfc.nasa.gov/FTP/integral/data/scw/2504/250400040010.001/spi_spectra.fits.gz"
+              },
+              {
+                  "scw_id": "250400060010",
+                  "url": "https://heasarc.gsfc.nasa.gov/FTP/integral/data/scw/2504/250400060010.001/spi_spectra.fits.gz"
+              },
+              {
+                  "scw_id": "250400050010",
+                  "url": "https://heasarc.gsfc.nasa.gov/FTP/integral/data/scw/2504/250400050010.001/spi_spectra.fits.gz"
+              }
+          ]
+          for r in candidates:
+              r["product"] = "spi_spectra.fits.gz"
+              r["locked_by"] = "R13MUN_R2_SAFE_PRECOMPUTED_SPECTRUM_CANDIDATES"
+          write_csv("R13MUO_LOCKED_SPI_SPECTRA_CANDIDATES_8.csv", candidates, ["scw_id", "product", "url", "locked_by"])
+
+          run_errors = []
+          dependency = {
+              "astropy_import_ok": False,
+              "astropy_version": "",
+              "numpy_import_ok": False,
+              "numpy_version": ""
+          }
+          try:
+              import numpy as np
+              dependency["numpy_import_ok"] = True
+              dependency["numpy_version"] = np.__version__
+              from astropy.io import fits
+              import astropy
+              dependency["astropy_import_ok"] = True
+              dependency["astropy_version"] = astropy.__version__
+          except Exception as e:
+              run_errors.append("dependency_import_error: " + repr(e))
+              run_errors.append(traceback.format_exc()[:2000])
+              write_json("R13MUO_DEPENDENCY_STATUS.json", dependency)
+              final = {
+                  "stage": STAGE,
+                  "decision": "DEPENDENCY_IMPORT_FAILED_VALUES_NOT_OPENED",
+                  "next_stage": "R13MUP_REPAIR_ASTROPY_INSTALL_OR_USE_OSA_CONTAINER",
+                  "downloaded_products": 0,
+                  "opened_products": 0,
+                  "diagnostic_value_rows": 0,
+                  "read_science_values": False,
+                  "claim_ceiling": "no claim",
+                  "run_errors": run_errors
+              }
+              write_json("R13MUO_FINAL_DECISION.json", final)
+              print(json.dumps(final, indent=2))
+              sys.exit(0)
+
+          write_json("R13MUO_DEPENDENCY_STATUS.json", dependency)
+
+          def head_content_length(url):
+              try:
+                  req = Request(url, method="HEAD", headers={"User-Agent": "ACIRM-R13MUO-guarded-readout"})
+                  with urlopen(req, timeout=30) as r:
+                      length = r.headers.get("Content-Length", "")
+                      ctype = r.headers.get("Content-Type", "")
+                      status = getattr(r, "status", "")
+                      return status, ctype, int(length) if str(length).isdigit() else None, ""
+              except Exception as e:
+                  return "", "", None, repr(e)[:500]
+
+          def safe_float_array(x):
+              try:
+                  arr = np.asarray(x, dtype=float)
+                  return arr
+              except Exception:
+                  return None
+
+          def choose_energy_columns(cols):
+              lower_options = ["E_MIN", "E_MINIMUM", "E_LO", "E_LOW", "ENERG_LO", "ENERGY_LO", "CHANNEL_E_MIN", "EMIN"]
+              upper_options = ["E_MAX", "E_MAXIMUM", "E_HI", "E_HIGH", "ENERG_HI", "ENERGY_HI", "CHANNEL_E_MAX", "EMAX"]
+              names_upper = {c.upper(): c for c in cols}
+              lo = None
+              hi = None
+              for k in lower_options:
+                  if k in names_upper:
+                      lo = names_upper[k]
+                      break
+              for k in upper_options:
+                  if k in names_upper:
+                      hi = names_upper[k]
+                      break
+              return lo, hi
+
+          def choose_value_columns(cols):
+              preferred = [
+                  "COUNTS", "COUNT", "RATE", "COUNTRATE", "COUNT_RATE",
+                  "SPECTRUM", "SPEC", "VALUE", "FLUX", "INTENSITY",
+                  "NET_COUNTS", "NET_RATE"
+              ]
+              names_upper = {c.upper(): c for c in cols}
+              out_cols = []
+              for p in preferred:
+                  if p in names_upper:
+                      out_cols.append(names_upper[p])
+              return out_cols
+
+          def sum_window(emin, emax, values, wlo, whi):
+              if emin is None or emax is None or values is None:
+                  return None, 0
+              mask = (emax > wlo) & (emin < whi)
+              if mask.size == 0:
+                  return None, 0
+              try:
+                  val = np.nansum(values[mask])
+                  return float(val), int(np.sum(mask))
+              except Exception:
+                  return None, int(np.sum(mask))
+
+          product_rows = []
+          hdu_rows = []
+          readout_rows = []
+          downloaded_count = 0
+          opened_count = 0
+          diagnostic_value_rows = 0
+          read_science_values = False
+
+          for cand in candidates:
+              scw_id = cand["scw_id"]
+              url = cand["url"]
+              status, ctype, content_length, head_error = head_content_length(url)
+              if content_length is not None and content_length > 80 * 1024 * 1024:
+                  product_rows.append({
+                      "scw_id": scw_id,
+                      "url": url,
+                      "head_status": status,
+                      "content_type": ctype,
+                      "content_length_bytes": content_length,
+                      "download_status": "SKIPPED_TOO_LARGE",
+                      "open_status": "NOT_OPENED",
+                      "error": ""
+                  })
+                  continue
+
+              tmp = None
+              try:
+                  with tempfile.NamedTemporaryFile(suffix=".fits.gz", delete=False) as tf:
+                      tmp = Path(tf.name)
+                  urlretrieve(url, tmp)
+                  downloaded_count += 1
+                  download_status = "DOWNLOADED"
+                  with fits.open(tmp, memmap=False) as hdul:
+                      opened_count += 1
+                      open_status = "OPENED"
+                      for hdu_index, hdu in enumerate(hdul):
+                          cols = []
+                          nrows = ""
+                          if hasattr(hdu, "columns") and hdu.columns is not None:
+                              try:
+                                  cols = list(hdu.columns.names)
+                              except Exception:
+                                  cols = []
+                          try:
+                              nrows = len(hdu.data) if hdu.data is not None else ""
+                          except Exception:
+                              nrows = ""
+                          hdu_rows.append({
+                              "scw_id": scw_id,
+                              "hdu_index": hdu_index,
+                              "hdu_name": getattr(hdu, "name", ""),
+                              "hdu_class": hdu.__class__.__name__,
+                              "n_columns": len(cols),
+                              "columns_json": json.dumps(cols)[:3000],
+                              "n_rows": nrows
+                          })
+
+                          if not cols or getattr(hdu, "data", None) is None:
+                              continue
+                          lo_col, hi_col = choose_energy_columns(cols)
+                          if not lo_col or not hi_col:
+                              continue
+                          emin = safe_float_array(hdu.data[lo_col])
+                          emax = safe_float_array(hdu.data[hi_col])
+                          if emin is None or emax is None:
+                              continue
+
+                          value_cols = choose_value_columns(cols)
+                          for vcol in value_cols:
+                              vals = safe_float_array(hdu.data[vcol])
+                              if vals is None:
+                                  continue
+                              if vals.ndim > 1:
+                                  try:
+                                      vals = np.nansum(vals, axis=tuple(range(1, vals.ndim)))
+                                  except Exception:
+                                      continue
+
+                              line_val, line_bins = sum_window(emin, emax, vals, 508.0, 514.0)
+                              low_val, low_bins = sum_window(emin, emax, vals, 490.0, 500.0)
+                              high_val, high_bins = sum_window(emin, emax, vals, 522.0, 532.0)
+                              side_mean = None
+                              ratio = None
+                              if low_val is not None and high_val is not None:
+                                  side_mean = 0.5 * (low_val + high_val)
+                                  if side_mean not in [0, None] and not (isinstance(side_mean, float) and math.isnan(side_mean)):
+                                      ratio = line_val / side_mean if line_val is not None else None
+                              if line_val is not None or low_val is not None or high_val is not None:
+                                  diagnostic_value_rows += 1
+                                  read_science_values = True
+                                  readout_rows.append({
+                                      "scw_id": scw_id,
+                                      "url": url,
+                                      "hdu_index": hdu_index,
+                                      "hdu_name": getattr(hdu, "name", ""),
+                                      "energy_low_column": lo_col,
+                                      "energy_high_column": hi_col,
+                                      "value_column": vcol,
+                                      "line_508_514_value": line_val,
+                                      "line_bins": line_bins,
+                                      "lower_490_500_value": low_val,
+                                      "lower_bins": low_bins,
+                                      "upper_522_532_value": high_val,
+                                      "upper_bins": high_bins,
+                                      "sideband_mean": side_mean,
+                                      "line_to_sideband_mean_ratio": ratio,
+                                      "claim": "NO_DETECTION_CLAIM_DIAGNOSTIC_VALUE_ONLY"
+                                  })
+                  product_rows.append({
+                      "scw_id": scw_id,
+                      "url": url,
+                      "head_status": status,
+                      "content_type": ctype,
+                      "content_length_bytes": content_length,
+                      "download_status": download_status,
+                      "open_status": open_status,
+                      "error": ""
+                  })
+              except Exception as e:
+                  product_rows.append({
+                      "scw_id": scw_id,
+                      "url": url,
+                      "head_status": status,
+                      "content_type": ctype,
+                      "content_length_bytes": content_length,
+                      "download_status": "FAILED",
+                      "open_status": "FAILED_OR_NOT_OPENED",
+                      "error": repr(e)[:500]
+                  })
+                  run_errors.append("product_error_" + scw_id + ": " + repr(e))
+              finally:
+                  try:
+                      if tmp is not None and tmp.exists():
+                          tmp.unlink()
+                  except Exception:
+                      pass
+
+          if not readout_rows:
+              readout_rows.append({
+                  "scw_id": "",
+                  "url": "",
+                  "hdu_index": "",
+                  "hdu_name": "",
+                  "energy_low_column": "",
+                  "energy_high_column": "",
+                  "value_column": "",
+                  "line_508_514_value": "",
+                  "line_bins": "",
+                  "lower_490_500_value": "",
+                  "lower_bins": "",
+                  "upper_522_532_value": "",
+                  "upper_bins": "",
+                  "sideband_mean": "",
+                  "line_to_sideband_mean_ratio": "",
+                  "claim": "NO_DIAGNOSTIC_VALUE_EXTRACTED_NO_DETECTION_CLAIM"
+              })
+
+          write_csv(
+              "R13MUO_PRODUCT_DOWNLOAD_OPEN_AUDIT.csv",
+              product_rows,
+              ["scw_id", "url", "head_status", "content_type", "content_length_bytes", "download_status", "open_status", "error"]
+          )
+          write_csv(
+              "R13MUO_PRODUCT_HDU_STRUCTURE.csv",
+              hdu_rows,
+              ["scw_id", "hdu_index", "hdu_name", "hdu_class", "n_columns", "columns_json", "n_rows"]
+          )
+          write_csv(
+              "R13MUO_GUARDED_511_READOUT_DIAGNOSTIC_VALUES.csv",
+              readout_rows,
+              [
+                  "scw_id", "url", "hdu_index", "hdu_name", "energy_low_column", "energy_high_column", "value_column",
+                  "line_508_514_value", "line_bins", "lower_490_500_value", "lower_bins",
+                  "upper_522_532_value", "upper_bins", "sideband_mean", "line_to_sideband_mean_ratio", "claim"
+              ]
+          )
+
+          if diagnostic_value_rows > 0:
+              decision = "GUARDED_511_DIAGNOSTIC_VALUES_EXTRACTED_NO_CLAIM"
+              next_stage = "R13MUP_VALIDATE_GUARDED_VALUES_WITH_OFFTIME_CONTROLS_AND_NULLS"
+          elif opened_count > 0:
+              decision = "PRODUCTS_OPENED_STRUCTURE_FOUND_NO_511_VALUE_MAPPING_NO_CLAIM"
+              next_stage = "R13MUP_REPAIR_SPI_SPECTRA_COLUMN_MAPPING_OR_RUN_OSA"
+          elif downloaded_count > 0:
+              decision = "PRODUCTS_DOWNLOADED_BUT_NOT_OPENED_NO_CLAIM"
+              next_stage = "R13MUP_REPAIR_FITS_OPEN_OR_COMPRESSION_HANDLING"
+          else:
+              decision = "NO_PRODUCTS_DOWNLOADED_OR_OPENED_NO_CLAIM"
+              next_stage = "R13MUP_REPAIR_NETWORK_OR_USE_OSA_CONTAINER"
+
+          final = {
+              "stage": STAGE,
+              "decision": decision,
+              "next_stage": next_stage,
+              "locked_candidates": len(candidates),
+              "downloaded_products": downloaded_count,
+              "opened_products": opened_count,
+              "diagnostic_value_rows": diagnostic_value_rows,
+              "read_science_values": read_science_values,
+              "run_errors_count": len(run_errors),
+              "run_errors": run_errors,
+              "claim_ceiling": "guarded diagnostic readout only; no detection/evidence/proof/discovery/particle-production claim"
+          }
+          write_json("R13MUO_FINAL_DECISION.json", final)
+          print(json.dumps(final, indent=2))
+          PY
+
+          echo "Python exit code was $?"
+          exit 0
+
+      - name: Package results
+        if: always()
+        shell: bash
+        run: |
+          set +e
+          STAGE="ACIRM_R13MUO_REPAIR_GUARDED_SPI_SPECTRA_PRODUCT_OPEN_AND_511_READOUT"
+          OUT="$GITHUB_WORKSPACE/${STAGE}_OUTPUT"
+          ZIP="$GITHUB_WORKSPACE/${STAGE}_RESULTS.zip"
+          SHA="$ZIP.sha256.txt"
+          mkdir -p "$OUT"
+
+          cat > "$OUT/R13MUO_GO_NO_GO.csv" <<'CSV'
+          question,decision,reason
+          Does R13MUO claim 511 keV detection?,NO,Only guarded diagnostic readout is allowed.
+          Does R13MUO perform broad search?,NO,Only 8 locked spi_spectra products from R13MUN-R2.
+          Does a nonzero value prove ACIRM?,NO,Controls/nulls are mandatory next.
+          Are off-time controls analyzed here?,NO,This stage repairs target product readout only.
+          CSV
+
+          cd "$GITHUB_WORKSPACE"
+          rm -f "$ZIP" "$SHA"
+          zip -r "$ZIP" "$(basename "$OUT")"
+          sha256sum "$ZIP" > "$SHA"
+          exit 0
+
+      - name: Upload artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ACIRM_R13MUO_REPAIR_GUARDED_SPI_SPECTRA_PRODUCT_OPEN_AND_511_READOUT_RESULTS
+          path: |
+            ACIRM_R13MUO_REPAIR_GUARDED_SPI_SPECTRA_PRODUCT_OPEN_AND_511_READOUT_RESULTS.zip
+            ACIRM_R13MUO_REPAIR_GUARDED_SPI_SPECTRA_PRODUCT_OPEN_AND_511_READOUT_RESULTS.zip.sha256.txt
+          retention-days: 7
