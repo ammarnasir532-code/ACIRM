@@ -1,0 +1,272 @@
+name: ACIRM R13MUJ verify official SCW paths for locked day manifest no values
+
+on:
+  workflow_dispatch:
+
+jobs:
+  verify-scw-paths:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Lock no-values scope
+        shell: bash
+        run: |
+          set -euo pipefail
+          STAGE="ACIRM_R13MUJ_GITHUB_ACTIONS_VERIFY_OFFICIAL_SCW_PATHS_FOR_LOCKED_DAY_MANIFEST_NO_VALUES"
+          OUT="$GITHUB_WORKSPACE/${STAGE}_OUTPUT"
+          mkdir -p "$OUT"
+          cat > "$OUT/R13MUJ_ROUTE_LOCK.json" <<'JSON'
+          {
+            "stage": "ACIRM_R13MUJ_GITHUB_ACTIONS_VERIFY_OFFICIAL_SCW_PATHS_FOR_LOCKED_DAY_MANIFEST_NO_VALUES",
+            "opens_science_values": false,
+            "downloads_science_products": false,
+            "downloads_fits": false,
+            "reads_fits_tables": false,
+            "purpose": "Verify official SCW directory paths for the R13MUI locked 21-row day-scale manifest only",
+            "forbidden": [
+              "SPI spectra",
+              "SPI images",
+              "511 keV flux/count/intensity values",
+              "FITS download",
+              "FITS science product opening",
+              "FITS table reading",
+              "science-window value extraction",
+              "particle-production claim"
+            ],
+            "claim_ceiling": "SCW path verification metadata only"
+          }
+          JSON
+
+      - name: Write locked R13MUI day-scale manifest
+        shell: bash
+        run: |
+          set -euo pipefail
+          STAGE="ACIRM_R13MUJ_GITHUB_ACTIONS_VERIFY_OFFICIAL_SCW_PATHS_FOR_LOCKED_DAY_MANIFEST_NO_VALUES"
+          OUT="$GITHUB_WORKSPACE/${STAGE}_OUTPUT"
+          cat > "$OUT/R13MUJ_INPUT_LOCKED_DAY_SCALE_SCW_MANIFEST_21_ROWS.csv" <<'CSV'
+scw_id_str,scw_ver_str,rev_dir_candidate,official_scw_dir_candidate_url,scw_type,good_spi,start_date,end_date
+250400110021,1,2504,https://heasarc.gsfc.nasa.gov/FTP/integral/data/scw/2504/250400110021.001/,slew,133,59717.7615575592,59717.763096912
+250400120010,1,2504,https://heasarc.gsfc.nasa.gov/FTP/integral/data/scw/2504/250400120010.001/,pointing,0,59717.763096912,59717.7631895046
+250400090021,1,2504,https://heasarc.gsfc.nasa.gov/FTP/integral/data/scw/2504/250400090021.001/,slew,132,59717.681337604,59717.6828653827
+250400090010,1,2504,https://heasarc.gsfc.nasa.gov/FTP/integral/data/scw/2504/250400090010.001/,pointing,3278,59717.6427611922,59717.681337604
+250400080021,1,2504,https://heasarc.gsfc.nasa.gov/FTP/integral/data/scw/2504/250400080021.001/,slew,133,59717.6412218394,59717.6427611922
+250400020010,1,2504,https://heasarc.gsfc.nasa.gov/FTP/integral/data/scw/2504/250400020010.001/,pointing,3472,59717.2947285785,59717.335712399
+250400010021,1,2504,https://heasarc.gsfc.nasa.gov/FTP/integral/data/scw/2504/250400010021.001/,slew,115,59717.2933975592,59717.2947285785
+250400010010,1,2504,https://heasarc.gsfc.nasa.gov/FTP/integral/data/scw/2504/250400010010.001/,pointing,770,59717.2794160694,59717.2933975592
+250400080010,1,2504,https://heasarc.gsfc.nasa.gov/FTP/integral/data/scw/2504/250400080010.001/,pointing,3248,59717.602691724,59717.6412218394
+250400020021,1,2504,https://heasarc.gsfc.nasa.gov/FTP/integral/data/scw/2504/250400020021.001/,slew,133,59717.335712399,59717.3372517518
+250400030010,1,2504,https://heasarc.gsfc.nasa.gov/FTP/integral/data/scw/2504/250400030010.001/,pointing,3299,59717.3372517518,59717.3758281635
+250400070021,1,2504,https://heasarc.gsfc.nasa.gov/FTP/integral/data/scw/2504/250400070021.001/,slew,7159,59717.5195782487,59717.602691724
+250400070010,1,2504,https://heasarc.gsfc.nasa.gov/FTP/integral/data/scw/2504/250400070010.001/,pointing,0,59717.5192888967,59717.5195782487
+250400030021,1,2504,https://heasarc.gsfc.nasa.gov/FTP/integral/data/scw/2504/250400030021.001/,slew,136,59717.3758281635,59717.3774022386
+250400060021,1,2504,https://heasarc.gsfc.nasa.gov/FTP/integral/data/scw/2504/250400060021.001/,slew,115,59717.5179578774,59717.5192888967
+250400040010,1,2504,https://heasarc.gsfc.nasa.gov/FTP/integral/data/scw/2504/250400040010.001/,pointing,5100,59717.3774022386,59717.4379115336
+250400060010,1,2504,https://heasarc.gsfc.nasa.gov/FTP/integral/data/scw/2504/250400060010.001/,pointing,3275,59717.4793583175,59717.5179578774
+250400040021,1,2504,https://heasarc.gsfc.nasa.gov/FTP/integral/data/scw/2504/250400040021.001/,slew,115,59717.4379115336,59717.4392425529
+250400050021,1,2504,https://heasarc.gsfc.nasa.gov/FTP/integral/data/scw/2504/250400050021.001/,slew,131,59717.4778421129,59717.4793583175
+250400000031,1,2504,https://heasarc.gsfc.nasa.gov/FTP/integral/data/scw/2504/250400000031.001/,slew,461,59717.2740804181,59717.2794160694
+250400050010,1,2504,https://heasarc.gsfc.nasa.gov/FTP/integral/data/scw/2504/250400050010.001/,pointing,3297,59717.4392425529,59717.4778421129
+CSV
+
+      - name: Verify official SCW path candidates metadata only
+        shell: bash
+        run: |
+          set -euo pipefail
+          STAGE="ACIRM_R13MUJ_GITHUB_ACTIONS_VERIFY_OFFICIAL_SCW_PATHS_FOR_LOCKED_DAY_MANIFEST_NO_VALUES"
+          OUT="$GITHUB_WORKSPACE/${STAGE}_OUTPUT"
+          python3 - <<'PY'
+          from pathlib import Path
+          import csv
+          import json
+          import os
+          import urllib.request
+
+          root = Path(os.environ["GITHUB_WORKSPACE"])
+          out = root / "ACIRM_R13MUJ_GITHUB_ACTIONS_VERIFY_OFFICIAL_SCW_PATHS_FOR_LOCKED_DAY_MANIFEST_NO_VALUES_OUTPUT"
+          manifest_path = out / "R13MUJ_INPUT_LOCKED_DAY_SCALE_SCW_MANIFEST_21_ROWS.csv"
+
+          def small_get(url, timeout=25, max_bytes=300000):
+              req = urllib.request.Request(url, headers={
+                  "User-Agent": "ACIRM-R13MUJ-official-scw-path-check-no-values",
+                  "Accept": "text/html,text/plain,*/*"
+              })
+              with urllib.request.urlopen(req, timeout=timeout) as r:
+                  data = r.read(max_bytes + 1)
+                  if len(data) > max_bytes:
+                      data = data[:max_bytes]
+                  text = data.decode("utf-8", errors="replace")
+                  return {
+                      "ok": True,
+                      "status": getattr(r, "status", ""),
+                      "final_url": r.geturl(),
+                      "content_type": r.headers.get("Content-Type", ""),
+                      "chars": len(text),
+                      "snippet": text[:500].replace("\n", " ").replace("\r", " "),
+                      "error": ""
+                  }
+
+          rows = list(csv.DictReader(manifest_path.open(encoding="utf-8")))
+          out_rows = []
+
+          for row in rows:
+              url = row["official_scw_dir_candidate_url"]
+              try:
+                  res = small_get(url)
+                  low = res["snippet"].lower()
+                  out_rows.append({
+                      "scw_id": row["scw_id_str"],
+                      "scw_ver": row["scw_ver_str"],
+                      "rev_dir": row["rev_dir_candidate"],
+                      "candidate_url": url,
+                      "tested": True,
+                      "ok": True,
+                      "status": res["status"],
+                      "content_type": res["content_type"],
+                      "chars_limited": res["chars"],
+                      "contains_index_terms": "index of" in low or "parent directory" in low or "href" in low,
+                      "mentions_fits_name": ".fits" in low or ".fit" in low or ".fits.gz" in low,
+                      "downloaded_fits": False,
+                      "opened_fits": False,
+                      "read_science_values": False,
+                      "error": ""
+                  })
+              except Exception as e:
+                  out_rows.append({
+                      "scw_id": row["scw_id_str"],
+                      "scw_ver": row["scw_ver_str"],
+                      "rev_dir": row["rev_dir_candidate"],
+                      "candidate_url": url,
+                      "tested": True,
+                      "ok": False,
+                      "status": "",
+                      "content_type": "",
+                      "chars_limited": 0,
+                      "contains_index_terms": False,
+                      "mentions_fits_name": False,
+                      "downloaded_fits": False,
+                      "opened_fits": False,
+                      "read_science_values": False,
+                      "error": repr(e)[:500]
+                  })
+
+          with (out / "R13MUJ_OFFICIAL_SCW_PATH_VERIFICATION_METADATA_ONLY.csv").open("w", newline="", encoding="utf-8") as f:
+              cols = [
+                  "scw_id","scw_ver","rev_dir","candidate_url","tested","ok","status","content_type",
+                  "chars_limited","contains_index_terms","mentions_fits_name",
+                  "downloaded_fits","opened_fits","read_science_values","error"
+              ]
+              w = csv.DictWriter(f, fieldnames=cols)
+              w.writeheader()
+              w.writerows(out_rows)
+
+          ok_count = sum(1 for r in out_rows if r["ok"])
+          summary = {
+              "n_locked_scw_rows": len(rows),
+              "n_tested": len(out_rows),
+              "n_ok": ok_count,
+              "n_failed": len(out_rows) - ok_count,
+              "downloaded_fits": False,
+              "opened_fits": False,
+              "read_science_values": False,
+              "science_values_authorized": False
+          }
+          (out / "R13MUJ_PATH_VERIFICATION_SUMMARY.json").write_text(json.dumps(summary, indent=2), encoding="utf-8")
+          PY
+
+      - name: Classify SCW path verification no values
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+          import csv
+          import json
+          import os
+
+          root = Path(os.environ["GITHUB_WORKSPACE"])
+          out = root / "ACIRM_R13MUJ_GITHUB_ACTIONS_VERIFY_OFFICIAL_SCW_PATHS_FOR_LOCKED_DAY_MANIFEST_NO_VALUES_OUTPUT"
+          verification_path = out / "R13MUJ_OFFICIAL_SCW_PATH_VERIFICATION_METADATA_ONLY.csv"
+
+          rows = list(csv.DictReader(verification_path.open(encoding="utf-8"))) if verification_path.exists() else []
+          ok_rows = [r for r in rows if str(r.get("ok")).lower() == "true"]
+          fail_rows = [r for r in rows if str(r.get("ok")).lower() != "true"]
+          fits_names_only = any(str(r.get("mentions_fits_name")).lower() == "true" for r in rows)
+
+          no_values_ok = all(
+              str(r.get("downloaded_fits")).lower() == "false" and
+              str(r.get("opened_fits")).lower() == "false" and
+              str(r.get("read_science_values")).lower() == "false"
+              for r in rows
+          )
+
+          if len(ok_rows) == len(rows) and len(rows) == 21 and no_values_ok:
+              path_decision = "ALL_LOCKED_DAY_SCALE_SCW_PATHS_VERIFIED_VALUES_STILL_BLOCKED"
+              next_stage = "R13MUK_LOCK_IC_IDX_CAT_AUX_RESPONSE_VERSIONS_AND_BACKGROUND_LINE_WINDOWS_NO_VALUES"
+          elif len(ok_rows) >= 10 and no_values_ok:
+              path_decision = "PARTIAL_LOCKED_DAY_SCALE_SCW_PATHS_VERIFIED_REPAIR_REMAINING_NO_VALUES"
+              next_stage = "R13MUK_REPAIR_MISSING_SCW_PATHS_OR_LOCK_PARTIAL_ROUTE_NO_VALUES"
+          else:
+              path_decision = "SCW_PATH_VERIFICATION_INSUFFICIENT_REPAIR_REQUIRED_NO_VALUES"
+              next_stage = "R13MUK_REPAIR_SCW_PATH_FORMULA_OR_SOURCE_ROUTE_NO_VALUES"
+
+          decision = {
+              "stage": "ACIRM_R13MUJ_GITHUB_ACTIONS_VERIFY_OFFICIAL_SCW_PATHS_FOR_LOCKED_DAY_MANIFEST_NO_VALUES",
+              "path_decision": path_decision,
+              "next_stage": next_stage,
+              "n_locked_scw_rows": len(rows),
+              "n_ok": len(ok_rows),
+              "n_failed": len(fail_rows),
+              "fits_names_in_directory_listing_only": fits_names_only,
+              "downloaded_fits": False,
+              "opened_fits": False,
+              "read_science_values": False,
+              "no_values_ok": no_values_ok,
+              "science_values_authorized": False,
+              "new_values_opened": False,
+              "hard_blockers_before_values": [
+                  "exact_IC_IDX_CAT_AUX_versions_not_locked",
+                  "exact_SPI_response_IRF_RMF_not_locked",
+                  "background_method_not_locked",
+                  "511_line_window_and_sidebands_not_locked",
+                  "off_time_and_off_region_controls_not_locked"
+              ],
+              "claim_ceiling": "official SCW path verification metadata only; no SPI/511 values"
+          }
+          (out / "R13MUJ_SCW_PATH_VERIFICATION_DECISION.json").write_text(json.dumps(decision, indent=2), encoding="utf-8")
+          print(json.dumps(decision, indent=2))
+          PY
+
+      - name: Package results
+        shell: bash
+        run: |
+          set -euo pipefail
+          STAGE="ACIRM_R13MUJ_GITHUB_ACTIONS_VERIFY_OFFICIAL_SCW_PATHS_FOR_LOCKED_DAY_MANIFEST_NO_VALUES"
+          OUT="$GITHUB_WORKSPACE/${STAGE}_OUTPUT"
+          ZIP="$GITHUB_WORKSPACE/${STAGE}_RESULTS.zip"
+          SHA="$ZIP.sha256.txt"
+
+          cat > "$OUT/R13MUJ_GO_NO_GO.csv" <<'CSV'
+          question,decision,reason
+          Open SPI/511 science values now?,NO,This stage verifies SCW paths only.
+          Download FITS now?,NO,FITS downloads remain forbidden.
+          Are official locked SCW paths verified?,SEE_DECISION,Read R13MUJ_SCW_PATH_VERIFICATION_DECISION.json.
+          Can this prove 511 keV or particle production?,NO,No values opened.
+          CSV
+
+          cd "$GITHUB_WORKSPACE"
+          rm -f "$ZIP" "$SHA"
+          zip -r "$ZIP" "$(basename "$OUT")"
+          sha256sum "$ZIP" > "$SHA"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ACIRM_R13MUJ_GITHUB_ACTIONS_VERIFY_OFFICIAL_SCW_PATHS_FOR_LOCKED_DAY_MANIFEST_NO_VALUES_RESULTS
+          path: |
+            ACIRM_R13MUJ_GITHUB_ACTIONS_VERIFY_OFFICIAL_SCW_PATHS_FOR_LOCKED_DAY_MANIFEST_NO_VALUES_RESULTS.zip
+            ACIRM_R13MUJ_GITHUB_ACTIONS_VERIFY_OFFICIAL_SCW_PATHS_FOR_LOCKED_DAY_MANIFEST_NO_VALUES_RESULTS.zip.sha256.txt
+          retention-days: 7
