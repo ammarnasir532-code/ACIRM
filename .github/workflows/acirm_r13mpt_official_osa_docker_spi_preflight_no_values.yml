@@ -1,0 +1,177 @@
+name: ACIRM R13MPT official OSA Docker SPI preflight no values
+
+on:
+  workflow_dispatch:
+
+jobs:
+  official-osa-docker-preflight:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+
+    steps:
+      - name: Run official OSA Docker SPI preflight without values
+        shell: bash
+        run: |
+          set +e
+          STAGE="ACIRM_R13MPT_OFFICIAL_OSA_DOCKER_SPI_PREFLIGHT_NO_VALUES"
+          OUT="$GITHUB_WORKSPACE/${STAGE}_OUTPUT"
+          mkdir -p "$OUT"
+
+          cat > "$OUT/R13MPT_FIREWALL.json" <<'JSON'
+          {
+            "stage": "ACIRM_R13MPT_OFFICIAL_OSA_DOCKER_SPI_PREFLIGHT_NO_VALUES",
+            "inherits_from": "R13MPS could not discover a usable MPE revolution-2504 rebinned tarball link.",
+            "purpose": "Test whether the official INTEGRAL OSA Docker environment is usable for SPI workflow on GitHub Actions.",
+            "opens_fits": false,
+            "downloads_science_data": false,
+            "reads_science_values": false,
+            "runs_spi_science_analysis_on_data": false,
+            "forbidden_claims": [
+              "511 keV detection",
+              "evidence",
+              "proof",
+              "discovery",
+              "particle production",
+              "ACIRM established"
+            ],
+            "claim_ceiling": "environment preflight only"
+          }
+          JSON
+
+          {
+            echo "start_utc=$(date -u)"
+            echo "runner=$(uname -a)"
+            echo "workspace=$GITHUB_WORKSPACE"
+            echo "disk:"
+            df -h || true
+            echo "docker_version:"
+            docker --version || true
+            echo "docker_info:"
+            docker info || true
+          } > "$OUT/R13MPT_RUNNER_AND_DOCKER_INFO.log" 2>&1
+
+          SELECTED_IMAGE=""
+          PULL_OK="false"
+          IMAGES=("integralsw/osa:11.2" "integralsw/osa:latest" "integralsw/osa:10.2")
+
+          for IMG in "${IMAGES[@]}"; do
+            SAFE=$(echo "$IMG" | tr '/:' '__')
+            echo "Trying image $IMG" > "$OUT/R13MPT_PULL_${SAFE}.log"
+            docker pull "$IMG" >> "$OUT/R13MPT_PULL_${SAFE}.log" 2>&1
+            CODE=$?
+            echo "pull_exit_code=$CODE" >> "$OUT/R13MPT_PULL_${SAFE}.log"
+            if [ "$CODE" = "0" ]; then
+              SELECTED_IMAGE="$IMG"
+              PULL_OK="true"
+              break
+            fi
+          done
+
+          echo "selected_image=$SELECTED_IMAGE" > "$OUT/R13MPT_SELECTED_IMAGE.txt"
+          echo "pull_ok=$PULL_OK" >> "$OUT/R13MPT_SELECTED_IMAGE.txt"
+
+          RUNTIME_OK="false"
+          SPI_TOOL_FOUND="false"
+          OG_CREATE_FOUND="false"
+          DAL_LIST_FOUND="false"
+
+          if [ "$PULL_OK" = "true" ]; then
+            docker run --rm --entrypoint /bin/bash "$SELECTED_IMAGE" -lc '
+              set +e
+              echo "CONTAINER_RUNTIME_OK"
+              echo "container_uname=$(uname -a)"
+              echo "PATH=$PATH"
+              echo "tool_checks_start"
+              if command -v spi_science_analysis >/dev/null 2>&1; then echo "TOOL_SPI_SCIENCE_ANALYSIS_FOUND=$(command -v spi_science_analysis)"; else echo "TOOL_SPI_SCIENCE_ANALYSIS_MISSING"; fi
+              if command -v og_create >/dev/null 2>&1; then echo "TOOL_OG_CREATE_FOUND=$(command -v og_create)"; else echo "TOOL_OG_CREATE_MISSING"; fi
+              if command -v dal_list >/dev/null 2>&1; then echo "TOOL_DAL_LIST_FOUND=$(command -v dal_list)"; else echo "TOOL_DAL_LIST_MISSING"; fi
+              if command -v spiros >/dev/null 2>&1; then echo "TOOL_SPIROS_FOUND=$(command -v spiros)"; else echo "TOOL_SPIROS_MISSING"; fi
+              echo "env_snapshot_start"
+              env | sort | grep -E "OSA|ISDC|REP_BASE|CURRENT_IC|HEADAS|PFILES|PATH" || true
+              echo "env_snapshot_end"
+              echo "container_os_release_start"
+              cat /etc/os-release 2>/dev/null || true
+              echo "container_os_release_end"
+            ' > "$OUT/R13MPT_CONTAINER_PREFLIGHT.log" 2>&1
+
+            RUN_CODE=$?
+            echo "container_run_exit_code=$RUN_CODE" >> "$OUT/R13MPT_CONTAINER_PREFLIGHT.log"
+
+            if grep -q "CONTAINER_RUNTIME_OK" "$OUT/R13MPT_CONTAINER_PREFLIGHT.log"; then
+              RUNTIME_OK="true"
+            fi
+            if grep -q "TOOL_SPI_SCIENCE_ANALYSIS_FOUND=" "$OUT/R13MPT_CONTAINER_PREFLIGHT.log"; then
+              SPI_TOOL_FOUND="true"
+            fi
+            if grep -q "TOOL_OG_CREATE_FOUND=" "$OUT/R13MPT_CONTAINER_PREFLIGHT.log"; then
+              OG_CREATE_FOUND="true"
+            fi
+            if grep -q "TOOL_DAL_LIST_FOUND=" "$OUT/R13MPT_CONTAINER_PREFLIGHT.log"; then
+              DAL_LIST_FOUND="true"
+            fi
+          else
+            echo "No OSA Docker image could be pulled from tested candidates." > "$OUT/R13MPT_CONTAINER_PREFLIGHT.log"
+          fi
+
+          if [ "$PULL_OK" != "true" ]; then
+            DECISION="OFFICIAL_OSA_DOCKER_IMAGE_NOT_PULLABLE_NO_VALUES"
+            NEXT_STAGE="R13MPU_USE_EXTERNAL_RUNNER_OR_SINGULARITY_APPTAINER_PREFLIGHT"
+          elif [ "$RUNTIME_OK" != "true" ]; then
+            DECISION="OFFICIAL_OSA_DOCKER_IMAGE_PULLED_BUT_CONTAINER_DID_NOT_RUN_NO_VALUES"
+            NEXT_STAGE="R13MPU_REPAIR_DOCKER_ENTRYPOINT_OR_USE_SINGULARITY"
+          elif [ "$SPI_TOOL_FOUND" = "true" ] && [ "$OG_CREATE_FOUND" = "true" ]; then
+            DECISION="OFFICIAL_OSA_DOCKER_SPI_ENV_PREFLIGHT_PASSED_NO_VALUES"
+            NEXT_STAGE="R13MPU_OFFICIAL_OSA_SPI_OBSGROUP_DRY_RUN_NO_VALUES"
+          elif [ "$SPI_TOOL_FOUND" = "true" ]; then
+            DECISION="OFFICIAL_OSA_DOCKER_SPI_TOOL_FOUND_BUT_OBSGROUP_TOOL_NOT_CONFIRMED_NO_VALUES"
+            NEXT_STAGE="R13MPU_REPAIR_OSA_TOOL_PATHS_OR_CONTAINER_ENV"
+          else
+            DECISION="OFFICIAL_OSA_DOCKER_AVAILABLE_BUT_SPI_TOOLS_NOT_CONFIRMED_NO_VALUES"
+            NEXT_STAGE="R13MPU_REPAIR_OSA_IMAGE_TAG_OR_TOOL_PATHS"
+          fi
+
+          cat > "$OUT/R13MPT_FINAL_DECISION.json" <<JSON
+          {
+            "stage": "ACIRM_R13MPT_OFFICIAL_OSA_DOCKER_SPI_PREFLIGHT_NO_VALUES",
+            "decision": "$DECISION",
+            "next_stage": "$NEXT_STAGE",
+            "tested_images": ["integralsw/osa:11.2", "integralsw/osa:latest", "integralsw/osa:10.2"],
+            "selected_image": "$SELECTED_IMAGE",
+            "pull_ok": $PULL_OK,
+            "container_runtime_ok": $RUNTIME_OK,
+            "spi_science_analysis_found": $SPI_TOOL_FOUND,
+            "og_create_found": $OG_CREATE_FOUND,
+            "dal_list_found": $DAL_LIST_FOUND,
+            "downloads_science_data": false,
+            "opens_fits": false,
+            "reads_science_values": false,
+            "claim_ceiling": "environment preflight only; no 511 detection/evidence/proof/discovery claim"
+          }
+          JSON
+
+          cat > "$OUT/R13MPT_GO_NO_GO.csv" <<'CSV'
+          question,decision,reason
+          Does R13MPT download science data?,NO,Only Docker image/environment is tested.
+          Does R13MPT open FITS files?,NO,No FITS access in this stage.
+          Does R13MPT read science values?,NO,No science values are opened.
+          Does R13MPT run SPI analysis on data?,NO,Only command availability is tested.
+          Can R13MPT claim 511 detection?,NO,It is environment preflight only.
+          CSV
+
+          cd "$GITHUB_WORKSPACE"
+          ZIP="$GITHUB_WORKSPACE/${STAGE}_RESULTS.zip"
+          SHA="$ZIP.sha256.txt"
+          rm -f "$ZIP" "$SHA"
+          zip -r "$ZIP" "$(basename "$OUT")"
+          sha256sum "$ZIP" > "$SHA"
+          exit 0
+
+      - name: Upload artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ACIRM_R13MPT_OFFICIAL_OSA_DOCKER_SPI_PREFLIGHT_NO_VALUES_RESULTS
+          path: |
+            ACIRM_R13MPT_OFFICIAL_OSA_DOCKER_SPI_PREFLIGHT_NO_VALUES_RESULTS.zip
+            ACIRM_R13MPT_OFFICIAL_OSA_DOCKER_SPI_PREFLIGHT_NO_VALUES_RESULTS.zip.sha256.txt
+          retention-days: 7
