@@ -1,0 +1,380 @@
+name: ACIRM R13MPAF Fermi LAT delayed GeV TeV driver metadata preflight no score
+
+on:
+  workflow_dispatch:
+
+jobs:
+  r13mpaf-fermi-lat-metadata-preflight:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+
+    steps:
+      - name: R13MPAF Fermi LAT delayed high energy driver metadata preflight no score
+        shell: bash
+        run: |
+          set +e
+          STAGE="ACIRM_R13MPAF_FERMI_LAT_DELAYED_GEV_TEV_DRIVER_METADATA_PREFLIGHT_NO_SCORE"
+          OUT="$GITHUB_WORKSPACE/${STAGE}_OUTPUT"
+          DATA="$GITHUB_WORKSPACE/${STAGE}_DATA"
+          mkdir -p "$OUT" "$DATA"
+          python3 -m pip install --user --no-cache-dir --upgrade numpy astropy > "$OUT/R13MPAF_PIP_INSTALL.log" 2>&1
+          cat > "$GITHUB_WORKSPACE/r13mpaf_controller.py" <<'PYCODE'
+          from pathlib import Path
+          from urllib.request import Request, urlopen
+          import csv, datetime, hashlib, json, math, os, shutil, subprocess, sys, time, traceback
+          import numpy as np
+          from astropy.io import fits
+          from astropy.time import Time, TimeDelta
+
+          STAGE = "ACIRM_R13MPAF_FERMI_LAT_DELAYED_GEV_TEV_DRIVER_METADATA_PREFLIGHT_NO_SCORE"
+          BASE = Path(os.environ.get("GITHUB_WORKSPACE", "/tmp/acirm_r13mpaf"))
+          OUT = BASE / (STAGE + "_OUTPUT")
+          DATA = BASE / (STAGE + "_DATA")
+          OUT.mkdir(parents=True, exist_ok=True)
+          DATA.mkdir(parents=True, exist_ok=True)
+
+          LOCKED = {
+              "stage": STAGE,
+              "previous_stage": "ACIRM_R13MPAE_DELAYED_HIGH_ENERGY_DRIVER_AFTER_LOCKED_R9C_GATE_PROTOCOL_NO_DATA",
+              "decision_scope": "metadata/time-window preflight only; no photon extraction, no likelihood, no score, no evidence/proof/discovery claim",
+              "locked_gate": "R9C is accepted as the locked ACIRM gate/phase-inversion diagnostic event for this branch; this stage does not re-test R9C.",
+              "source": "Cyg X-1",
+              "cygx1_ra_deg": 299.590315,
+              "cygx1_dec_deg": 35.201606,
+              "roi_deg_primary": 5.0,
+              "roi_deg_audit": 10.0,
+              "energy_route": "Fermi-LAT GeV to sub-TeV / TeV-capable metadata preflight",
+              "fermi_catalog_url": "https://fermi.gsfc.nasa.gov/ssc/data/access/lat/14yr_catalog/gll_psc_v35.fit",
+              "lat_data_server_url": "https://fermi.gsfc.nasa.gov/cgi-bin/ssc/LAT/LATDataQuery.cgi",
+              "r9c_time_basis": "R13MU_R2 ref_time + locked R9C start_rel_s. Treated as preflight timing, not final timing proof.",
+              "r9c_nicer_ref_time_s": 264299262.67254668,
+              "r9c_start_rel_s": 72796.99981,
+              "r9c_duration_s": 1.0,
+              "nicer_epoch_utc": "2014-01-01T00:00:00",
+              "fermi_epoch_utc": "2001-01-01T00:00:00",
+              "locked_post_windows": [
+                  {"id": "W0", "label": "post_0_1h", "start_s": 0, "end_s": 3600},
+                  {"id": "W1", "label": "post_1_6h", "start_s": 3600, "end_s": 21600},
+                  {"id": "W2", "label": "post_6_24h", "start_s": 21600, "end_s": 86400},
+                  {"id": "W3", "label": "post_1_7d", "start_s": 86400, "end_s": 604800},
+                  {"id": "W4", "label": "post_7_30d", "start_s": 604800, "end_s": 2592000}
+              ],
+              "locked_pre_controls": [
+                  {"id": "C0", "label": "pre_0_1h", "start_s": -3600, "end_s": 0},
+                  {"id": "C1", "label": "pre_1_6h", "start_s": -21600, "end_s": -3600},
+                  {"id": "C2", "label": "pre_6_24h", "start_s": -86400, "end_s": -21600}
+              ],
+              "high_energy_metadata_bands": [
+                  {"band": "GeV_1_10", "emin_mev": 1000, "emax_mev": 10000},
+                  {"band": "GeV_10_100", "emin_mev": 10000, "emax_mev": 100000},
+                  {"band": "GeV_100_1000", "emin_mev": 100000, "emax_mev": 1000000}
+              ],
+              "claim_ceiling": "preflight only: readiness / catalog-context / timing-window availability; no detection claim"
+          }
+
+          def log(msg):
+              print(str(msg), flush=True)
+              with (OUT / "R13MPAF_PROGRESS.log").open("a", encoding="utf-8") as f:
+                  f.write(str(msg) + "\n")
+
+          def write_json(name, obj):
+              (OUT / name).write_text(json.dumps(obj, indent=2, ensure_ascii=False), encoding="utf-8")
+
+          def write_csv(name, rows, cols):
+              with (OUT / name).open("w", newline="", encoding="utf-8") as f:
+                  w = csv.DictWriter(f, fieldnames=cols)
+                  w.writeheader()
+                  for r in rows:
+                      w.writerow({c: r.get(c, "") for c in cols})
+
+          def sha256_file(path):
+              h = hashlib.sha256()
+              with open(path, "rb") as f:
+                  for b in iter(lambda: f.read(1024 * 1024), b""):
+                      h.update(b)
+              return h.hexdigest()
+
+          def final_decision(decision, next_stage, extra=None):
+              obj = {
+                  "stage": STAGE,
+                  "decision": decision,
+                  "next_stage": next_stage,
+                  "claim_ceiling": LOCKED["claim_ceiling"],
+                  "timestamp_utc": datetime.datetime.now(datetime.UTC).isoformat()
+              }
+              if extra:
+                  obj.update(extra)
+              write_json("R13MPAF_FINAL_DECISION.json", obj)
+              log("FINAL_DECISION: " + decision)
+              return obj
+
+          def run_cmd(cmd, timeout=120):
+              try:
+                  p = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=timeout)
+                  return p.returncode, p.stdout
+              except Exception as e:
+                  return 999, repr(e)
+
+          def probe_url(url, label, timeout=60):
+              rows = []
+              for method, shell in [
+                  ("curl_head", "curl -L -I --connect-timeout 20 --max-time %d --retry 1 --retry-all-errors " % timeout + repr(url)),
+                  ("curl_range", "curl -L --fail --connect-timeout 20 --max-time %d --retry 1 --retry-all-errors -r 0-0 -o /tmp/acirm_probe.bin " % timeout + repr(url))
+              ]:
+                  code, out = run_cmd(["bash", "-lc", shell], timeout=timeout + 20)
+                  rows.append({"label": label, "url": url, "method": method, "ok": code == 0, "exit_code": code, "log_tail": out[-1000:]})
+              return rows
+
+          def download_fast(url, dest, label, max_time=300):
+              dest.parent.mkdir(parents=True, exist_ok=True)
+              tmp = dest.with_suffix(dest.suffix + ".part")
+              if tmp.exists():
+                  try: tmp.unlink()
+                  except Exception: pass
+              row = {"label": label, "url": url, "download_ok": False, "path": str(dest), "size_bytes": "", "sha256": "", "method": "", "exit_code": "", "error": ""}
+              logs = []
+              cmd = ["bash", "-lc", "curl -L --fail --connect-timeout 20 --max-time %d --retry 2 --retry-delay 4 --retry-all-errors -o " % max_time + repr(str(tmp)) + " " + repr(url)]
+              code, out = run_cmd(cmd, timeout=max_time + 60)
+              logs.append("CURL_EXIT_%s\n%s" % (code, out[-2000:]))
+              if code == 0 and tmp.exists() and tmp.stat().st_size > 0:
+                  tmp.rename(dest)
+                  row.update({"download_ok": True, "size_bytes": dest.stat().st_size, "sha256": sha256_file(dest), "method": "curl", "exit_code": code})
+                  return row, "\n".join(logs)
+              if tmp.exists():
+                  try: tmp.unlink()
+                  except Exception: pass
+              try:
+                  req = Request(url, headers={"User-Agent": "ACIRM-R13MPAF/1.0"})
+                  with urlopen(req, timeout=max_time) as r, open(tmp, "wb") as f:
+                      shutil.copyfileobj(r, f, length=1024 * 1024)
+                  if tmp.exists() and tmp.stat().st_size > 0:
+                      tmp.rename(dest)
+                      row.update({"download_ok": True, "size_bytes": dest.stat().st_size, "sha256": sha256_file(dest), "method": "urllib", "exit_code": 0})
+                      logs.append("URLLIB_OK")
+                      return row, "\n".join(logs)
+              except Exception as e:
+                  logs.append("URLLIB_EXCEPTION\n" + repr(e))
+              row.update({"method": "curl_urllib", "exit_code": "FAILED", "error": "download_failed_fast_bounded"})
+              return row, "\n".join(logs)
+
+          def colnames(table):
+              try:
+                  return list(table.columns.names)
+              except Exception:
+                  return []
+
+          def pick_col(cols, names):
+              upper = {str(c).upper(): c for c in cols}
+              for n in names:
+                  if n.upper() in upper:
+                      return upper[n.upper()]
+              return None
+
+          def bstr(x):
+              if isinstance(x, bytes):
+                  return x.decode("utf-8", errors="ignore").strip()
+              try:
+                  if hasattr(x, 'item'):
+                      x = x.item()
+                  if isinstance(x, bytes):
+                      return x.decode("utf-8", errors="ignore").strip()
+              except Exception:
+                  pass
+              return str(x).strip()
+
+          def angsep_deg(ra1, dec1, ra2, dec2):
+              r1 = math.radians(float(ra1)); d1 = math.radians(float(dec1))
+              r2 = math.radians(float(ra2)); d2 = math.radians(float(dec2))
+              s = math.sin((d2-d1)/2)**2 + math.cos(d1)*math.cos(d2)*math.sin((r2-r1)/2)**2
+              return math.degrees(2*math.asin(min(1, math.sqrt(max(0, s)))))
+
+          write_json("R13MPAF_LOCKED_CONTEXT.json", LOCKED)
+          log("R13MPAF started: metadata/time-window preflight only. No likelihood and no detection claim.")
+
+          r9c_nicer_time = float(LOCKED["r9c_nicer_ref_time_s"]) + float(LOCKED["r9c_start_rel_s"])
+          nicer_epoch = Time(LOCKED["nicer_epoch_utc"], scale="utc")
+          fermi_epoch = Time(LOCKED["fermi_epoch_utc"], scale="utc")
+          r9c_time_utc = nicer_epoch + TimeDelta(r9c_nicer_time, format="sec")
+          r9c_fermi_met = float((r9c_time_utc - fermi_epoch).sec)
+          time_rows = []
+          all_windows = []
+          for w in LOCKED["locked_post_windows"] + LOCKED["locked_pre_controls"]:
+              start = r9c_time_utc + TimeDelta(float(w["start_s"]), format="sec")
+              end = r9c_time_utc + TimeDelta(float(w["end_s"]), format="sec")
+              start_met = float((start - fermi_epoch).sec)
+              end_met = float((end - fermi_epoch).sec)
+              role = "post_driver" if w["id"].startswith("W") else "pre_control"
+              row = {"window_id": w["id"], "label": w["label"], "role": role, "start_utc": start.utc.isot, "end_utc": end.utc.isot, "start_fermi_met": start_met, "end_fermi_met": end_met, "duration_s": float(w["end_s"])-float(w["start_s"])}
+              time_rows.append(row); all_windows.append(row)
+          write_csv("R13MPAF_LOCKED_R9C_TIME_WINDOWS_FOR_FERMI.csv", time_rows, ["window_id", "label", "role", "start_utc", "end_utc", "start_fermi_met", "end_fermi_met", "duration_s"])
+          write_json("R13MPAF_R9C_TIME_PREFLIGHT.json", {"r9c_nicer_time_s": r9c_nicer_time, "r9c_time_utc_preflight": r9c_time_utc.utc.isot, "r9c_mjd_preflight": float(r9c_time_utc.utc.mjd), "r9c_fermi_met_preflight": r9c_fermi_met, "time_caveat": "Computed from R13MU_R2 ref_time + R9C relative start using NICER epoch for preflight windows. Final photon work should verify FITS timing keywords/TIMESYS."})
+
+          probe_rows = []
+          probe_rows += probe_url(LOCKED["lat_data_server_url"], "lat_data_server", timeout=60)
+          probe_rows += probe_url(LOCKED["fermi_catalog_url"], "4fgl_dr4_catalog", timeout=60)
+          write_csv("R13MPAF_NETWORK_AND_ENDPOINT_PREFLIGHT.csv", probe_rows, ["label", "url", "method", "ok", "exit_code", "log_tail"])
+
+          catalog_path = DATA / "gll_psc_v35.fit"
+          cat_row, cat_log = download_fast(LOCKED["fermi_catalog_url"], catalog_path, "4fgl_dr4_catalog", max_time=360)
+          (OUT / "R13MPAF_4FGL_DOWNLOAD.log").write_text(cat_log, encoding="utf-8")
+          write_csv("R13MPAF_4FGL_DOWNLOAD.csv", [cat_row], ["label", "url", "download_ok", "path", "size_bytes", "sha256", "method", "exit_code", "error"])
+
+          catalog_rows = []
+          catalog_context = {}
+          errors = []
+          if cat_row.get("download_ok"):
+              try:
+                  with fits.open(catalog_path, memmap=False) as hdul:
+                      table_hdu = None
+                      for hdu in hdul:
+                          if hasattr(hdu, "data") and hdu.data is not None and hasattr(hdu, "columns"):
+                              cols = colnames(hdu)
+                              if pick_col(cols, ["RAJ2000", "RA", "RAJ2000"] ) and pick_col(cols, ["DEJ2000", "DEC", "DECJ2000"]):
+                                  table_hdu = hdu
+                                  break
+                      if table_hdu is None:
+                          raise RuntimeError("Could not identify 4FGL source table with RA/DEC columns")
+                      data = table_hdu.data
+                      cols = colnames(table_hdu)
+                      ra_col = pick_col(cols, ["RAJ2000", "RA", "RAJ2000"])
+                      dec_col = pick_col(cols, ["DEJ2000", "DEC", "DECJ2000"])
+                      name_col = pick_col(cols, ["Source_Name", "Source_Name", "NAME", "Source_Name"])
+                      assoc_col = pick_col(cols, ["ASSOC1", "ASSOC2", "ASSOC_TEV", "ASSOC"])
+                      class_col = pick_col(cols, ["CLASS1", "CLASS"])
+                      sig_col = pick_col(cols, ["Detection_Significance", "Signif_Avg", "SIGNIFICANCE"])
+                      var_col = pick_col(cols, ["Variability_Index", "Variability_Index"])
+                      fracvar_col = pick_col(cols, ["Frac_Variability", "Frac_Variability"])
+                      peak_col = pick_col(cols, ["Time_Peak", "Time_Peak"])
+                      peakint_col = pick_col(cols, ["Time_Peak_Interval", "Time_Peak_Interval"])
+                      tev_col = pick_col(cols, ["TeVCat_Flag", "TEVCAT_FLAG", "TEVCat"])
+                      flags_col = pick_col(cols, ["Flags", "FLAGS"])
+                      flux_col = pick_col(cols, ["Flux_1_100_GeV", "Flux1000", "Flux_1_100_GeV"])
+                      energy_flux_col = pick_col(cols, ["Energy_Flux", "Energy_Flux100"])
+                      catalog_context = {"table_hdu_name": str(getattr(table_hdu, "name", "")), "row_count": int(len(data)), "columns": cols[:200], "ra_col": ra_col, "dec_col": dec_col, "name_col": name_col, "assoc_col": assoc_col, "class_col": class_col, "time_peak_col": peak_col, "tev_col": tev_col, "flags_col": flags_col}
+                      for i, row in enumerate(data):
+                          try:
+                              ra = float(row[ra_col]); dec = float(row[dec_col])
+                              sep = angsep_deg(LOCKED["cygx1_ra_deg"], LOCKED["cygx1_dec_deg"], ra, dec)
+                              if sep <= float(LOCKED["roi_deg_audit"]):
+                                  tp_mjd = None; tp_delta_days = None; tp_window = ""
+                                  if peak_col is not None:
+                                      try:
+                                          tp_mjd = float(row[peak_col])
+                                          if np.isfinite(tp_mjd) and tp_mjd > 0:
+                                              tp_time = Time(tp_mjd, format="mjd", scale="utc")
+                                              tp_delta_days = float(tp_time.mjd - r9c_time_utc.utc.mjd)
+                                              for wr in all_windows:
+                                                  if wr["start_utc"] <= tp_time.utc.isot <= wr["end_utc"]:
+                                                      tp_window = wr["window_id"] + "_" + wr["label"]
+                                      except Exception:
+                                          pass
+                                  catalog_rows.append({
+                                      "source_name": bstr(row[name_col]) if name_col else "",
+                                      "assoc": bstr(row[assoc_col]) if assoc_col else "",
+                                      "class": bstr(row[class_col]) if class_col else "",
+                                      "ra_deg": ra,
+                                      "dec_deg": dec,
+                                      "sep_from_cygx1_deg": sep,
+                                      "within_primary_roi_5deg": bool(sep <= float(LOCKED["roi_deg_primary"])),
+                                      "detection_significance": float(row[sig_col]) if sig_col else "",
+                                      "variability_index": float(row[var_col]) if var_col else "",
+                                      "frac_variability": float(row[fracvar_col]) if fracvar_col else "",
+                                      "time_peak_mjd": tp_mjd if tp_mjd is not None else "",
+                                      "time_peak_delta_days_from_R9C": tp_delta_days if tp_delta_days is not None else "",
+                                      "time_peak_locked_window_match": tp_window,
+                                      "time_peak_interval_s": float(row[peakint_col]) if peakint_col else "",
+                                      "tevcat_flag": bstr(row[tev_col]) if tev_col else "",
+                                      "flags": int(row[flags_col]) if flags_col else "",
+                                      "flux_1_100_gev": float(row[flux_col]) if flux_col else "",
+                                      "energy_flux": float(row[energy_flux_col]) if energy_flux_col else ""
+                                  })
+                          except Exception:
+                              pass
+              except Exception as e:
+                  errors.append({"stage": "catalog_parse", "error": repr(e)[:500], "traceback": traceback.format_exc()[:1500]})
+          write_json("R13MPAF_4FGL_CATALOG_CONTEXT.json", catalog_context)
+          catalog_rows = sorted(catalog_rows, key=lambda r: float(r.get("sep_from_cygx1_deg", 999)))
+          write_csv("R13MPAF_4FGL_SOURCES_WITHIN_10DEG_CYGX1.csv", catalog_rows, ["source_name", "assoc", "class", "ra_deg", "dec_deg", "sep_from_cygx1_deg", "within_primary_roi_5deg", "detection_significance", "variability_index", "frac_variability", "time_peak_mjd", "time_peak_delta_days_from_R9C", "time_peak_locked_window_match", "time_peak_interval_s", "tevcat_flag", "flags", "flux_1_100_gev", "energy_flux"])
+          write_json("R13MPAF_ERRORS.json", {"errors_count": len(errors), "errors": errors})
+
+          query_rows = []
+          for wr in all_windows:
+              for band in LOCKED["high_energy_metadata_bands"]:
+                  query_rows.append({
+                      "window_id": wr["window_id"], "label": wr["label"], "role": wr["role"],
+                      "ra_deg": LOCKED["cygx1_ra_deg"], "dec_deg": LOCKED["cygx1_dec_deg"], "roi_deg": LOCKED["roi_deg_primary"],
+                      "start_fermi_met": wr["start_fermi_met"], "end_fermi_met": wr["end_fermi_met"],
+                      "emin_mev": band["emin_mev"], "emax_mev": band["emax_mev"], "band": band["band"],
+                      "submit_status": "NOT_SUBMITTED_PREFLIGHT_ONLY",
+                      "lat_data_server_url": LOCKED["lat_data_server_url"]
+                  })
+          write_csv("R13MPAF_FERMI_LAT_QUERY_TEMPLATES_NOT_SUBMITTED.csv", query_rows, ["window_id", "label", "role", "ra_deg", "dec_deg", "roi_deg", "start_fermi_met", "end_fermi_met", "emin_mev", "emax_mev", "band", "submit_status", "lat_data_server_url"])
+
+          n_endpoint_ok = sum(1 for r in probe_rows if r.get("ok"))
+          n_catalog_sources_5 = sum(1 for r in catalog_rows if r.get("within_primary_roi_5deg") in [True, "True"])
+          n_catalog_sources_10 = len(catalog_rows)
+          n_time_peak_hits = sum(1 for r in catalog_rows if r.get("time_peak_locked_window_match"))
+          n_tev_flags = sum(1 for r in catalog_rows if str(r.get("tevcat_flag", "")).strip() not in ["", "N", "0", "nan"])
+          summary = {
+              "r9c_time_utc_preflight": r9c_time_utc.utc.isot,
+              "r9c_fermi_met_preflight": r9c_fermi_met,
+              "endpoint_probe_ok_count": n_endpoint_ok,
+              "catalog_download_ok": bool(cat_row.get("download_ok")),
+              "catalog_sources_within_5deg": n_catalog_sources_5,
+              "catalog_sources_within_10deg": n_catalog_sources_10,
+              "catalog_sources_with_time_peak_in_locked_windows": n_time_peak_hits,
+              "catalog_sources_with_tevcat_flag_within_10deg": n_tev_flags,
+              "query_templates_not_submitted": len(query_rows),
+              "errors_count": len(errors),
+              "claim_ceiling": LOCKED["claim_ceiling"]
+          }
+          write_json("R13MPAF_PREFLIGHT_SUMMARY.json", summary)
+          if not cat_row.get("download_ok") and n_endpoint_ok == 0:
+              decision = "TECHNICAL_STOP_FERMI_ENDPOINTS_UNREACHABLE_NO_DATA_NO_SCORE"
+              next_stage = "RERUN_PREFLIGHT_WHEN_NETWORK_IS_AVAILABLE"
+          elif not cat_row.get("download_ok"):
+              decision = "FERMI_ENDPOINTS_REACHABLE_BUT_4FGL_CATALOG_DOWNLOAD_FAILED_NO_SCORE"
+              next_stage = "RETRY_4FGL_DOWNLOAD_OR_USE_HEASARC_BROWSE_TABLE_PREFLIGHT"
+          elif n_catalog_sources_10 > 0:
+              decision = "FERMI_LAT_METADATA_PREFLIGHT_READY_FOR_SMALL_DELAYED_PHOTON_AVAILABILITY_CHECK_NO_SCORE"
+              next_stage = "ACIRM_R13MPAG_SMALL_FERMI_LAT_DELAYED_PHOTON_AVAILABILITY_CHECK_NO_LIKELIHOOD_NO_SCORE"
+          else:
+              decision = "FERMI_LAT_METADATA_PREFLIGHT_NO_CATALOG_CONTEXT_WITHIN_10DEG_NO_SCORE"
+              next_stage = "MANUAL_CHECK_ROI_OR_ALTERNATE_HIGH_ENERGY_ROUTE"
+          final_decision(decision, next_stage, {"summary": summary})
+          try:
+              shutil.rmtree(DATA)
+          except Exception:
+              pass
+          PYCODE
+          python3 "$GITHUB_WORKSPACE/r13mpaf_controller.py" > "$OUT/R13MPAF_CONTROLLER_STDOUT.txt" 2> "$OUT/R13MPAF_CONTROLLER_STDERR.txt"
+          CODE=$?
+          echo "controller_exit_code=$CODE" > "$OUT/R13MPAF_STEP_STATUS.log"
+          if [ ! -f "$OUT/R13MPAF_FINAL_DECISION.json" ]; then
+            cat > "$OUT/R13MPAF_FINAL_DECISION.json" <<'JSON'
+          {
+            "stage": "ACIRM_R13MPAF_FERMI_LAT_DELAYED_GEV_TEV_DRIVER_METADATA_PREFLIGHT_NO_SCORE",
+            "decision": "CONTROLLER_FAILED_BEFORE_FINAL_DECISION",
+            "next_stage": "REPAIR_FROM_STDOUT_STDERR",
+            "claim_ceiling": "no reliable result"
+          }
+          JSON
+          fi
+          cd "$GITHUB_WORKSPACE"
+          ZIP="$GITHUB_WORKSPACE/${STAGE}_RESULTS.zip"
+          SHA="$ZIP.sha256.txt"
+          rm -f "$ZIP" "$SHA"
+          rm -rf "$GITHUB_WORKSPACE/${STAGE}_DATA"
+          zip -r "$ZIP" "$(basename "$OUT")"
+          sha256sum "$ZIP" > "$SHA"
+          exit 0
+
+      - name: Upload artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ACIRM_R13MPAF_FERMI_LAT_DELAYED_GEV_TEV_DRIVER_METADATA_PREFLIGHT_NO_SCORE_RESULTS
+          path: |
+            ACIRM_R13MPAF_FERMI_LAT_DELAYED_GEV_TEV_DRIVER_METADATA_PREFLIGHT_NO_SCORE_RESULTS.zip
+            ACIRM_R13MPAF_FERMI_LAT_DELAYED_GEV_TEV_DRIVER_METADATA_PREFLIGHT_NO_SCORE_RESULTS.zip.sha256.txt
+          retention-days: 7
