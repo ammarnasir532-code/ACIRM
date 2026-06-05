@@ -1,11 +1,396 @@
-name: ACIRM R13M A
+name: ACIRM R13M B direct weeks
 
 on:
   workflow_dispatch:
 
 jobs:
-  test:
+  r13m-b:
     runs-on: ubuntu-latest
+    timeout-minutes: 180
     steps:
-      - name: Test workflow
-        run: echo "ACIRM R13M A works"
+      - name: Run direct week on off shifted audit
+        shell: bash
+        run: |
+          set +e
+          STAGE="ACIRM_R13M_B_DIRECT_WEEK_ON_OFF_SHIFTED_RAW_COUNT_NO_SCORE"
+          OUT="$GITHUB_WORKSPACE/${STAGE}_OUTPUT"
+          DATA="$GITHUB_WORKSPACE/${STAGE}_DATA"
+          mkdir -p "$OUT" "$DATA"
+          python3 -m pip install --user --no-cache-dir --upgrade numpy astropy > "$OUT/PIP_INSTALL.log" 2>&1
+          python3 - <<'PY' > "$OUT/CONTROLLER_STDOUT.txt" 2> "$OUT/CONTROLLER_STDERR.txt"
+          from pathlib import Path
+          from urllib.request import Request, urlopen
+          import csv, datetime, hashlib, json, math, os, re, shutil, subprocess, traceback
+          import numpy as np
+          from astropy.io import fits
+
+          STAGE = "ACIRM_R13M_B_DIRECT_WEEK_ON_OFF_SHIFTED_RAW_COUNT_NO_SCORE"
+          BASE = Path(os.environ.get("GITHUB_WORKSPACE", "/tmp/acirm_r13m_b"))
+          OUT = BASE / (STAGE + "_OUTPUT")
+          DATA = BASE / (STAGE + "_DATA")
+          OUT.mkdir(parents=True, exist_ok=True)
+          DATA.mkdir(parents=True, exist_ok=True)
+
+          LOCKED = {
+              "stage": STAGE,
+              "purpose": "Direct-week repair after Xamin network stop. Downloads preselected Fermi weekly photon files directly and performs raw on/off-source and shifted-time control count audit. No likelihood, no exposure correction, no score, no evidence/proof/discovery claim.",
+              "locked_gate": "R9C is accepted as the locked ACIRM gate for this branch; this workflow does not re-test R9C.",
+              "r9c_time_utc": "2022-05-18T20:40:57.672000+00:00",
+              "source": "Cyg X-1",
+              "cygx1_ra_deg": 299.590315,
+              "cygx1_dec_deg": 35.201606,
+              "roi_deg": 5.0,
+              "off_source_ring_radius_deg": 12.0,
+              "off_source_control_count": 8,
+              "zenith_max_deg_if_column_exists": 90.0,
+              "fermi_epoch_utc": "2001-01-01T00:00:00+00:00",
+              "fermi_weekly_photon_dir": "https://heasarc.gsfc.nasa.gov/FTP/fermi/data/lat/weekly/photon/",
+              "direct_week_numbers": [724, 725, 726, 727, 728, 729, 730],
+              "selected_real_windows": [
+                  {"id": "P_0_1h", "direction": "post", "lag_label": "0_1h", "start_s": 0, "end_s": 3600},
+                  {"id": "P_1_6h", "direction": "post", "lag_label": "1_6h", "start_s": 3600, "end_s": 21600},
+                  {"id": "P_6_24h", "direction": "post", "lag_label": "6_24h", "start_s": 21600, "end_s": 86400},
+                  {"id": "P_1_7d", "direction": "post", "lag_label": "1_7d", "start_s": 86400, "end_s": 604800},
+                  {"id": "C_0_1h", "direction": "pre", "lag_label": "0_1h", "start_s": -3600, "end_s": 0},
+                  {"id": "C_1_6h", "direction": "pre", "lag_label": "1_6h", "start_s": -21600, "end_s": -3600},
+                  {"id": "C_6_24h", "direction": "pre", "lag_label": "6_24h", "start_s": -86400, "end_s": -21600},
+                  {"id": "C_1_7d", "direction": "pre", "lag_label": "1_7d", "start_s": -604800, "end_s": -86400}
+              ],
+              "selected_shifted_windows": [
+                  {"id": "S_POST_1_7d_plus7d", "direction": "shifted_post_control", "lag_label": "1_7d_plus7d", "start_s": 604800, "end_s": 1123200},
+                  {"id": "S_POST_1_7d_plus14d", "direction": "shifted_post_control", "lag_label": "1_7d_plus14d", "start_s": 1209600, "end_s": 1814400},
+                  {"id": "S_PRE_1_7d_minus7d", "direction": "shifted_pre_control", "lag_label": "1_7d_minus7d", "start_s": -1123200, "end_s": -604800},
+                  {"id": "S_PRE_1_7d_minus14d", "direction": "shifted_pre_control", "lag_label": "1_7d_minus14d", "start_s": -1814400, "end_s": -1209600}
+              ],
+              "energy_bands_mev": [
+                  {"band": "low_control_0p1_1GeV", "emin_mev": 100, "emax_mev": 1000, "role": "low_energy_control"},
+                  {"band": "GeV_1_10", "emin_mev": 1000, "emax_mev": 10000, "role": "high_energy_component"},
+                  {"band": "GeV_10_100", "emin_mev": 10000, "emax_mev": 100000, "role": "high_energy_component"},
+                  {"band": "GeV_100_1000", "emin_mev": 100000, "emax_mev": 1000000, "role": "high_energy_component"},
+                  {"band": "GeV_1_1000_combined", "emin_mev": 1000, "emax_mev": 1000000, "role": "primary_nonduplicated_high_energy_driver"}
+              ],
+              "primary_nonduplicated_band": "GeV_1_1000_combined",
+              "operational_horizon_policy": "+/-10000 days is an operational search/audit boundary only, not a theoretical ceiling or falsification rule.",
+              "claim_ceiling": "raw direct-week on/off/shifted-control photon count audit only; no likelihood, no exposure correction, no score, no detection/evidence/proof/discovery claim"
+          }
+
+          def log(msg):
+              print(str(msg), flush=True)
+              with (OUT / "PROGRESS.log").open("a", encoding="utf-8") as f:
+                  f.write(str(msg) + "\n")
+
+          def write_json(name, obj):
+              (OUT / name).write_text(json.dumps(obj, indent=2, ensure_ascii=False), encoding="utf-8")
+
+          def write_csv(name, rows, cols):
+              with (OUT / name).open("w", newline="", encoding="utf-8") as f:
+                  w = csv.DictWriter(f, fieldnames=cols)
+                  w.writeheader()
+                  for r in rows:
+                      w.writerow({c: r.get(c, "") for c in cols})
+
+          def sha256_file(path):
+              h = hashlib.sha256()
+              with open(path, "rb") as f:
+                  for b in iter(lambda: f.read(1024 * 1024), b""):
+                      h.update(b)
+              return h.hexdigest()
+
+          def final_decision(decision, next_stage, extra=None):
+              obj = {"stage": STAGE, "decision": decision, "next_stage": next_stage, "claim_ceiling": LOCKED["claim_ceiling"], "timestamp_utc": datetime.datetime.now(datetime.UTC).isoformat()}
+              if extra:
+                  obj.update(extra)
+              write_json("FINAL_DECISION.json", obj)
+              log("FINAL_DECISION: " + decision)
+              return obj
+
+          def parse_utc(text):
+              return datetime.datetime.fromisoformat(str(text).replace("Z", "+00:00")).astimezone(datetime.UTC)
+
+          def iso(dt):
+              return dt.astimezone(datetime.UTC).isoformat().replace("+00:00", "Z")
+
+          def fermi_met(dt):
+              epoch = parse_utc(LOCKED["fermi_epoch_utc"])
+              return (dt.astimezone(datetime.UTC) - epoch).total_seconds()
+
+          def met_to_utc(met):
+              epoch = parse_utc(LOCKED["fermi_epoch_utc"])
+              return epoch + datetime.timedelta(seconds=float(met))
+
+          def run_cmd(cmd, timeout=120):
+              try:
+                  p = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=timeout)
+                  return p.returncode, p.stdout
+              except Exception as e:
+                  return 999, repr(e)
+
+          def http_get_text(url, timeout=180):
+              req = Request(url, headers={"User-Agent": "ACIRM-R13M-B/1.0"})
+              with urlopen(req, timeout=timeout) as r:
+                  return r.read().decode("utf-8", errors="replace")
+
+          def probe_url(url, label, timeout=90):
+              rows = []
+              for method, shell in [("curl_head", "curl -L -I --connect-timeout 20 --max-time %d --retry 1 --retry-all-errors " % timeout + repr(url)), ("curl_range", "curl -L --fail --connect-timeout 20 --max-time %d --retry 1 --retry-all-errors -r 0-0 -o /tmp/acirm_probe.bin " % timeout + repr(url))]:
+                  code, out = run_cmd(["bash", "-lc", shell], timeout=timeout + 30)
+                  rows.append({"label": label, "url": url, "method": method, "ok": code == 0, "exit_code": code, "log_tail": out[-1200:]})
+              return rows
+
+          def download_file(url, dest, label, max_time=1800):
+              dest.parent.mkdir(parents=True, exist_ok=True)
+              tmp = dest.with_suffix(dest.suffix + ".part")
+              if tmp.exists():
+                  try: tmp.unlink()
+                  except Exception: pass
+              row = {"label": label, "url": url, "download_ok": False, "path": str(dest), "size_bytes": "", "sha256": "", "method": "", "exit_code": "", "error": ""}
+              logs = []
+              cmd = ["bash", "-lc", "curl -L --fail --connect-timeout 30 --max-time %d --retry 3 --retry-delay 5 --retry-all-errors -o " % max_time + repr(str(tmp)) + " " + repr(url)]
+              code, out = run_cmd(cmd, timeout=max_time + 120)
+              logs.append("CURL_EXIT_%s\n%s" % (code, out[-2500:]))
+              if code == 0 and tmp.exists() and tmp.stat().st_size > 0:
+                  tmp.rename(dest)
+                  row.update({"download_ok": True, "size_bytes": dest.stat().st_size, "sha256": sha256_file(dest), "method": "curl", "exit_code": code})
+                  return row, "\n".join(logs)
+              if tmp.exists():
+                  try: tmp.unlink()
+                  except Exception: pass
+              cmd = ["bash", "-lc", "wget -T 30 -t 3 --waitretry=5 --retry-connrefused --no-check-certificate -O " + repr(str(tmp)) + " " + repr(url)]
+              code, out = run_cmd(cmd, timeout=max_time + 120)
+              logs.append("WGET_EXIT_%s\n%s" % (code, out[-2500:]))
+              if code == 0 and tmp.exists() and tmp.stat().st_size > 0:
+                  tmp.rename(dest)
+                  row.update({"download_ok": True, "size_bytes": dest.stat().st_size, "sha256": sha256_file(dest), "method": "wget", "exit_code": code})
+                  return row, "\n".join(logs)
+              row.update({"method": "curl_wget", "exit_code": "FAILED", "error": "download_failed"})
+              return row, "\n".join(logs)
+
+          def fetch_photon_index():
+              try:
+                  return http_get_text(LOCKED["fermi_weekly_photon_dir"], timeout=180)
+              except Exception as e:
+                  log("WARNING: could not fetch photon index: " + repr(e))
+                  return ""
+
+          def resolve_week_url(week, index_html):
+              week = int(week)
+              default = LOCKED["fermi_weekly_photon_dir"] + f"lat_photon_weekly_w{week:03d}_p305_v001.fits"
+              if index_html:
+                  pat = rf"lat_photon_weekly_w{week:03d}_p\d+_v\d+\.fits"
+                  m = re.search(pat, index_html)
+                  if m:
+                      return LOCKED["fermi_weekly_photon_dir"] + m.group(0), m.group(0), "INDEX_MATCH"
+              return default, Path(default).name, "DEFAULT_P305_V001"
+
+          def build_windows():
+              t0 = parse_utc(LOCKED["r9c_time_utc"])
+              rows = []
+              for group, role in [(LOCKED["selected_real_windows"], "real_gate_window"), (LOCKED["selected_shifted_windows"], "shifted_time_control")]:
+                  for w in group:
+                      start = t0 + datetime.timedelta(seconds=float(w["start_s"]))
+                      end = t0 + datetime.timedelta(seconds=float(w["end_s"]))
+                      if start >= end:
+                          raise RuntimeError("Bad window ordering for " + w["id"])
+                      rows.append({"window_id": w["id"], "direction": w["direction"], "lag_label": w["lag_label"], "window_role": role, "start_utc": iso(start), "end_utc": iso(end), "start_fermi_met": fermi_met(start), "end_fermi_met": fermi_met(end), "duration_s": (end - start).total_seconds(), "non_detection_interpretation": "not_detected_in_selected_window_not_theory_failure"})
+              return rows
+
+          def destination_point(ra_deg, dec_deg, distance_deg, bearing_deg):
+              ra1 = math.radians(float(ra_deg)); dec1 = math.radians(float(dec_deg)); d = math.radians(float(distance_deg)); br = math.radians(float(bearing_deg))
+              dec2 = math.asin(math.sin(dec1) * math.cos(d) + math.cos(dec1) * math.sin(d) * math.cos(br))
+              ra2 = ra1 + math.atan2(math.sin(br) * math.sin(d) * math.cos(dec1), math.cos(d) - math.sin(dec1) * math.sin(dec2))
+              return math.degrees(ra2) % 360.0, math.degrees(dec2)
+
+          def build_regions():
+              rows = [{"region_id": "ON_CYGX1", "region_role": "on_source", "ra_deg": LOCKED["cygx1_ra_deg"], "dec_deg": LOCKED["cygx1_dec_deg"], "roi_deg": LOCKED["roi_deg"], "notes": "locked Cyg X-1 ROI"}]
+              n = int(LOCKED["off_source_control_count"])
+              for i in range(n):
+                  bearing = i * 360.0 / float(n)
+                  ra, dec = destination_point(LOCKED["cygx1_ra_deg"], LOCKED["cygx1_dec_deg"], LOCKED["off_source_ring_radius_deg"], bearing)
+                  rows.append({"region_id": f"OFF_RING12_{i:02d}", "region_role": "off_source_annulus_control", "ra_deg": ra, "dec_deg": dec, "roi_deg": LOCKED["roi_deg"], "notes": f"12 deg ring bearing {bearing:g}"})
+              return rows
+
+          def angsep_deg_vec(ra, dec, ra0, dec0):
+              ra = np.asarray(ra, dtype=float); dec = np.asarray(dec, dtype=float)
+              r1 = np.radians(ra); d1 = np.radians(dec); r2 = math.radians(float(ra0)); d2 = math.radians(float(dec0))
+              s = np.sin((d1 - d2) / 2.0) ** 2 + np.cos(d1) * math.cos(d2) * np.sin((r1 - r2) / 2.0) ** 2
+              return np.degrees(2 * np.arcsin(np.sqrt(np.clip(s, 0, 1))))
+
+          def find_event_hdu(hdul):
+              for hdu in hdul:
+                  cols = []
+                  if hasattr(hdu, "columns") and hdu.columns is not None:
+                      try: cols = [str(c).upper() for c in hdu.columns.names]
+                      except Exception: cols = []
+                  if all(c in cols for c in ["TIME", "ENERGY", "RA", "DEC"]):
+                      return hdu
+              return None
+
+          def count_file(path, week_number, windows, regions):
+              count_rows, top_rows, schema_rows = [], [], []
+              try:
+                  with fits.open(path, memmap=True) as hdul:
+                      hdu = find_event_hdu(hdul)
+                      if hdu is None:
+                          schema_rows.append({"week_number": week_number, "file": path.name, "status": "NO_EVENT_HDU_WITH_TIME_ENERGY_RA_DEC"})
+                          return count_rows, top_rows, schema_rows
+                      cols = [str(c).upper() for c in hdu.columns.names]
+                      data = hdu.data
+                      time_arr = np.asarray(data["TIME"], dtype=float)
+                      energy = np.asarray(data["ENERGY"], dtype=float)
+                      ra = np.asarray(data["RA"], dtype=float)
+                      dec = np.asarray(data["DEC"], dtype=float)
+                      if "ZENITH_ANGLE" in cols:
+                          zenith = np.asarray(data["ZENITH_ANGLE"], dtype=float); zenith_available = True
+                      else:
+                          zenith = np.zeros_like(time_arr) + np.nan; zenith_available = False
+                      zmask = (zenith <= float(LOCKED["zenith_max_deg_if_column_exists"])) if zenith_available else np.ones_like(time_arr, dtype=bool)
+                      finite = np.isfinite(time_arr) & np.isfinite(energy) & np.isfinite(ra) & np.isfinite(dec) & zmask
+                      schema_rows.append({"week_number": week_number, "file": path.name, "status": "OK", "rows_total": int(len(time_arr)), "rows_after_zenith_finite": int(np.sum(finite)), "zenith_column_available": bool(zenith_available), "columns": "|".join(cols[:100])})
+                      t_masks = {w["window_id"]: (time_arr >= float(w["start_fermi_met"])) & (time_arr < float(w["end_fermi_met"])) for w in windows}
+                      e_masks = {b["band"]: (energy >= float(b["emin_mev"])) & (energy < float(b["emax_mev"])) for b in LOCKED["energy_bands_mev"]}
+                      for region in regions:
+                          sep = angsep_deg_vec(ra, dec, region["ra_deg"], region["dec_deg"])
+                          rmask = sep <= float(region["roi_deg"])
+                          base_region = finite & rmask
+                          for w in windows:
+                              base_time = base_region & t_masks[w["window_id"]]
+                              for band in LOCKED["energy_bands_mev"]:
+                                  mask = base_time & e_masks[band["band"]]
+                                  n = int(np.sum(mask))
+                                  max_energy = max_met = max_utc = min_sep = max_sep = max_ra = max_dec = max_zen = ""
+                                  if n > 0:
+                                      idxs = np.where(mask)[0]
+                                      imax = idxs[np.argmax(energy[idxs])]
+                                      max_energy = float(energy[imax]); max_met = float(time_arr[imax]); max_utc = iso(met_to_utc(max_met)); min_sep = float(np.nanmin(sep[idxs])); max_sep = float(sep[imax]); max_ra = float(ra[imax]); max_dec = float(dec[imax]); max_zen = float(zenith[imax]) if zenith_available else ""
+                                      top_rows.append({"week_number": week_number, "file": path.name, "region_id": region["region_id"], "region_role": region["region_role"], "window_id": w["window_id"], "window_role": w["window_role"], "energy_band": band["band"], "event_rank_note": "highest_energy_event_in_this_file_region_window_band", "event_time_met": max_met, "event_time_utc_approx": max_utc, "energy_mev": max_energy, "ra_deg": max_ra, "dec_deg": max_dec, "sep_from_region_center_deg": max_sep, "min_sep_in_bin_deg": min_sep, "zenith_angle_deg": max_zen})
+                                  count_rows.append({"week_number": week_number, "file": path.name, "region_id": region["region_id"], "region_role": region["region_role"], "region_ra_deg": region["ra_deg"], "region_dec_deg": region["dec_deg"], "window_id": w["window_id"], "direction": w["direction"], "lag_label": w["lag_label"], "window_role": w["window_role"], "start_utc": w["start_utc"], "end_utc": w["end_utc"], "roi_deg": region["roi_deg"], "zenith_cut_applied": bool(zenith_available), "energy_band": band["band"], "energy_role": band["role"], "emin_mev": band["emin_mev"], "emax_mev": band["emax_mev"], "raw_photon_count": n, "max_energy_mev_in_bin": max_energy, "max_energy_event_met": max_met, "max_energy_event_utc_approx": max_utc, "min_sep_from_region_center_deg_in_bin": min_sep, "claim": "RAW_DIRECT_WEEK_ON_OFF_SHIFTED_COUNT_AUDIT_ONLY_NO_EXPOSURE_NO_LIKELIHOOD_NO_SCORE"})
+              except Exception as e:
+                  schema_rows.append({"week_number": week_number, "file": path.name, "status": "EXCEPTION:" + repr(e)[:300]})
+              return count_rows, top_rows, schema_rows
+
+          try:
+              write_json("LOCKED_CONTEXT.json", LOCKED)
+              log("Started direct-week workflow; no Xamin discovery.")
+              windows = build_windows(); regions = build_regions()
+              write_csv("WINDOWS.csv", windows, ["window_id","direction","lag_label","window_role","start_utc","end_utc","start_fermi_met","end_fermi_met","duration_s","non_detection_interpretation"])
+              write_csv("REGIONS.csv", regions, ["region_id","region_role","ra_deg","dec_deg","roi_deg","notes"])
+              index_html = fetch_photon_index()
+              resolve_rows = []
+              for wk in LOCKED["direct_week_numbers"]:
+                  url, fname, method = resolve_week_url(wk, index_html)
+                  resolve_rows.append({"week_number": int(wk), "photon_file": fname, "url": url, "resolve_method": method})
+              write_csv("DIRECT_WEEK_URLS.csv", resolve_rows, ["week_number","photon_file","url","resolve_method"])
+              endpoint_rows = []
+              endpoint_rows += probe_url(LOCKED["fermi_weekly_photon_dir"], "weekly_photon_dir")
+              for r in resolve_rows:
+                  endpoint_rows += probe_url(r["url"], "week_%03d" % int(r["week_number"]), timeout=90)
+              write_csv("ENDPOINT_PREFLIGHT.csv", endpoint_rows, ["label","url","method","ok","exit_code","log_tail"])
+              download_rows, all_count_rows, all_top_rows, all_schema_rows = [], [], [], []
+              log_dir = OUT / "download_logs"; log_dir.mkdir(exist_ok=True)
+              for r in resolve_rows:
+                  wk = int(r["week_number"]); dest = DATA / r["photon_file"]
+                  log("Downloading week %03d" % wk)
+                  drow, dlog = download_file(r["url"], dest, label="week_%03d" % wk, max_time=1800)
+                  drow["week_number"] = wk; drow["photon_file"] = r["photon_file"]; download_rows.append(drow)
+                  (log_dir / ("week_%03d_download.log" % wk)).write_text(dlog, encoding="utf-8")
+                  if drow.get("download_ok"):
+                      log("Counting week %03d" % wk)
+                      counts, tops, schemas = count_file(dest, wk, windows, regions)
+                      all_count_rows.extend(counts); all_top_rows.extend(tops); all_schema_rows.extend(schemas)
+              write_csv("DOWNLOADS.csv", download_rows, ["week_number","photon_file","label","url","download_ok","path","size_bytes","sha256","method","exit_code","error"])
+              write_csv("SCHEMA_AUDIT.csv", all_schema_rows, ["week_number","file","status","rows_total","rows_after_zenith_finite","zenith_column_available","columns"])
+              count_cols = ["week_number","file","region_id","region_role","region_ra_deg","region_dec_deg","window_id","direction","lag_label","window_role","start_utc","end_utc","roi_deg","zenith_cut_applied","energy_band","energy_role","emin_mev","emax_mev","raw_photon_count","max_energy_mev_in_bin","max_energy_event_met","max_energy_event_utc_approx","min_sep_from_region_center_deg_in_bin","claim"]
+              write_csv("RAW_COUNTS_BY_FILE_REGION_WINDOW_BAND.csv", all_count_rows, count_cols)
+              top_cols = ["week_number","file","region_id","region_role","window_id","window_role","energy_band","event_rank_note","event_time_met","event_time_utc_approx","energy_mev","ra_deg","dec_deg","sep_from_region_center_deg","min_sep_in_bin_deg","zenith_angle_deg"]
+              write_csv("TOP_RAW_PHOTON_CANDIDATES_NOT_SCORE.csv", all_top_rows, top_cols)
+              agg = {}
+              for row in all_count_rows:
+                  key = (row["region_id"], row["region_role"], row["window_id"], row["window_role"], row["direction"], row["lag_label"], row["energy_band"], row["energy_role"], row["emin_mev"], row["emax_mev"])
+                  if key not in agg:
+                      agg[key] = {"region_id": row["region_id"], "region_role": row["region_role"], "window_id": row["window_id"], "window_role": row["window_role"], "direction": row["direction"], "lag_label": row["lag_label"], "energy_band": row["energy_band"], "energy_role": row["energy_role"], "emin_mev": row["emin_mev"], "emax_mev": row["emax_mev"], "raw_photon_count_total": 0, "week_files_used": set()}
+                  agg[key]["raw_photon_count_total"] += int(row.get("raw_photon_count") or 0); agg[key]["week_files_used"].add(str(row.get("week_number")))
+              agg_rows = []
+              for v in agg.values():
+                  v["week_files_used"] = ",".join(sorted(v["week_files_used"], key=lambda x:int(x))); v["claim"] = "AGGREGATED_RAW_DIRECT_WEEK_COUNT_CONTROL_AUDIT_ONLY_NO_EXPOSURE_NO_LIKELIHOOD_NO_SCORE"; agg_rows.append(v)
+              agg_rows = sorted(agg_rows, key=lambda r: (r["window_id"], r["region_role"], r["region_id"], str(r["energy_band"])))
+              write_csv("AGGREGATED_COUNTS_BY_REGION_WINDOW_BAND.csv", agg_rows, ["region_id","region_role","window_id","window_role","direction","lag_label","energy_band","energy_role","emin_mev","emax_mev","raw_photon_count_total","week_files_used","claim"])
+              primary = LOCKED["primary_nonduplicated_band"]
+              control_rows = []
+              for wid in sorted(set(r["window_id"] for r in agg_rows)):
+                  rows = [r for r in agg_rows if r["window_id"] == wid and r["energy_band"] == primary]
+                  on = [r for r in rows if r["region_role"] == "on_source"]; off = [r for r in rows if r["region_role"] == "off_source_annulus_control"]
+                  if not on: continue
+                  on_count = int(on[0]["raw_photon_count_total"]); off_counts = [int(r["raw_photon_count_total"]) for r in off]
+                  off_mean = float(np.mean(off_counts)) if off_counts else None
+                  control_rows.append({"window_id": wid, "window_role": on[0]["window_role"], "direction": on[0]["direction"], "lag_label": on[0]["lag_label"], "energy_band": primary, "on_source_raw_count": on_count, "off_source_control_count_n": len(off_counts), "off_source_mean_raw_count": off_mean, "off_source_median_raw_count": float(np.median(off_counts)) if off_counts else None, "off_source_min_raw_count": int(np.min(off_counts)) if off_counts else None, "off_source_max_raw_count": int(np.max(off_counts)) if off_counts else None, "on_minus_off_mean": (on_count - off_mean) if off_mean is not None else "", "on_over_off_mean": (on_count / off_mean) if off_mean and off_mean > 0 else "", "interpretation": "raw_on_off_diagnostic_only_not_exposure_corrected_not_score"})
+              write_csv("ON_OFF_CONTROL_SUMMARY_PRIMARY_BAND.csv", control_rows, ["window_id","window_role","direction","lag_label","energy_band","on_source_raw_count","off_source_control_count_n","off_source_mean_raw_count","off_source_median_raw_count","off_source_min_raw_count","off_source_max_raw_count","on_minus_off_mean","on_over_off_mean","interpretation"])
+              on_primary = [r for r in agg_rows if r["region_role"] == "on_source" and r["energy_band"] == primary]
+              by_window = {r["window_id"]: int(r["raw_photon_count_total"]) for r in on_primary}
+              pair_rows = []
+              for label, p, c in [("0_1h","P_0_1h","C_0_1h"),("1_6h","P_1_6h","C_1_6h"),("6_24h","P_6_24h","C_6_24h"),("1_7d","P_1_7d","C_1_7d")]:
+                  pc = by_window.get(p,0); cc = by_window.get(c,0)
+                  pair_rows.append({"lag_label": label, "post_window": p, "pre_window": c, "post_count": pc, "pre_count": cc, "post_minus_pre": pc-cc, "post_over_pre_if_pre_positive": (pc/cc if cc>0 else ""), "interpretation": "raw_post_pre_only_not_exposure_corrected_not_score"})
+              shifted_ids = ["S_POST_1_7d_plus7d","S_POST_1_7d_plus14d","S_PRE_1_7d_minus7d","S_PRE_1_7d_minus14d"]
+              shift_counts = [by_window.get(x,0) for x in shifted_ids]
+              shift_mean = float(np.mean(shift_counts)) if shift_counts else None
+              p17 = by_window.get("P_1_7d",0)
+              pair_rows.append({"lag_label":"1_7d_vs_shifted_controls","post_window":"P_1_7d","pre_window":"shifted_control_mean","post_count":p17,"pre_count":shift_mean if shift_mean is not None else "","post_minus_pre":(p17-shift_mean) if shift_mean is not None else "","post_over_pre_if_pre_positive":(p17/shift_mean if shift_mean and shift_mean>0 else ""),"interpretation":"raw_shifted_time_control_only_not_exposure_corrected_not_score"})
+              write_csv("POST_PRE_SHIFTED_SUMMARY_PRIMARY_BAND.csv", pair_rows, ["lag_label","post_window","pre_window","post_count","pre_count","post_minus_pre","post_over_pre_if_pre_positive","interpretation"])
+              n_downloaded = sum(1 for r in download_rows if r.get("download_ok"))
+              on_high_total_real = sum(int(r["raw_photon_count_total"]) for r in on_primary if r["window_role"] == "real_gate_window")
+              on_high_total_shifted = sum(int(r["raw_photon_count_total"]) for r in on_primary if r["window_role"] == "shifted_time_control")
+              off_mean_available = any(r.get("off_source_mean_raw_count") not in [None, ""] for r in control_rows)
+              highest_on_energy = None
+              on_top = [r for r in all_top_rows if r.get("region_role") == "on_source" and r.get("energy_band") == primary]
+              if on_top:
+                  try: highest_on_energy = max(float(r["energy_mev"]) for r in on_top if str(r.get("energy_mev", "")) != "")
+                  except Exception: highest_on_energy = None
+              summary = {"direct_week_numbers": LOCKED["direct_week_numbers"], "selected_windows_total": len(windows), "regions_total": len(regions), "downloaded_week_files": n_downloaded, "count_rows": len(all_count_rows), "aggregated_count_rows": len(agg_rows), "on_off_control_rows_primary_band": len(control_rows), "raw_on_source_primary_high_energy_count_real_windows_total": on_high_total_real, "raw_on_source_primary_high_energy_count_shifted_windows_total": on_high_total_shifted, "highest_on_source_primary_band_energy_mev": highest_on_energy, "off_source_controls_available": off_mean_available, "primary_nonduplicated_band": primary, "claim_ceiling": LOCKED["claim_ceiling"], "non_detection_interpretation": "Zero or non-excess in this selected raw direct-week control audit is not theory failure and not a full +/-10000 day result."}
+              write_json("CONTROL_AUDIT_SUMMARY.json", summary)
+              if n_downloaded == 0:
+                  decision = "TECHNICAL_STOP_NO_DIRECT_WEEKLY_PHOTON_FILES_DOWNLOADED_NO_SCORE"; next_stage = "CHECK_WEEK_URLS_OR_USE_LAT_DATA_SERVER_EXACT_QUERY"
+              elif len(all_count_rows) == 0:
+                  decision = "TECHNICAL_STOP_DIRECT_WEEK_FILES_DOWNLOADED_BUT_NO_CONTROL_COUNT_TABLE_NO_SCORE"; next_stage = "REPAIR_FITS_SCHEMA_OR_EVENT_HDU_SELECTION"
+              elif on_high_total_real > 0 and off_mean_available:
+                  decision = "RAW_DIRECT_WEEK_ON_OFF_SHIFTED_CONTROL_AUDIT_COMPLETED_HIGH_ENERGY_PHOTONS_PRESENT_NO_SCORE"; next_stage = "ACIRM_R13MPJ_ADJUDICATE_RAW_CONTROL_AUDIT_AND_DECIDE_EXPOSURE_OR_WIDE_LAG_EXPANSION"
+              elif on_high_total_real > 0:
+                  decision = "RAW_DIRECT_WEEK_ON_SOURCE_HIGH_ENERGY_PHOTONS_PRESENT_OFFSOURCE_CONTROL_INCOMPLETE_NO_SCORE"; next_stage = "REPAIR_OFFSOURCE_CONTROL_OR_USE_LAT_DATA_SERVER_EXACT_QUERY"
+              else:
+                  decision = "RAW_DIRECT_WEEK_CONTROL_AUDIT_COMPLETED_NO_ONSOURCE_HIGH_ENERGY_PHOTONS_IN_SELECTED_REAL_WINDOWS_NO_SCORE"; next_stage = "EXPAND_TO_WIDER_LAG_OR_ALTERNATE_MESSENGER_ROUTE_IF_NEEDED"
+              final_decision(decision, next_stage, {"summary": summary})
+              try: shutil.rmtree(DATA)
+              except Exception: pass
+          except Exception as e:
+              (OUT / "EXCEPTION_TRACEBACK.txt").write_text(traceback.format_exc(), encoding="utf-8")
+              final_decision("TECHNICAL_STOP_EXCEPTION_DURING_DIRECT_WEEK_WORKFLOW", "REPAIR_FROM_TRACEBACK", {"error": repr(e)[:500]})
+          PY
+          CODE=$?
+          echo "controller_exit_code=$CODE" > "$OUT/STEP_STATUS.log"
+          if [ ! -f "$OUT/FINAL_DECISION.json" ]; then
+            cat > "$OUT/FINAL_DECISION.json" <<'EOF'
+          {
+            "stage": "ACIRM_R13M_B_DIRECT_WEEK_ON_OFF_SHIFTED_RAW_COUNT_NO_SCORE",
+            "decision": "CONTROLLER_FAILED_BEFORE_FINAL_DECISION",
+            "next_stage": "REPAIR_FROM_STDOUT_STDERR",
+            "claim_ceiling": "no reliable result"
+          }
+          EOF
+          fi
+          cd "$GITHUB_WORKSPACE"
+          ZIP="$GITHUB_WORKSPACE/${STAGE}_RESULTS.zip"
+          SHA="$ZIP.sha256.txt"
+          rm -f "$ZIP" "$SHA"
+          rm -rf "$GITHUB_WORKSPACE/${STAGE}_DATA"
+          zip -r "$ZIP" "$(basename "$OUT")"
+          sha256sum "$ZIP" > "$SHA"
+          exit 0
+
+      - name: Upload artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ACIRM_R13M_B_DIRECT_WEEK_ON_OFF_SHIFTED_RAW_COUNT_NO_SCORE_RESULTS
+          path: |
+            ACIRM_R13M_B_DIRECT_WEEK_ON_OFF_SHIFTED_RAW_COUNT_NO_SCORE_RESULTS.zip
+            ACIRM_R13M_B_DIRECT_WEEK_ON_OFF_SHIFTED_RAW_COUNT_NO_SCORE_RESULTS.zip.sha256.txt
+          retention-days: 7
