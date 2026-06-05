@@ -1,0 +1,524 @@
+name: ACIRM R13MPAC SPI gain coefficient channel to keV 511 readout
+
+on:
+  workflow_dispatch:
+
+jobs:
+  r13mpac-gain-coeff-readout:
+    runs-on: ubuntu-latest
+    timeout-minutes: 240
+
+    steps:
+      - name: R13MPAC find SPI gain calibration and read 511 only if channel-to-keV mapping is safe
+        shell: bash
+        run: |
+          set +e
+          STAGE="ACIRM_R13MPAC_SPI_GAIN_COEFF_CHANNEL_TO_KEV_SAFE_511_READOUT"
+          OUT="$GITHUB_WORKSPACE/${STAGE}_OUTPUT"
+          DATA="$GITHUB_WORKSPACE/${STAGE}_DATA"
+          mkdir -p "$OUT" "$DATA"
+          python3 -m pip install --user --no-cache-dir --upgrade numpy astropy pyyaml > "$OUT/R13MPAC_PIP_INSTALL.log" 2>&1
+
+          cat > "$GITHUB_WORKSPACE/r13mpac_controller.py" <<'PYCODE'
+          from pathlib import Path
+          from urllib.request import Request, urlopen
+          import csv, datetime, hashlib, json, math, os, re, shutil, subprocess, sys, traceback
+          import numpy as np
+          from astropy.io import fits
+
+          STAGE = "ACIRM_R13MPAC_SPI_GAIN_COEFF_CHANNEL_TO_KEV_SAFE_511_READOUT"
+          BASE = Path(os.environ.get("GITHUB_WORKSPACE", "/tmp/acirm_r13mpac"))
+          OUT = BASE / (STAGE + "_OUTPUT")
+          DATA = BASE / (STAGE + "_DATA")
+          OUT.mkdir(parents=True, exist_ok=True)
+          DATA.mkdir(parents=True, exist_ok=True)
+
+          LOCKED = {
+              "stage": STAGE,
+              "purpose": "Solve the R13MPAB block by finding an official/OSA SPI gain-coefficient calibration that maps the 16384 COUNTS channels in spi_spectra.fits.gz to keV. Read 511 only if a safe channel-to-keV mapping is found; otherwise block claims.",
+              "locked_scw_ids": ["250400090010", "250400020010", "250400080010", "250400030010", "250400070021", "250400040010", "250400060010", "250400050010"],
+              "heasarc_scw_base": "https://heasarc.gsfc.nasa.gov/FTP/integral/data/scw/2504",
+              "heasarc_ic_spi_base": "https://heasarc.gsfc.nasa.gov/FTP/integral/data/ic/spi/",
+              "target_public_file": "spi_spectra.fits.gz",
+              "locked_line_keV": [508.0, 514.0],
+              "locked_lower_sideband_keV": [490.0, 500.0],
+              "locked_upper_sideband_keV": [522.0, 532.0],
+              "minimum_candidate_ratio": 1.2,
+              "safe_mapping_rule": "Allowed only if calibration file schema exposes detector-compatible gain/offset or polynomial coefficients giving channel edges in keV over the 511 windows. E_RANGE=[0,1] alone is never treated as keV.",
+              "claim_ceiling": "calibration-derived diagnostic only; no evidence/proof/discovery claim",
+              "artifact_policy": "Do not include downloaded FITS/IC/OSA data in final artifact. Keep CSV, JSON, logs only."
+          }
+
+          LINE = tuple(LOCKED["locked_line_keV"])
+          LOWER = tuple(LOCKED["locked_lower_sideband_keV"])
+          UPPER = tuple(LOCKED["locked_upper_sideband_keV"])
+          MIN_RATIO = float(LOCKED["minimum_candidate_ratio"])
+
+          def log(msg):
+              print(msg, flush=True)
+              with (OUT / "R13MPAC_PROGRESS.log").open("a", encoding="utf-8") as f:
+                  f.write(str(msg) + "\n")
+
+          def write_json(name, obj):
+              (OUT / name).write_text(json.dumps(obj, indent=2, ensure_ascii=False), encoding="utf-8")
+
+          def write_csv(name, rows, cols):
+              with (OUT / name).open("w", newline="", encoding="utf-8") as f:
+                  w = csv.DictWriter(f, fieldnames=cols)
+                  w.writeheader()
+                  for r in rows:
+                      w.writerow({c: r.get(c, "") for c in cols})
+
+          def sha256_file(path):
+              h = hashlib.sha256()
+              with open(path, "rb") as f:
+                  for b in iter(lambda: f.read(1024 * 1024), b""):
+                      h.update(b)
+              return h.hexdigest()
+
+          def final_decision(decision, next_stage, extra=None):
+              obj = {
+                  "stage": STAGE,
+                  "decision": decision,
+                  "next_stage": next_stage,
+                  "claim_ceiling": LOCKED["claim_ceiling"],
+                  "timestamp_utc": datetime.datetime.utcnow().isoformat() + "Z"
+              }
+              if extra:
+                  obj.update(extra)
+              write_json("R13MPAC_FINAL_DECISION.json", obj)
+              log("FINAL_DECISION: " + decision)
+              return obj
+
+          def url_probe(url, timeout=30):
+              last = ""
+              for method in ["HEAD", "GET"]:
+                  try:
+                      headers = {"User-Agent": "ACIRM-R13MPAC/1.0"}
+                      if method == "GET":
+                          headers["Range"] = "bytes=0-0"
+                      req = Request(url, headers=headers, method=method)
+                      with urlopen(req, timeout=timeout) as r:
+                          cl = r.headers.get("Content-Length") or r.headers.get("Content-length")
+                          return {"ok": True, "status": getattr(r, "status", ""), "content_length": int(cl) if str(cl).isdigit() else None, "content_type": r.headers.get("Content-Type", ""), "final_url": r.geturl(), "error": ""}
+                  except Exception as e:
+                      last = repr(e)[:350]
+              return {"ok": False, "status": "", "content_length": None, "content_type": "", "final_url": "", "error": last}
+
+          def download_url(url, dest, timeout=1800):
+              dest.parent.mkdir(parents=True, exist_ok=True)
+              tmp = dest.with_suffix(dest.suffix + ".part")
+              if tmp.exists():
+                  tmp.unlink()
+              req = Request(url, headers={"User-Agent": "ACIRM-R13MPAC/1.0"})
+              with urlopen(req, timeout=timeout) as r, open(tmp, "wb") as f:
+                  shutil.copyfileobj(r, f, length=1024 * 1024)
+              tmp.rename(dest)
+              return dest
+
+          def col_meta(hdu, col):
+              out = {"unit": "", "format": "", "dim": ""}
+              try:
+                  for c in hdu.columns:
+                      if c.name == col:
+                          out = {"unit": str(c.unit or ""), "format": str(c.format or ""), "dim": str(c.dim or "")}
+                          break
+              except Exception:
+                  pass
+              return out
+
+          def to_float_array(data, col):
+              try:
+                  arr = np.asarray(data[col])
+                  if arr.size == 0:
+                      return None
+                  if not np.issubdtype(arr.dtype, np.number):
+                      arr = arr.astype(float)
+                  return np.asarray(arr, dtype=float)
+              except Exception:
+                  return None
+
+          def edge_indices(emin, emax, window):
+              return np.where((emax > window[0]) & (emin < window[1]))[0]
+
+          write_json("R13MPAC_LOCKED_CONTEXT.json", LOCKED)
+
+          log("Downloading public spi_spectra.fits.gz files.")
+          download_rows = []
+          spectra_files = []
+          for scw in LOCKED["locked_scw_ids"]:
+              url = f"{LOCKED['heasarc_scw_base']}/{scw}.001/{LOCKED['target_public_file']}"
+              probe = url_probe(url)
+              row = {"scw_id": scw, "url": url, **probe, "download_ok": False, "path": "", "size_bytes": "", "sha256": ""}
+              if probe["ok"]:
+                  dest = DATA / "spectra" / scw / LOCKED["target_public_file"]
+                  try:
+                      download_url(url, dest)
+                      row.update({"download_ok": True, "path": str(dest), "size_bytes": dest.stat().st_size, "sha256": sha256_file(dest)})
+                      spectra_files.append((scw, dest))
+                  except Exception as e:
+                      row["error"] = "download_exception_" + repr(e)[:300]
+              download_rows.append(row)
+          write_csv("R13MPAC_SPI_SPECTRA_DOWNLOADS.csv", download_rows, ["scw_id", "url", "ok", "status", "content_length", "content_type", "final_url", "error", "download_ok", "path", "size_bytes", "sha256"])
+
+          ic_dir = DATA / "ic_spi"
+          ic_dir.mkdir(parents=True, exist_ok=True)
+          log("Downloading HEASARC ic/spi calibration tree recursively. This may take several minutes.")
+          wget_log = OUT / "R13MPAC_HEASARC_IC_SPI_WGET.log"
+          cmd = ["bash", "-lc", f"timeout 3600 wget -nv -nH --no-check-certificate --cut-dirs=3 -r -l0 -c -N -np -R 'index*' -erobots=off --retr-symlinks -P '{ic_dir}' '{LOCKED['heasarc_ic_spi_base']}'"]
+          p = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+          wget_log.write_text(p.stdout + "\nEXIT_CODE=%s\n" % p.returncode, encoding="utf-8")
+
+          osa_dir = DATA / "osa_docker_cal_candidates"
+          osa_dir.mkdir(parents=True, exist_ok=True)
+          log("Trying optional OSA Docker calibration candidate extraction.")
+          osa_script = OUT / "r13mpac_osa_extract.sh"
+          osa_script.write_text("""#!/usr/bin/env bash
+          set +e
+          echo OSA_EXTRACT_START
+          find /opt /isdc /usr -type f \( -iname '*spi*gain*coeff*.fits*' -o -iname '*gain*coeff*.fits*' -o -iname '*coef*cal*.fits*' -o -iname '*ebound*.fits*' -o -iname '*energy*bound*.fits*' \) 2>/dev/null | head -300 | while read f; do
+            echo CANDIDATE:$f
+            mkdir -p /out/$(dirname "$f")
+            cp -f "$f" /out/$f 2>/dev/null || true
+          done
+          echo OSA_EXTRACT_END
+          """, encoding="utf-8")
+          os.chmod(osa_script, 0o755)
+          docker_status = {"attempted": True, "exit_code": None}
+          try:
+              subprocess.run(["docker", "pull", "integralsw/osa:latest"], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=1800)
+              pp = subprocess.run(["docker", "run", "--rm", "-v", f"{osa_dir}:/out", "-v", f"{OUT}:/ctrl", "--entrypoint", "/bin/bash", "integralsw/osa:latest", "/ctrl/r13mpac_osa_extract.sh"], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=1200)
+              (OUT / "R13MPAC_OSA_DOCKER_CAL_EXTRACT.log").write_text(pp.stdout, encoding="utf-8")
+              docker_status["exit_code"] = pp.returncode
+          except Exception as e:
+              docker_status["error"] = repr(e)[:500]
+          write_json("R13MPAC_OSA_DOCKER_STATUS.json", docker_status)
+
+          spectra_schema_rows = []
+          spectra_count_rows = []
+          spectra_records = []
+          errors = []
+          for scw, path in spectra_files:
+              try:
+                  with fits.open(path, memmap=False) as hdul:
+                      for hdu_i, hdu in enumerate(hdul):
+                          data = getattr(hdu, "data", None)
+                          cols = []
+                          if hasattr(hdu, "columns") and hdu.columns is not None:
+                              try:
+                                  cols = list(hdu.columns.names)
+                              except Exception:
+                                  cols = []
+                          spectra_schema_rows.append({"scw_id": scw, "filename": path.name, "hdu_index": hdu_i, "hdu_name": getattr(hdu, "name", ""), "columns": "|".join(cols), "n_columns": len(cols), "data_shape": str(getattr(data, "shape", ""))})
+                          if data is None or not cols:
+                              continue
+                          upper = {str(c).upper(): c for c in cols}
+                          if "COUNTS" not in upper:
+                              continue
+                          c_col = upper["COUNTS"]
+                          counts = to_float_array(data, c_col)
+                          if counts is None or counts.ndim < 1:
+                              continue
+                          det_ids = to_float_array(data, upper["DET_ID"]) if "DET_ID" in upper else None
+                          erange = to_float_array(data, upper["E_RANGE"]) if "E_RANGE" in upper else None
+                          spectra_count_rows.append({"scw_id": scw, "hdu_index": hdu_i, "hdu_name": getattr(hdu, "name", ""), "counts_shape": str(counts.shape), "counts_unit": col_meta(hdu, c_col)["unit"], "det_id_shape": str(np.asarray(det_ids).shape) if det_ids is not None else "", "erange_shape": str(np.asarray(erange).shape) if erange is not None else "", "erange_unique": json.dumps([float(x) for x in np.unique(erange)[:20]]) if erange is not None else ""})
+                          spectra_records.append({"scw_id": scw, "path": str(path), "hdu_index": hdu_i, "hdu_name": getattr(hdu, "name", ""), "counts": counts, "det_ids": det_ids, "erange": erange})
+              except Exception as e:
+                  errors.append({"stage": "spectra_parse", "file": str(path), "error": repr(e)[:500]})
+          write_csv("R13MPAC_SPECTRA_SCHEMA.csv", spectra_schema_rows, ["scw_id", "filename", "hdu_index", "hdu_name", "columns", "n_columns", "data_shape"])
+          write_csv("R13MPAC_SPECTRA_COUNTS_SCHEMA.csv", spectra_count_rows, ["scw_id", "hdu_index", "hdu_name", "counts_shape", "counts_unit", "det_id_shape", "erange_shape", "erange_unique"])
+
+          cal_roots = [ic_dir, osa_dir]
+          cal_files = []
+          for root in cal_roots:
+              if root.exists():
+                  for pth in root.rglob("*"):
+                      if pth.is_file() and (pth.name.lower().endswith((".fits", ".fits.gz", ".fit", ".fit.gz"))):
+                          name = pth.name.lower()
+                          rel = str(pth).lower()
+                          if any(k in rel for k in ["gain", "coef", "coeff", "cal", "ebound", "energy", "bounds"]):
+                              cal_files.append(pth)
+          cal_files = sorted(set(cal_files), key=lambda p: ("spi_gain_coeff" not in p.name.lower(), str(p)))
+          cal_schema_rows = []
+          plausible_solution_rows = []
+
+          coef_name_groups = [
+              ("OFFSET_GAIN", ["OFFSET", "GAIN"]),
+              ("A0_A1", ["A0", "A1"]),
+              ("P0_P1", ["P0", "P1"]),
+              ("C0_C1", ["C0", "C1"]),
+              ("COEF0_COEF1", ["COEF0", "COEF1"]),
+              ("PAR0_PAR1", ["PAR0", "PAR1"])
+          ]
+          det_name_candidates = ["DET_ID", "DETID", "DETNAM", "DETECTOR", "DET", "ID"]
+
+          def numeric_col(hdu, data, col):
+              arr = to_float_array(data, col)
+              if arr is None:
+                  return None
+              arr = np.asarray(arr, dtype=float)
+              if arr.size == 0 or not np.isfinite(arr).any():
+                  return None
+              return arr
+
+          def choose_coeff_pairs(hdu, data, cols):
+              upper = {str(c).upper(): c for c in cols}
+              pairs = []
+              for label, names in coef_name_groups:
+                  if all(n in upper for n in names):
+                      a0 = numeric_col(hdu, data, upper[names[0]])
+                      a1 = numeric_col(hdu, data, upper[names[1]])
+                      if a0 is not None and a1 is not None:
+                          pairs.append((label, upper[names[0]], upper[names[1]], None, a0, a1, None))
+              numeric = []
+              for c in cols:
+                  cu = str(c).upper()
+                  if any(bad in cu for bad in ["TIME", "DATE", "REV", "OBT", "TSTART", "TSTOP", "DET", "ID", "QUALITY", "FLAG"]):
+                      continue
+                  arr = numeric_col(hdu, data, c)
+                  if arr is None:
+                      continue
+                  vals = arr.ravel()[np.isfinite(arr.ravel())]
+                  if vals.size:
+                      numeric.append((c, arr, float(np.nanmedian(vals)), float(np.nanmin(vals)), float(np.nanmax(vals))))
+              for c0, a0, med0, min0, max0 in numeric:
+                  for c1, a1, med1, min1, max1 in numeric:
+                      if c0 == c1:
+                          continue
+                      if -2000 <= med0 <= 2000 and 0.02 <= abs(med1) <= 2.0:
+                          pairs.append(("GENERIC_OFFSET_GAIN", c0, c1, None, a0, a1, None))
+              return pairs
+
+          def extract_row_values(arr, row_index, nrows):
+              arr = np.asarray(arr, dtype=float)
+              if arr.ndim == 0:
+                  return float(arr)
+              flat = arr.reshape((arr.shape[0], -1)) if arr.shape[0] == nrows else arr.ravel().reshape((-1, 1))
+              if flat.shape[0] == nrows:
+                  vals = flat[row_index]
+                  return vals
+              return np.asarray(arr).ravel()
+
+          def evaluate_calibration(cal_path, hdu_index, hdu_name, relation, c0_name, c1_name, c2_name, det_col_name, det_values, a0, a1, a2):
+              rows = []
+              a0_arr = np.asarray(a0, dtype=float)
+              a1_arr = np.asarray(a1, dtype=float)
+              a2_arr = np.asarray(a2, dtype=float) if a2 is not None else None
+              det_arr = np.asarray(det_values).ravel() if det_values is not None else None
+              ch_edges = np.arange(0, 16385, dtype=float)
+              for rec in spectra_records:
+                  counts = np.asarray(rec["counts"], dtype=float)
+                  row_count = counts.shape[0] if counts.ndim >= 2 else 1
+                  det_ids = np.asarray(rec["det_ids"]).ravel() if rec.get("det_ids") is not None else None
+                  if counts.shape[-1] != 16384:
+                      continue
+                  for ridx in range(row_count):
+                      det_id = int(det_ids[ridx]) if det_ids is not None and ridx < len(det_ids) and np.isfinite(det_ids[ridx]) else None
+                      candidates = []
+                      if det_arr is not None and det_id is not None:
+                          for ci, dv in enumerate(det_arr):
+                              try:
+                                  if int(dv) == det_id:
+                                      candidates.append(ci)
+                              except Exception:
+                                  pass
+                      if not candidates:
+                          if np.asarray(a0_arr).size == 1 or (hasattr(a0_arr, 'shape') and a0_arr.shape[0] == 1):
+                              candidates = [0]
+                          else:
+                              continue
+                      ci = candidates[0]
+                      try:
+                          nbase = max(len(det_arr), 1) if det_arr is not None else max(np.asarray(a0_arr).shape[0] if np.asarray(a0_arr).ndim else 1, 1)
+                          off_vals = extract_row_values(a0_arr, ci, nbase)
+                          gain_vals = extract_row_values(a1_arr, ci, nbase)
+                          off = float(np.ravel(off_vals)[0])
+                          gain = float(np.ravel(gain_vals)[0])
+                          quad = 0.0
+                          if a2_arr is not None:
+                              qv = extract_row_values(a2_arr, ci, nbase)
+                              quad = float(np.ravel(qv)[0])
+                          energies = off + gain * ch_edges + quad * ch_edges * ch_edges
+                          if not np.all(np.isfinite(energies)):
+                              continue
+                          emin = np.minimum(energies[:-1], energies[1:])
+                          emax = np.maximum(energies[:-1], energies[1:])
+                          if np.nanmin(emin) > 100 or np.nanmax(emax) < 1000 or np.nanmax(emax) > 20000:
+                              continue
+                          li = edge_indices(emin, emax, LINE)
+                          lo = edge_indices(emin, emax, LOWER)
+                          up = edge_indices(emin, emax, UPPER)
+                          if len(li) == 0 or len(lo) == 0 or len(up) == 0:
+                              continue
+                          spectrum = counts[ridx] if counts.ndim >= 2 else counts
+                          lv = float(np.nansum(spectrum[li]))
+                          lov = float(np.nansum(spectrum[lo]))
+                          uv = float(np.nansum(spectrum[up]))
+                          side = 0.5 * (lov + uv)
+                          ratio = lv / side if side > 0 else None
+                          rows.append({
+                              "scw_id": rec["scw_id"], "spectra_file": Path(rec["path"]).name, "spectra_hdu": rec["hdu_name"], "row_index": ridx,
+                              "det_id": det_id, "cal_file": str(cal_path), "cal_hdu_index": hdu_index, "cal_hdu_name": hdu_name,
+                              "cal_relation": relation, "offset_col": c0_name, "gain_col": c1_name, "quad_col": c2_name or "",
+                              "offset_value": off, "gain_value": gain, "quad_value": quad,
+                              "energy_min_channel0_edge": float(energies[0]), "energy_max_channel16384_edge": float(energies[-1]),
+                              "line_bin_count": int(len(li)), "lower_bin_count": int(len(lo)), "upper_bin_count": int(len(up)),
+                              "line_508_514_counts": lv, "lower_490_500_counts": lov, "upper_522_532_counts": uv,
+                              "sideband_mean": side, "line_to_sideband_ratio": ratio,
+                              "candidate_ratio_ge_1p2": bool(ratio is not None and ratio >= MIN_RATIO),
+                              "claim": "CALIBRATION_DERIVED_DIAGNOSTIC_ONLY"
+                          })
+                      except Exception:
+                          continue
+              return rows
+
+          safe_rows = []
+          for cal_path in cal_files[:2000]:
+              try:
+                  with fits.open(cal_path, memmap=False) as hdul:
+                      for hdu_i, hdu in enumerate(hdul):
+                          data = getattr(hdu, "data", None)
+                          cols = []
+                          if hasattr(hdu, "columns") and hdu.columns is not None:
+                              try:
+                                  cols = list(hdu.columns.names)
+                              except Exception:
+                                  cols = []
+                          hname = getattr(hdu, "name", "")
+                          cal_schema_rows.append({"file": str(cal_path), "filename": cal_path.name, "hdu_index": hdu_i, "hdu_name": hname, "columns": "|".join(cols), "n_columns": len(cols), "data_shape": str(getattr(data, "shape", ""))})
+                          if data is None or not cols:
+                              continue
+                          upper = {str(c).upper(): c for c in cols}
+                          det_col = None
+                          for dn in det_name_candidates:
+                              if dn in upper:
+                                  det_col = upper[dn]
+                                  break
+                          det_values = to_float_array(data, det_col) if det_col else None
+                          pairs = choose_coeff_pairs(hdu, data, cols)
+                          for relation, c0n, c1n, c2n, a0, a1, a2 in pairs[:30]:
+                              c2col = None
+                              a2arr = None
+                              for qn in ["A2", "P2", "C2", "COEF2", "PAR2"]:
+                                  if qn in upper:
+                                      c2col = upper[qn]
+                                      a2arr = to_float_array(data, c2col)
+                                      break
+                              rr = evaluate_calibration(cal_path, hdu_i, hname, relation, c0n, c1n, c2col, det_col, det_values, a0, a1, a2arr)
+                              if rr:
+                                  plausible_solution_rows.append({"file": str(cal_path), "hdu_index": hdu_i, "hdu_name": hname, "relation": relation, "offset_col": c0n, "gain_col": c1n, "quad_col": c2col or "", "det_col": det_col or "", "readout_rows": len(rr)})
+                                  safe_rows.extend(rr)
+              except Exception as e:
+                  errors.append({"stage": "cal_parse", "file": str(cal_path), "error": repr(e)[:500]})
+
+          def rank_row(r):
+              cf = str(r.get("cal_file", "")).lower()
+              rel = str(r.get("cal_relation", ""))
+              rank = 0
+              if "spi_gain_coeff" in cf:
+                  rank += 1000
+              if "SPI.-COEF" in str(r.get("cal_hdu_name", "")):
+                  rank += 500
+              if rel in ["OFFSET_GAIN", "A0_A1", "P0_P1", "C0_C1"]:
+                  rank += 200
+              if r.get("det_id") not in [None, ""]:
+                  rank += 50
+              return -rank
+
+          safe_rows = sorted(safe_rows, key=rank_row)
+          if safe_rows:
+              best_key = (safe_rows[0]["cal_file"], safe_rows[0]["cal_hdu_index"], safe_rows[0]["offset_col"], safe_rows[0]["gain_col"], safe_rows[0]["quad_col"])
+              safe_rows_best = [r for r in safe_rows if (r["cal_file"], r["cal_hdu_index"], r["offset_col"], r["gain_col"], r["quad_col"]) == best_key]
+          else:
+              safe_rows_best = []
+
+          write_csv("R13MPAC_CALIBRATION_CANDIDATE_SCHEMA.csv", cal_schema_rows[:10000], ["file", "filename", "hdu_index", "hdu_name", "columns", "n_columns", "data_shape"])
+          write_csv("R13MPAC_PLAUSIBLE_CALIBRATION_SOLUTIONS.csv", plausible_solution_rows, ["file", "hdu_index", "hdu_name", "relation", "offset_col", "gain_col", "quad_col", "det_col", "readout_rows"])
+          readout_cols = ["scw_id", "spectra_file", "spectra_hdu", "row_index", "det_id", "cal_file", "cal_hdu_index", "cal_hdu_name", "cal_relation", "offset_col", "gain_col", "quad_col", "offset_value", "gain_value", "quad_value", "energy_min_channel0_edge", "energy_max_channel16384_edge", "line_bin_count", "lower_bin_count", "upper_bin_count", "line_508_514_counts", "lower_490_500_counts", "upper_522_532_counts", "sideband_mean", "line_to_sideband_ratio", "candidate_ratio_ge_1p2", "claim"]
+          write_csv("R13MPAC_CALIBRATION_DERIVED_511_READOUT_ALL_CANDIDATES.csv", safe_rows[:20000] if safe_rows else [{"claim":"NO_SAFE_CALIBRATION_DERIVED_READOUT"}], readout_cols)
+          write_csv("R13MPAC_CALIBRATION_DERIVED_511_READOUT_BEST_SCHEMA.csv", safe_rows_best if safe_rows_best else [{"claim":"NO_SAFE_CALIBRATION_DERIVED_READOUT"}], readout_cols)
+          write_json("R13MPAC_ERRORS.json", {"errors_count": len(errors), "errors": errors[:200]})
+
+          if safe_rows_best:
+              line_sum = sum(float(r["line_508_514_counts"]) for r in safe_rows_best)
+              lower_sum = sum(float(r["lower_490_500_counts"]) for r in safe_rows_best)
+              upper_sum = sum(float(r["upper_522_532_counts"]) for r in safe_rows_best)
+              side = 0.5 * (lower_sum + upper_sum)
+              ratio = line_sum / side if side > 0 else None
+              candidate = bool(ratio is not None and ratio >= MIN_RATIO)
+              best_schema = {k: safe_rows_best[0].get(k) for k in ["cal_file", "cal_hdu_index", "cal_hdu_name", "cal_relation", "offset_col", "gain_col", "quad_col"]}
+          else:
+              line_sum = lower_sum = upper_sum = side = ratio = None
+              candidate = False
+              best_schema = {}
+
+          summary = {
+              "downloaded_spi_spectra_count": len(spectra_files),
+              "calibration_fits_candidates_found": len(cal_files),
+              "calibration_schema_rows": len(cal_schema_rows),
+              "plausible_calibration_solution_count": len(plausible_solution_rows),
+              "safe_readout_all_candidate_rows": len(safe_rows),
+              "safe_readout_best_schema_rows": len(safe_rows_best),
+              "best_schema": best_schema,
+              "line_508_514_sum": line_sum,
+              "lower_490_500_sum": lower_sum,
+              "upper_522_532_sum": upper_sum,
+              "sideband_mean": side,
+              "line_to_sideband_ratio": ratio,
+              "minimum_candidate_ratio": MIN_RATIO,
+              "candidate_ratio_ge_1p2": candidate,
+              "errors_count": len(errors),
+              "claim_ceiling": LOCKED["claim_ceiling"]
+          }
+          write_json("R13MPAC_CALIBRATION_DERIVED_511_SUMMARY.json", summary)
+
+          if candidate:
+              decision = "CALIBRATION_DERIVED_511_RATIO_CANDIDATE_DIAGNOSTIC_ONLY_REQUIRES_OFFICIAL_OSA_AND_BACKGROUND_AUDIT"
+              next_stage = "RUN_OFFICIAL_OSA_SPIBOUNDS_SPIHIST_OR_BACKGROUND_RESPONSE_NULLS_BEFORE_ANY_CLAIM"
+          elif safe_rows_best:
+              decision = "CALIBRATION_DERIVED_511_READOUT_COMPLETED_NO_RATIO_EXCESS"
+              next_stage = "STOP_OR_RUN_OFFICIAL_OSA_REPLICATION_NO_DETECTION_CLAIM"
+          elif plausible_solution_rows:
+              decision = "CALIBRATION_CANDIDATES_FOUND_BUT_NO_SAFE_511_CHANNEL_MAPPING_PASSED_FIREWALL"
+              next_stage = "MANUAL_CALIBRATION_SCHEMA_REVIEW_OR_OFFICIAL_OSA_SPIBOUNDS_SPIHIST_REQUIRED"
+          else:
+              decision = "NO_SPI_GAIN_COEFFICIENT_CHANNEL_TO_KEV_MAPPING_FOUND_AUTOMATICALLY"
+              next_stage = "OFFICIAL_OSA_SPIBOUNDS_SPIHIST_OR_MANUAL_IC_SPI_CALIBRATION_FILE_REQUIRED"
+          final_decision(decision, next_stage, {"summary": summary})
+
+          try:
+              shutil.rmtree(DATA)
+          except Exception:
+              pass
+          PYCODE
+          python3 "$GITHUB_WORKSPACE/r13mpac_controller.py" > "$OUT/R13MPAC_CONTROLLER_STDOUT.txt" 2> "$OUT/R13MPAC_CONTROLLER_STDERR.txt"
+          CODE=$?
+          echo "controller_exit_code=$CODE" > "$OUT/R13MPAC_STEP_STATUS.log"
+          if [ ! -f "$OUT/R13MPAC_FINAL_DECISION.json" ]; then
+            cat > "$OUT/R13MPAC_FINAL_DECISION.json" <<'JSON'
+          {
+            "stage": "ACIRM_R13MPAC_SPI_GAIN_COEFF_CHANNEL_TO_KEV_SAFE_511_READOUT",
+            "decision": "CONTROLLER_FAILED_BEFORE_FINAL_DECISION",
+            "next_stage": "REPAIR_FROM_STDOUT_STDERR",
+            "claim_ceiling": "no reliable result"
+          }
+          JSON
+          fi
+          cd "$GITHUB_WORKSPACE"
+          ZIP="$GITHUB_WORKSPACE/${STAGE}_RESULTS.zip"
+          SHA="$ZIP.sha256.txt"
+          rm -f "$ZIP" "$SHA"
+          rm -rf "$GITHUB_WORKSPACE/${STAGE}_DATA"
+          zip -r "$ZIP" "$(basename "$OUT")"
+          sha256sum "$ZIP" > "$SHA"
+          exit 0
+
+      - name: Upload artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ACIRM_R13MPAC_SPI_GAIN_COEFF_CHANNEL_TO_KEV_SAFE_511_READOUT_RESULTS
+          path: |
+            ACIRM_R13MPAC_SPI_GAIN_COEFF_CHANNEL_TO_KEV_SAFE_511_READOUT_RESULTS.zip
+            ACIRM_R13MPAC_SPI_GAIN_COEFF_CHANNEL_TO_KEV_SAFE_511_READOUT_RESULTS.zip.sha256.txt
+          retention-days: 7
