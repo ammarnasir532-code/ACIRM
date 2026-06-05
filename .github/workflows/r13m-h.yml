@@ -1,0 +1,364 @@
+name: ACIRM R13M H targeted late lag
+
+on:
+  workflow_dispatch:
+
+jobs:
+  r13m-h:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    steps:
+      - name: Run targeted multi week late lag replication
+        shell: bash
+        run: |
+          set +e
+          STAGE="ACIRM_R13M_H_TARGETED_MULTI_WEEK_LATE_LAG_REPLICATION_NO_SCORE"
+          OUT="$GITHUB_WORKSPACE/${STAGE}_OUTPUT"
+          DATA="$GITHUB_WORKSPACE/${STAGE}_DATA"
+          mkdir -p "$OUT" "$DATA"
+          python3 -m pip install --user --no-cache-dir --upgrade numpy astropy > "$OUT/PIP_INSTALL.log" 2>&1
+          python3 - <<'PY' > "$OUT/STDOUT.txt" 2> "$OUT/STDERR.txt"
+          from pathlib import Path
+          from urllib.request import Request, urlopen
+          import csv, datetime, hashlib, json, math, os, re, shutil, subprocess, traceback
+          import numpy as np
+          from astropy.io import fits
+
+          STAGE = "ACIRM_R13M_H_TARGETED_MULTI_WEEK_LATE_LAG_REPLICATION_NO_SCORE"
+          BASE = Path(os.environ.get("GITHUB_WORKSPACE", "/tmp/acirm_r13m_h"))
+          OUT = BASE / (STAGE + "_OUTPUT")
+          DATA = BASE / (STAGE + "_DATA")
+          OUT.mkdir(parents=True, exist_ok=True)
+          DATA.mkdir(parents=True, exist_ok=True)
+
+          CFG = {
+              "r9c_utc": "2022-05-18T20:40:57.672000+00:00",
+              "cygx1_ra_deg": 299.590315,
+              "cygx1_dec_deg": 35.201606,
+              "roi_deg": 5.0,
+              "off_radius_deg": 12.0,
+              "n_off": 8,
+              "zmax": 90.0,
+              "weekly_dir": "https://heasarc.gsfc.nasa.gov/FTP/fermi/data/lat/weekly/photon/",
+              "claim_ceiling": "targeted multi-week late-lag raw photon replication only; no likelihood, no exposure correction, no score, no evidence/proof/discovery claim",
+              "horizon_policy": "+/-10000 days is an operational audit/search horizon only, not a theoretical ceiling or falsification boundary. Non-detection means not detected within this operational sample, not theory failure."
+          }
+
+          TARGETS = [
+              {"lag_bin":"100_300d", "sample_point":"start", "direction":"post", "target_day":107, "week":743},
+              {"lag_bin":"100_300d", "sample_point":"mid",   "direction":"post", "target_day":200, "week":757},
+              {"lag_bin":"100_300d", "sample_point":"end",   "direction":"post", "target_day":293, "week":770},
+              {"lag_bin":"100_300d", "sample_point":"start", "direction":"pre",  "target_day":-107, "week":713},
+              {"lag_bin":"100_300d", "sample_point":"mid",   "direction":"pre",  "target_day":-200, "week":699},
+              {"lag_bin":"100_300d", "sample_point":"end",   "direction":"pre",  "target_day":-293, "week":686},
+              {"lag_bin":"300_1000d", "sample_point":"start", "direction":"post", "target_day":307, "week":772},
+              {"lag_bin":"300_1000d", "sample_point":"mid",   "direction":"post", "target_day":650, "week":821},
+              {"lag_bin":"300_1000d", "sample_point":"end",   "direction":"post", "target_day":993, "week":870},
+              {"lag_bin":"300_1000d", "sample_point":"start", "direction":"pre",  "target_day":-307, "week":684},
+              {"lag_bin":"300_1000d", "sample_point":"mid",   "direction":"pre",  "target_day":-650, "week":635},
+              {"lag_bin":"300_1000d", "sample_point":"end",   "direction":"pre",  "target_day":-993, "week":586}
+          ]
+
+          BANDS = [
+              ("low_0p1_1GeV", 100.0, 1000.0),
+              ("primary_1_1000GeV", 1000.0, 1000000.0),
+              ("high_10_1000GeV", 10000.0, 1000000.0),
+              ("vhigh_100_1000GeV", 100000.0, 1000000.0)
+          ]
+
+          def log(msg):
+              print(str(msg), flush=True)
+              with (OUT / "PROGRESS.log").open("a", encoding="utf-8") as f:
+                  f.write(str(msg) + "\n")
+
+          def write_json(name, obj):
+              (OUT / name).write_text(json.dumps(obj, indent=2, ensure_ascii=False), encoding="utf-8")
+
+          def write_csv(name, rows, cols):
+              with (OUT / name).open("w", newline="", encoding="utf-8") as f:
+                  w = csv.DictWriter(f, fieldnames=cols)
+                  w.writeheader()
+                  for r in rows:
+                      w.writerow({c: r.get(c, "") for c in cols})
+
+          def sha256(path):
+              h = hashlib.sha256()
+              with open(path, "rb") as f:
+                  for b in iter(lambda: f.read(1024 * 1024), b""):
+                      h.update(b)
+              return h.hexdigest()
+
+          def final(decision, next_stage, extra=None):
+              obj = {
+                  "stage": STAGE,
+                  "decision": decision,
+                  "next_stage": next_stage,
+                  "claim_ceiling": CFG["claim_ceiling"],
+                  "horizon_policy": CFG["horizon_policy"],
+                  "timestamp_utc": datetime.datetime.now(datetime.UTC).isoformat()
+              }
+              if extra:
+                  obj.update(extra)
+              write_json("FINAL_DECISION.json", obj)
+              log("FINAL_DECISION: " + decision)
+
+          def run(cmd, timeout=120):
+              try:
+                  p = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=timeout)
+                  return p.returncode, p.stdout
+              except Exception as e:
+                  return 999, repr(e)
+
+          def http_text(url, timeout=180):
+              req = Request(url, headers={"User-Agent": "ACIRM-R13M-H/1.0"})
+              with urlopen(req, timeout=timeout) as r:
+                  return r.read().decode("utf-8", errors="replace")
+
+          def parse_index():
+              try:
+                  html = http_text(CFG["weekly_dir"], timeout=180)
+              except Exception as e:
+                  log("WARNING index fetch failed: " + repr(e))
+                  return {}
+              out = {}
+              for m in re.finditer(r"lat_photon_weekly_w(\d{3,4})_p\d+_v\d+\.fits", html):
+                  out[int(m.group(1))] = m.group(0)
+              return out
+
+          def resolve_url(wk, index):
+              fname = index.get(int(wk), f"lat_photon_weekly_w{int(wk):03d}_p305_v001.fits")
+              return CFG["weekly_dir"] + fname, fname, "index" if int(wk) in index else "default"
+
+          def download(row):
+              dest = DATA / row["file"]
+              tmp = dest.with_suffix(dest.suffix + ".part")
+              if tmp.exists():
+                  try:
+                      tmp.unlink()
+                  except Exception:
+                      pass
+              cmd = [
+                  "bash", "-lc",
+                  "curl -L --fail --connect-timeout 30 --max-time 1800 --retry 3 --retry-delay 5 --retry-all-errors -o "
+                  + repr(str(tmp)) + " " + repr(row["url"])
+              ]
+              code, out = run(cmd, timeout=1950)
+              (OUT / ("download_w%03d.log" % int(row["week"]))).write_text(out[-4000:], encoding="utf-8")
+              ok = code == 0 and tmp.exists() and tmp.stat().st_size > 0
+              if ok:
+                  tmp.rename(dest)
+              return {
+                  "week": row["week"],
+                  "file": row["file"],
+                  "url": row["url"],
+                  "download_ok": ok,
+                  "size_bytes": dest.stat().st_size if ok else "",
+                  "sha256": sha256(dest) if ok else "",
+                  "exit_code": code,
+                  "path": str(dest) if ok else ""
+              }
+
+          def offset(ra, dec, dist, bearing):
+              ra1, de1, d, br = map(math.radians, [ra, dec, dist, bearing])
+              de2 = math.asin(math.sin(de1) * math.cos(d) + math.cos(de1) * math.sin(d) * math.cos(br))
+              ra2 = ra1 + math.atan2(math.sin(br) * math.sin(d) * math.cos(de1), math.cos(d) - math.sin(de1) * math.sin(de2))
+              return math.degrees(ra2) % 360.0, math.degrees(de2)
+
+          def build_regions():
+              rows = [{"region_id":"ON", "region_role":"on_source", "ra":CFG["cygx1_ra_deg"], "dec":CFG["cygx1_dec_deg"], "roi":CFG["roi_deg"]}]
+              for i in range(int(CFG["n_off"])):
+                  ra, dec = offset(CFG["cygx1_ra_deg"], CFG["cygx1_dec_deg"], CFG["off_radius_deg"], i * 360.0 / CFG["n_off"])
+                  rows.append({"region_id":f"OFF_{i:02d}", "region_role":"off_source", "ra":ra, "dec":dec, "roi":CFG["roi_deg"]})
+              return rows
+
+          def sep(ra, dec, ra0, dec0):
+              r1, d1 = np.radians(np.asarray(ra, float)), np.radians(np.asarray(dec, float))
+              r2, d2 = math.radians(float(ra0)), math.radians(float(dec0))
+              x = np.sin((d1 - d2) / 2.0) ** 2 + np.cos(d1) * math.cos(d2) * np.sin((r1 - r2) / 2.0) ** 2
+              return np.degrees(2 * np.arcsin(np.sqrt(np.clip(x, 0, 1))))
+
+          def find_hdu(hdul):
+              for h in hdul:
+                  if hasattr(h, "columns") and h.columns is not None:
+                      try:
+                          cols = [c.upper() for c in h.columns.names]
+                      except Exception:
+                          cols = []
+                      if all(x in cols for x in ["TIME", "ENERGY", "RA", "DEC"]):
+                          return h
+              return None
+
+          def met_to_utc(met):
+              epoch = datetime.datetime.fromisoformat("2001-01-01T00:00:00+00:00").astimezone(datetime.UTC)
+              return epoch + datetime.timedelta(seconds=float(met))
+
+          def iso(t):
+              return t.astimezone(datetime.UTC).isoformat().replace("+00:00", "Z")
+
+          def count_file(path, target, regs):
+              rows, tops, schema = [], [], []
+              week = int(target["week"])
+              try:
+                  with fits.open(path, memmap=True) as hdul:
+                      h = find_hdu(hdul)
+                      if h is None:
+                          schema.append({"week": week, "status":"NO_EVENT_HDU"})
+                          return rows, tops, schema
+                      d = h.data
+                      cols = [c.upper() for c in h.columns.names]
+                      t = np.asarray(d["TIME"], float)
+                      en = np.asarray(d["ENERGY"], float)
+                      ra = np.asarray(d["RA"], float)
+                      de = np.asarray(d["DEC"], float)
+                      if "ZENITH_ANGLE" in cols:
+                          zen = np.asarray(d["ZENITH_ANGLE"], float)
+                          zmask = zen <= CFG["zmax"]
+                      else:
+                          zen = np.zeros_like(t) + np.nan
+                          zmask = np.ones_like(t, dtype=bool)
+                      good = np.isfinite(t) & np.isfinite(en) & np.isfinite(ra) & np.isfinite(de) & zmask
+                      schema.append({"week": week, "status":"OK", "rows_total": int(len(t)), "rows_good": int(good.sum())})
+                      for reg in regs:
+                          sd = sep(ra, de, reg["ra"], reg["dec"])
+                          rmask = good & (sd <= reg["roi"])
+                          for band, emin, emax in BANDS:
+                              m = rmask & (en >= emin) & (en < emax)
+                              n = int(m.sum())
+                              mx = ""; tu = ""; ms = ""
+                              if n:
+                                  idx = np.where(m)[0]
+                                  im = idx[np.argmax(en[idx])]
+                                  mx = float(en[im])
+                                  tu = iso(met_to_utc(float(t[im])))
+                                  ms = float(sd[idx].min())
+                                  tops.append({
+                                      "week": week, "lag_bin": target["lag_bin"], "sample_point": target["sample_point"], "direction": target["direction"],
+                                      "region_id": reg["region_id"], "band": band, "energy_mev": mx, "time_utc": tu, "sep_deg": float(sd[im])
+                                  })
+                              rows.append({
+                                  "week": week, "lag_bin": target["lag_bin"], "sample_point": target["sample_point"], "direction": target["direction"],
+                                  "target_day": target["target_day"], "region_id": reg["region_id"], "region_role": reg["region_role"],
+                                  "band": band, "raw_count": n, "max_energy_mev": mx, "max_time_utc": tu, "min_sep_deg": ms,
+                                  "claim": "RAW_TARGETED_MULTI_WEEK_COUNT_ONLY_NO_EXPOSURE_NO_LIKELIHOOD_NO_SCORE"
+                              })
+              except Exception as e:
+                  schema.append({"week": week, "status":"EXCEPTION:" + repr(e)[:300]})
+              return rows, tops, schema
+
+          def aggregate(rows):
+              d = {}
+              for r in rows:
+                  k = (r["lag_bin"], r["sample_point"], r["direction"], r["region_id"], r["region_role"], r["band"])
+                  if k not in d:
+                      d[k] = {"lag_bin":r["lag_bin"], "sample_point":r["sample_point"], "direction":r["direction"], "region_id":r["region_id"], "region_role":r["region_role"], "band":r["band"], "raw_count_total":0, "weeks":set()}
+                  d[k]["raw_count_total"] += int(r["raw_count"])
+                  d[k]["weeks"].add(str(r["week"]))
+              out = []
+              for v in d.values():
+                  v["weeks"] = ",".join(sorted(v["weeks"], key=lambda x:int(x)))
+                  out.append(v)
+              return out
+
+          def make_summaries(agg):
+              primary = "primary_1_1000GeV"
+              rows = [x for x in agg if x["band"] == primary]
+              by = {(x["lag_bin"], x["sample_point"], x["direction"], x["region_id"]): int(x["raw_count_total"]) for x in rows}
+              sample_rows = []
+              for lag in sorted(set(x["lag_bin"] for x in rows)):
+                  for sp in ["start", "mid", "end"]:
+                      p = by.get((lag, sp, "post", "ON"), 0)
+                      c = by.get((lag, sp, "pre", "ON"), 0)
+                      sample_rows.append({"lag_bin":lag, "sample_point":sp, "post_on_count":p, "pre_on_count":c, "post_minus_pre":p-c, "post_over_pre":p/c if c>0 else ""})
+              bin_rows = []
+              for lag in sorted(set(x["lag_bin"] for x in rows)):
+                  p = sum(by.get((lag, sp, "post", "ON"), 0) for sp in ["start", "mid", "end"])
+                  c = sum(by.get((lag, sp, "pre", "ON"), 0) for sp in ["start", "mid", "end"])
+                  bin_rows.append({"lag_bin":lag, "post_on_count_sum":p, "pre_on_count_sum":c, "post_minus_pre_sum":p-c, "post_over_pre_sum":p/c if c>0 else ""})
+              onoff_rows = []
+              for lag in sorted(set(x["lag_bin"] for x in rows)):
+                  for sp in ["start", "mid", "end"]:
+                      for direction in ["post", "pre"]:
+                          on = by.get((lag, sp, direction, "ON"), 0)
+                          offs = [by.get((lag, sp, direction, f"OFF_{i:02d}"), 0) for i in range(int(CFG["n_off"]))]
+                          mean = float(np.mean(offs)) if offs else 0.0
+                          onoff_rows.append({"lag_bin":lag, "sample_point":sp, "direction":direction, "on_count":on, "off_mean":mean, "on_minus_off_mean":on-mean, "on_over_off_mean":on/mean if mean>0 else ""})
+              return sample_rows, bin_rows, onoff_rows
+
+          try:
+              write_json("LOCKED_CONTEXT.json", {"stage":STAGE, **CFG, "targets":TARGETS})
+              log("R13M_H started: targeted multi-week late-lag replication; no score.")
+              index = parse_index()
+              regs = build_regions()
+              urls = []
+              for t in TARGETS:
+                  url, fname, method = resolve_url(t["week"], index)
+                  urls.append({**t, "file":fname, "url":url, "resolve":method})
+              write_csv("TARGET_WEEK_PLAN.csv", TARGETS, ["lag_bin","sample_point","direction","target_day","week"])
+              write_csv("DIRECT_WEEK_URLS.csv", urls, ["lag_bin","sample_point","direction","target_day","week","file","url","resolve"])
+              write_csv("REGIONS.csv", regs, ["region_id","region_role","ra","dec","roi"])
+              downloads = []; counts = []; tops = []; schemas = []
+              for u in urls:
+                  log("Downloading week %03d %s %s %s" % (u["week"], u["lag_bin"], u["sample_point"], u["direction"]))
+                  dr = download(u)
+                  downloads.append(dr)
+                  if dr["download_ok"]:
+                      log("Counting week %03d" % u["week"])
+                      c, top, sc = count_file(Path(dr["path"]), u, regs)
+                      counts += c; tops += top; schemas += sc
+              agg = aggregate(counts)
+              sample, binsum, onoff = make_summaries(agg)
+              write_csv("DOWNLOADS.csv", downloads, ["week","file","url","download_ok","size_bytes","sha256","exit_code","path"])
+              write_csv("SCHEMA.csv", schemas, ["week","status","rows_total","rows_good"])
+              write_csv("RAW_COUNTS.csv", counts, ["week","lag_bin","sample_point","direction","target_day","region_id","region_role","band","raw_count","max_energy_mev","max_time_utc","min_sep_deg","claim"])
+              write_csv("TOP_EVENTS_NOT_SCORE.csv", tops, ["week","lag_bin","sample_point","direction","region_id","band","energy_mev","time_utc","sep_deg"])
+              write_csv("AGG_COUNTS.csv", agg, ["lag_bin","sample_point","direction","region_id","region_role","band","raw_count_total","weeks"])
+              write_csv("POST_PRE_BY_SAMPLE_PRIMARY.csv", sample, ["lag_bin","sample_point","post_on_count","pre_on_count","post_minus_pre","post_over_pre"])
+              write_csv("POST_PRE_BY_BIN_PRIMARY.csv", binsum, ["lag_bin","post_on_count_sum","pre_on_count_sum","post_minus_pre_sum","post_over_pre_sum"])
+              write_csv("ON_OFF_BY_SAMPLE_PRIMARY.csv", onoff, ["lag_bin","sample_point","direction","on_count","off_mean","on_minus_off_mean","on_over_off_mean"])
+              high = max([float(x["energy_mev"]) for x in tops if x["region_id"]=="ON" and x["band"]=="primary_1_1000GeV"] or [0.0])
+              summary = {
+                  "target_weeks": [t["week"] for t in TARGETS],
+                  "downloaded_week_files": sum(1 for x in downloads if x["download_ok"]),
+                  "raw_rows": len(counts),
+                  "aggregated_rows": len(agg),
+                  "post_pre_bin_summary": binsum,
+                  "highest_on_source_primary_energy_mev": high,
+                  "claim_ceiling": CFG["claim_ceiling"],
+                  "horizon_policy": CFG["horizon_policy"]
+              }
+              write_json("SUMMARY.json", summary)
+              if summary["downloaded_week_files"] == 0:
+                  final("TECHNICAL_STOP_NO_TARGETED_WEEK_FILES_DOWNLOADED_NO_SCORE", "RETRY_OR_USE_SMALLER_WEEK_SET", {"summary":summary})
+              else:
+                  final("TARGETED_MULTI_WEEK_LATE_LAG_REPLICATION_COMPLETED_NO_SCORE", "ACIRM_R13M_I_ADJUDICATE_TARGETED_REPLICATION_OR_FULL_BIN_SCAN", {"summary":summary})
+              try:
+                  shutil.rmtree(DATA)
+              except Exception:
+                  pass
+          except Exception as e:
+              (OUT / "EXCEPTION_TRACEBACK.txt").write_text(traceback.format_exc(), encoding="utf-8")
+              final("TECHNICAL_STOP_EXCEPTION_DURING_R13M_H", "REPAIR_FROM_TRACEBACK", {"error":repr(e)[:500]})
+          PY
+          CODE=$?
+          echo "controller_exit_code=$CODE" > "$OUT/STEP_STATUS.log"
+          if [ ! -f "$OUT/FINAL_DECISION.json" ]; then
+            echo '{"decision":"CONTROLLER_FAILED_BEFORE_FINAL_DECISION"}' > "$OUT/FINAL_DECISION.json"
+          fi
+          cd "$GITHUB_WORKSPACE"
+          ZIP="$GITHUB_WORKSPACE/${STAGE}_RESULTS.zip"
+          SHA="$ZIP.sha256.txt"
+          rm -f "$ZIP" "$SHA"
+          rm -rf "$GITHUB_WORKSPACE/${STAGE}_DATA"
+          zip -r "$ZIP" "$(basename "$OUT")"
+          sha256sum "$ZIP" > "$SHA"
+          exit 0
+
+      - name: Upload artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ACIRM_R13M_H_TARGETED_MULTI_WEEK_LATE_LAG_REPLICATION_NO_SCORE_RESULTS
+          path: |
+            ACIRM_R13M_H_TARGETED_MULTI_WEEK_LATE_LAG_REPLICATION_NO_SCORE_RESULTS.zip
+            ACIRM_R13M_H_TARGETED_MULTI_WEEK_LATE_LAG_REPLICATION_NO_SCORE_RESULTS.zip.sha256.txt
+          retention-days: 7
