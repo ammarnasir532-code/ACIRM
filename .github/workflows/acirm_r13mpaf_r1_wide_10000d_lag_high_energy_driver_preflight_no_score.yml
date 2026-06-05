@@ -1,0 +1,349 @@
+name: ACIRM R13MPAF R1 wide 10000d lag high energy driver preflight no score
+
+on:
+  workflow_dispatch:
+
+jobs:
+  r13mpaf-r1-wide-10000d-preflight:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    steps:
+      - name: R13MPAF R1 wide 10000d operational lag preflight no score
+        shell: bash
+        run: |
+          set +e
+          STAGE="ACIRM_R13MPAF_R1_WIDE_10000D_LAG_HIGH_ENERGY_DRIVER_PREFLIGHT_NO_SCORE"
+          OUT="$GITHUB_WORKSPACE/${STAGE}_OUTPUT"
+          mkdir -p "$OUT"
+          cat > "$GITHUB_WORKSPACE/r13mpaf_r1_controller.py" <<'PYCODE'
+          from pathlib import Path
+          import csv, datetime, hashlib, json, math, os, subprocess, traceback
+
+          STAGE = "ACIRM_R13MPAF_R1_WIDE_10000D_LAG_HIGH_ENERGY_DRIVER_PREFLIGHT_NO_SCORE"
+          BASE = Path(os.environ.get("GITHUB_WORKSPACE", "/tmp/acirm_r13mpaf_r1"))
+          OUT = BASE / (STAGE + "_OUTPUT")
+          OUT.mkdir(parents=True, exist_ok=True)
+
+          LOCKED = {
+              "stage": STAGE,
+              "previous_stage": "ACIRM_R13MPAF_FERMI_LAT_DELAYED_GEV_TEV_DRIVER_METADATA_PREFLIGHT_NO_SCORE",
+              "purpose": "Repair the narrow 30-day preflight into a wide operational lag horizon. R9C is already the locked gate for this branch. This stage only builds and audits +/-10000 day windows and query templates; it does not download photons, run likelihood, score, or claim evidence.",
+              "locked_gate": "R9C is accepted as the locked ACIRM gate/phase-inversion diagnostic event for this branch; this stage does not re-test whether R9C exists.",
+              "r9c_time_utc": "2022-05-18T20:40:57.672000+00:00",
+              "operational_horizon_days": 10000,
+              "operational_horizon_policy": "The +/-10000 day horizon is an operational search/audit bound only. It is not a theoretical lifetime limit and not a falsification boundary. Non-detection inside it means not detected within the operational search horizon / observationally unresolved.",
+              "source": "Cyg X-1",
+              "cygx1_ra_deg": 299.590315,
+              "cygx1_dec_deg": 35.201606,
+              "roi_options_deg": [5.0, 10.0],
+              "fermi_data_start_utc_operational": "2008-08-04T15:43:36+00:00",
+              "data_end_policy": "Use workflow run time minus 30 days as a conservative public-data availability guard for preflight templates. This is not a science cut.",
+              "fermi_epoch_utc": "2001-01-01T00:00:00+00:00",
+              "lat_data_server_url": "https://fermi.gsfc.nasa.gov/cgi-bin/ssc/LAT/LATDataQuery.cgi",
+              "fermi_catalog_url": "https://fermi.gsfc.nasa.gov/ssc/data/access/lat/14yr_catalog/gll_psc_v35.fit",
+              "lag_bins_seconds_abs": [
+                  [0, 3600, "0_1h"],
+                  [3600, 21600, "1_6h"],
+                  [21600, 86400, "6_24h"],
+                  [86400, 604800, "1_7d"],
+                  [604800, 2592000, "7_30d"],
+                  [2592000, 8640000, "30_100d"],
+                  [8640000, 25920000, "100_300d"],
+                  [25920000, 86400000, "300_1000d"],
+                  [86400000, 259200000, "1000_3000d"],
+                  [259200000, 864000000, "3000_10000d"]
+              ],
+              "energy_bands_mev": [
+                  {"band": "low_control_0p1_1GeV", "emin_mev": 100, "emax_mev": 1000, "role": "low_energy_control"},
+                  {"band": "GeV_1_10", "emin_mev": 1000, "emax_mev": 10000, "role": "high_energy_driver"},
+                  {"band": "GeV_10_100", "emin_mev": 10000, "emax_mev": 100000, "role": "high_energy_driver"},
+                  {"band": "GeV_100_1000", "emin_mev": 100000, "emax_mev": 1000000, "role": "high_energy_driver"},
+                  {"band": "GeV_1_1000_combined", "emin_mev": 1000, "emax_mev": 1000000, "role": "high_energy_driver_combined"}
+              ],
+              "claim_ceiling": "wide-lag operational preflight only; no photon extraction, no score, no detection/evidence/proof/discovery claim"
+          }
+
+          def log(msg):
+              print(str(msg), flush=True)
+              with (OUT / "R13MPAF_R1_PROGRESS.log").open("a", encoding="utf-8") as f:
+                  f.write(str(msg) + "\n")
+
+          def write_json(name, obj):
+              (OUT / name).write_text(json.dumps(obj, indent=2, ensure_ascii=False), encoding="utf-8")
+
+          def write_csv(name, rows, cols):
+              with (OUT / name).open("w", newline="", encoding="utf-8") as f:
+                  w = csv.DictWriter(f, fieldnames=cols)
+                  w.writeheader()
+                  for r in rows:
+                      w.writerow({c: r.get(c, "") for c in cols})
+
+          def sha256_file(path):
+              h = hashlib.sha256()
+              with open(path, "rb") as f:
+                  for b in iter(lambda: f.read(1024 * 1024), b""):
+                      h.update(b)
+              return h.hexdigest()
+
+          def final_decision(decision, next_stage, extra=None):
+              obj = {
+                  "stage": STAGE,
+                  "decision": decision,
+                  "next_stage": next_stage,
+                  "claim_ceiling": LOCKED["claim_ceiling"],
+                  "timestamp_utc": datetime.datetime.now(datetime.UTC).isoformat()
+              }
+              if extra:
+                  obj.update(extra)
+              write_json("R13MPAF_R1_FINAL_DECISION.json", obj)
+              log("FINAL_DECISION: " + decision)
+              return obj
+
+          def parse_utc(text):
+              return datetime.datetime.fromisoformat(text.replace("Z", "+00:00")).astimezone(datetime.UTC)
+
+          def iso(dt):
+              return dt.astimezone(datetime.UTC).isoformat().replace("+00:00", "Z")
+
+          def fermi_met(dt):
+              epoch = parse_utc(LOCKED["fermi_epoch_utc"])
+              return (dt.astimezone(datetime.UTC) - epoch).total_seconds()
+
+          def run_cmd(cmd, timeout=60):
+              try:
+                  p = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=timeout)
+                  return p.returncode, p.stdout
+              except Exception as e:
+                  return 999, repr(e)
+
+          def probe_url(url, label):
+              rows = []
+              commands = [
+                  ("curl_head", "curl -L -I --connect-timeout 15 --max-time 45 --retry 1 --retry-all-errors " + repr(url)),
+                  ("curl_range", "curl -L --fail --connect-timeout 15 --max-time 45 --retry 1 --retry-all-errors -r 0-0 -o /tmp/acirm_r13mpaf_r1_probe.bin " + repr(url))
+              ]
+              for method, shell in commands:
+                  code, out = run_cmd(["bash", "-lc", shell], timeout=70)
+                  rows.append({"label": label, "url": url, "method": method, "ok": code == 0, "exit_code": code, "log_tail": out[-1200:]})
+              return rows
+
+          def lag_class(label):
+              if label in ["0_1h", "1_6h", "6_24h", "1_7d", "7_30d"]:
+                  return "short_lag"
+              if label in ["30_100d", "100_300d"]:
+                  return "medium_lag"
+              if label in ["300_1000d"]:
+                  return "long_lag"
+              if label in ["1000_3000d", "3000_10000d"]:
+                  return "ultra_long_lag"
+              return "unknown_lag"
+
+          def make_windows():
+              t0 = parse_utc(LOCKED["r9c_time_utc"])
+              data_start = parse_utc(LOCKED["fermi_data_start_utc_operational"])
+              run_now = datetime.datetime.now(datetime.UTC)
+              data_end_guard = run_now - datetime.timedelta(days=30)
+              horizon = datetime.timedelta(days=float(LOCKED["operational_horizon_days"]))
+              theoretical_start = t0 - horizon
+              theoretical_end = t0 + horizon
+              rows = []
+              for direction in ["post", "pre"]:
+                  for start_abs, end_abs, label in LOCKED["lag_bins_seconds_abs"]:
+                      if direction == "post":
+                          planned_start = t0 + datetime.timedelta(seconds=float(start_abs))
+                          planned_end = t0 + datetime.timedelta(seconds=float(end_abs))
+                          role = "post_driver_search"
+                          signed_start_days = start_abs / 86400.0
+                          signed_end_days = end_abs / 86400.0
+                      else:
+                          planned_start = t0 - datetime.timedelta(seconds=float(end_abs))
+                          planned_end = t0 - datetime.timedelta(seconds=float(start_abs))
+                          role = "pre_control_search"
+                          signed_start_days = -end_abs / 86400.0
+                          signed_end_days = -start_abs / 86400.0
+                      clipped_start = max(planned_start, data_start)
+                      clipped_end = min(planned_end, data_end_guard)
+                      if clipped_start >= clipped_end:
+                          status = "OUTSIDE_AVAILABLE_DATA_RANGE"
+                          duration = 0.0
+                          start_iso = ""
+                          end_iso = ""
+                          start_met = ""
+                          end_met = ""
+                      else:
+                          clipped_by_start = clipped_start > planned_start
+                          clipped_by_end = clipped_end < planned_end
+                          if clipped_by_start and clipped_by_end:
+                              status = "PARTIAL_CLIPPED_BOTH_START_AND_END"
+                          elif clipped_by_start:
+                              status = "PARTIAL_CLIPPED_BY_DATA_START"
+                          elif clipped_by_end:
+                              status = "PARTIAL_CLIPPED_BY_DATA_END_GUARD"
+                          else:
+                              status = "FULLY_AVAILABLE_WITHIN_OPERATIONAL_GUARD"
+                          duration = (clipped_end - clipped_start).total_seconds()
+                          start_iso = iso(clipped_start)
+                          end_iso = iso(clipped_end)
+                          start_met = fermi_met(clipped_start)
+                          end_met = fermi_met(clipped_end)
+                      rows.append({
+                          "window_id": ("P" if direction == "post" else "C") + "_" + label,
+                          "direction": direction,
+                          "role": role,
+                          "lag_label": label,
+                          "lag_class": lag_class(label),
+                          "signed_start_days_from_R9C": signed_start_days,
+                          "signed_end_days_from_R9C": signed_end_days,
+                          "planned_start_utc": iso(planned_start),
+                          "planned_end_utc": iso(planned_end),
+                          "clipped_start_utc": start_iso,
+                          "clipped_end_utc": end_iso,
+                          "clipped_start_fermi_met": start_met,
+                          "clipped_end_fermi_met": end_met,
+                          "available_duration_s": duration,
+                          "availability_status": status,
+                          "operational_not_theoretical_ceiling": True,
+                          "non_detection_interpretation": "not_detected_within_operational_search_horizon_not_theory_failure"
+                      })
+              context = {
+                  "r9c_time_utc": iso(t0),
+                  "run_now_utc": iso(run_now),
+                  "data_start_guard_utc": iso(data_start),
+                  "data_end_guard_utc": iso(data_end_guard),
+                  "theoretical_operational_search_start_utc": iso(theoretical_start),
+                  "theoretical_operational_search_end_utc": iso(theoretical_end),
+                  "r9c_fermi_met_approx": fermi_met(t0),
+                  "operational_horizon_days": LOCKED["operational_horizon_days"],
+                  "policy": LOCKED["operational_horizon_policy"]
+              }
+              return rows, context
+
+          write_json("R13MPAF_R1_LOCKED_CONTEXT.json", LOCKED)
+          log("R13MPAF_R1 started. Building +/-10000 day operational horizon windows. No photon data, no score.")
+
+          try:
+              window_rows, timing_context = make_windows()
+              write_json("R13MPAF_R1_TIMING_CONTEXT.json", timing_context)
+              write_csv("R13MPAF_R1_WIDE_10000D_OPERATIONAL_WINDOWS.csv", window_rows, [
+                  "window_id", "direction", "role", "lag_label", "lag_class",
+                  "signed_start_days_from_R9C", "signed_end_days_from_R9C",
+                  "planned_start_utc", "planned_end_utc", "clipped_start_utc", "clipped_end_utc",
+                  "clipped_start_fermi_met", "clipped_end_fermi_met", "available_duration_s",
+                  "availability_status", "operational_not_theoretical_ceiling", "non_detection_interpretation"
+              ])
+
+              endpoint_rows = []
+              endpoint_rows += probe_url(LOCKED["lat_data_server_url"], "lat_data_server")
+              endpoint_rows += probe_url(LOCKED["fermi_catalog_url"], "4fgl_dr4_catalog")
+              write_csv("R13MPAF_R1_ENDPOINT_PREFLIGHT.csv", endpoint_rows, ["label", "url", "method", "ok", "exit_code", "log_tail"])
+
+              query_rows = []
+              for w in window_rows:
+                  if w["availability_status"] == "OUTSIDE_AVAILABLE_DATA_RANGE":
+                      continue
+                  for roi in LOCKED["roi_options_deg"]:
+                      for band in LOCKED["energy_bands_mev"]:
+                          query_rows.append({
+                              "template_id": f"{w['window_id']}_ROI{roi:g}_{band['band']}",
+                              "window_id": w["window_id"],
+                              "direction": w["direction"],
+                              "role": w["role"],
+                              "lag_label": w["lag_label"],
+                              "lag_class": w["lag_class"],
+                              "ra_deg": LOCKED["cygx1_ra_deg"],
+                              "dec_deg": LOCKED["cygx1_dec_deg"],
+                              "roi_deg": roi,
+                              "start_utc": w["clipped_start_utc"],
+                              "end_utc": w["clipped_end_utc"],
+                              "start_fermi_met_approx": w["clipped_start_fermi_met"],
+                              "end_fermi_met_approx": w["clipped_end_fermi_met"],
+                              "emin_mev": band["emin_mev"],
+                              "emax_mev": band["emax_mev"],
+                              "energy_band": band["band"],
+                              "energy_role": band["role"],
+                              "submit_status": "NOT_SUBMITTED_PREFLIGHT_ONLY",
+                              "lat_data_server_url": LOCKED["lat_data_server_url"]
+                          })
+              write_csv("R13MPAF_R1_FERMI_LAT_WIDE_LAG_QUERY_TEMPLATES_NOT_SUBMITTED.csv", query_rows, [
+                  "template_id", "window_id", "direction", "role", "lag_label", "lag_class",
+                  "ra_deg", "dec_deg", "roi_deg", "start_utc", "end_utc", "start_fermi_met_approx", "end_fermi_met_approx",
+                  "emin_mev", "emax_mev", "energy_band", "energy_role", "submit_status", "lat_data_server_url"
+              ])
+
+              governance_rows = [
+                  {"rule": "R9C gate status", "locked_value": "accepted locked gate for this branch", "allowed_claim": "does not re-test R9C", "forbidden_claim": "new proof of R9C"},
+                  {"rule": "10000 day horizon", "locked_value": "+/-10000 days operational only", "allowed_claim": "not detected within operational search horizon", "forbidden_claim": "theory falsified beyond/inside 10000 days"},
+                  {"rule": "preflight scope", "locked_value": "no photon extraction no score", "allowed_claim": "query readiness", "forbidden_claim": "detection/evidence/proof/discovery"},
+                  {"rule": "long lag interpretation", "locked_value": "lag may exceed operational horizon", "allowed_claim": "observationally unresolved", "forbidden_claim": "resonance lifetime capped at 10000 days"},
+                  {"rule": "post-hoc protection", "locked_value": "record all bins and controls before photon readout", "allowed_claim": "candidate lag requires controls", "forbidden_claim": "choose lag after seeing photons as proof"}
+              ]
+              write_csv("R13MPAF_R1_CLAIM_GOVERNANCE.csv", governance_rows, ["rule", "locked_value", "allowed_claim", "forbidden_claim"])
+
+              n_endpoint_ok = sum(1 for r in endpoint_rows if r.get("ok"))
+              n_available_windows = sum(1 for r in window_rows if r["availability_status"] != "OUTSIDE_AVAILABLE_DATA_RANGE")
+              n_post_available = sum(1 for r in window_rows if r["direction"] == "post" and r["availability_status"] != "OUTSIDE_AVAILABLE_DATA_RANGE")
+              n_pre_available = sum(1 for r in window_rows if r["direction"] == "pre" and r["availability_status"] != "OUTSIDE_AVAILABLE_DATA_RANGE")
+              max_post_available_days = 0.0
+              for r in window_rows:
+                  if r["direction"] == "post" and r["availability_status"] != "OUTSIDE_AVAILABLE_DATA_RANGE":
+                      max_post_available_days = max(max_post_available_days, float(r["signed_end_days_from_R9C"]))
+              summary = {
+                  "r9c_time_utc": timing_context["r9c_time_utc"],
+                  "operational_horizon_days": LOCKED["operational_horizon_days"],
+                  "operational_horizon_is_not_theoretical_ceiling": True,
+                  "available_windows": n_available_windows,
+                  "available_post_windows": n_post_available,
+                  "available_pre_control_windows": n_pre_available,
+                  "query_templates_not_submitted": len(query_rows),
+                  "endpoint_ok_count": n_endpoint_ok,
+                  "max_post_lag_bin_end_days_available_or_planned": max_post_available_days,
+                  "non_detection_interpretation": "not detected within operational search horizon / observationally unresolved, not theory failure",
+                  "claim_ceiling": LOCKED["claim_ceiling"]
+              }
+              write_json("R13MPAF_R1_PREFLIGHT_SUMMARY.json", summary)
+
+              if n_available_windows == 0:
+                  decision = "WIDE_10000D_WINDOWS_OUTSIDE_AVAILABLE_FERMI_RANGE_NO_SCORE"
+                  next_stage = "USE_ALTERNATE_MESSENGER_ROUTE_OR_RECHECK_TIMING"
+              elif n_endpoint_ok == 0:
+                  decision = "WIDE_10000D_WINDOWS_LOCKED_BUT_FERMI_ENDPOINTS_UNREACHABLE_NO_SCORE"
+                  next_stage = "RERUN_PREFLIGHT_WHEN_NETWORK_AVAILABLE_OR_PROCEED_WITH_LOCAL_QUERY_TEMPLATES"
+              else:
+                  decision = "WIDE_10000D_OPERATIONAL_HORIZON_PREFLIGHT_READY_NO_SCORE"
+                  next_stage = "ACIRM_R13MPAG_SMALL_FERMI_LAT_WIDE_LAG_PHOTON_AVAILABILITY_CHECK_NO_LIKELIHOOD_NO_SCORE"
+              final_decision(decision, next_stage, {"summary": summary})
+          except Exception as e:
+              (OUT / "R13MPAF_R1_EXCEPTION_TRACEBACK.txt").write_text(traceback.format_exc(), encoding="utf-8")
+              final_decision("TECHNICAL_STOP_EXCEPTION_DURING_WIDE_10000D_PREFLIGHT", "REPAIR_FROM_TRACEBACK", {"error": repr(e)[:500]})
+          PYCODE
+          python3 "$GITHUB_WORKSPACE/r13mpaf_r1_controller.py" > "$OUT/R13MPAF_R1_CONTROLLER_STDOUT.txt" 2> "$OUT/R13MPAF_R1_CONTROLLER_STDERR.txt"
+          CODE=$?
+          echo "controller_exit_code=$CODE" > "$OUT/R13MPAF_R1_STEP_STATUS.log"
+          if [ ! -f "$OUT/R13MPAF_R1_FINAL_DECISION.json" ]; then
+            cat > "$OUT/R13MPAF_R1_FINAL_DECISION.json" <<'JSON'
+          {
+            "stage": "ACIRM_R13MPAF_R1_WIDE_10000D_LAG_HIGH_ENERGY_DRIVER_PREFLIGHT_NO_SCORE",
+            "decision": "CONTROLLER_FAILED_BEFORE_FINAL_DECISION",
+            "next_stage": "REPAIR_FROM_STDOUT_STDERR",
+            "claim_ceiling": "no reliable result"
+          }
+          JSON
+          fi
+          cd "$GITHUB_WORKSPACE"
+          ZIP="$GITHUB_WORKSPACE/${STAGE}_RESULTS.zip"
+          SHA="$ZIP.sha256.txt"
+          rm -f "$ZIP" "$SHA"
+          zip -r "$ZIP" "$(basename "$OUT")"
+          sha256sum "$ZIP" > "$SHA"
+          exit 0
+
+      - name: Upload artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ACIRM_R13MPAF_R1_WIDE_10000D_LAG_HIGH_ENERGY_DRIVER_PREFLIGHT_NO_SCORE_RESULTS
+          path: |
+            ACIRM_R13MPAF_R1_WIDE_10000D_LAG_HIGH_ENERGY_DRIVER_PREFLIGHT_NO_SCORE_RESULTS.zip
+            ACIRM_R13MPAF_R1_WIDE_10000D_LAG_HIGH_ENERGY_DRIVER_PREFLIGHT_NO_SCORE_RESULTS.zip.sha256.txt
+          retention-days: 7
