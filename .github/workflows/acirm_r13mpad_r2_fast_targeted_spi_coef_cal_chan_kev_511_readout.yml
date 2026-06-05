@@ -1,0 +1,550 @@
+name: ACIRM R13MPAD R2 fast targeted CHAN KEV 511 readout
+
+on:
+  workflow_dispatch:
+
+jobs:
+  r13mpad-r2-fast-targeted-chan-kev:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+
+    steps:
+      - name: R13MPAD R2 fast targeted SPI COEF CAL CHAN_KEV readout
+        shell: bash
+        run: |
+          set +e
+          STAGE="ACIRM_R13MPAD_R2_FAST_TARGETED_SPI_COEF_CAL_CHAN_KEV_511_READOUT"
+          OUT="$GITHUB_WORKSPACE/${STAGE}_OUTPUT"
+          DATA="$GITHUB_WORKSPACE/${STAGE}_DATA"
+          mkdir -p "$OUT" "$DATA"
+          python3 -m pip install --user --no-cache-dir --upgrade numpy astropy > "$OUT/R13MPAD_R2_PIP_INSTALL.log" 2>&1
+          cat > "$GITHUB_WORKSPACE/r13mpad_r2_controller.py" <<'PYCODE'
+          from pathlib import Path
+          from urllib.request import Request, urlopen
+          import csv, datetime, hashlib, json, math, os, shutil, subprocess, sys, time, traceback
+          import numpy as np
+          from astropy.io import fits
+
+          STAGE = "ACIRM_R13MPAD_R2_FAST_TARGETED_SPI_COEF_CAL_CHAN_KEV_511_READOUT"
+          BASE = Path(os.environ.get("GITHUB_WORKSPACE", "/tmp/acirm_r13mpad_r2"))
+          OUT = BASE / (STAGE + "_OUTPUT")
+          DATA = BASE / (STAGE + "_DATA")
+          OUT.mkdir(parents=True, exist_ok=True)
+          DATA.mkdir(parents=True, exist_ok=True)
+
+          LOCKED = {
+              "stage": STAGE,
+              "previous_issue": "R13MPAD_R1 exceeded GitHub 4h timeout because it tried many files and long retries.",
+              "purpose": "Fast targeted repair: download only locked SCW spi_spectra.fits.gz files and targeted spi_coef_cal_0014..0024 calibration files; audit CHAN_KEV/KEV_CHAN; read 511 only from strict SPI.-COEF-CAL CHAN_KEV mapping when safe. No USE_SE/USE_PE accepted.",
+              "locked_scw_ids": ["250400090010", "250400020010", "250400080010", "250400030010", "250400070021", "250400040010", "250400060010", "250400050010"],
+              "target_cal_indices": list(range(14, 25)),
+              "heasarc_scw_base": "https://heasarc.gsfc.nasa.gov/FTP/integral/data/scw/2504",
+              "heasarc_ic_spi_cal_base": "https://heasarc.gsfc.nasa.gov/FTP/integral/data/ic/spi/cal",
+              "target_public_file": "spi_spectra.fits.gz",
+              "accepted_cal_hdu": "SPI.-COEF-CAL",
+              "required_columns": ["DET_ID", "E_RANGE", "OBT_START", "OBT_END", "CHAN_KEV", "KEV_CHAN"],
+              "locked_line_keV": [508.0, 514.0],
+              "locked_lower_sideband_keV": [490.0, 500.0],
+              "locked_upper_sideband_keV": [522.0, 532.0],
+              "minimum_candidate_ratio": 1.2,
+              "claim_ceiling": "strict SPI.-COEF-CAL / CHAN_KEV diagnostic only; no evidence/proof/discovery claim",
+              "artifact_policy": "No FITS files in artifact. Always produce CSV/JSON/logs. Network failures are technical stops, not science results."
+          }
+
+          LINE = tuple(LOCKED["locked_line_keV"])
+          LOWER = tuple(LOCKED["locked_lower_sideband_keV"])
+          UPPER = tuple(LOCKED["locked_upper_sideband_keV"])
+          MIN_RATIO = float(LOCKED["minimum_candidate_ratio"])
+
+          def log(msg):
+              print(str(msg), flush=True)
+              with (OUT / "R13MPAD_R2_PROGRESS.log").open("a", encoding="utf-8") as f:
+                  f.write(str(msg) + "\n")
+
+          def write_json(name, obj):
+              (OUT / name).write_text(json.dumps(obj, indent=2, ensure_ascii=False), encoding="utf-8")
+
+          def write_csv(name, rows, cols):
+              with (OUT / name).open("w", newline="", encoding="utf-8") as f:
+                  w = csv.DictWriter(f, fieldnames=cols)
+                  w.writeheader()
+                  for r in rows:
+                      w.writerow({c: r.get(c, "") for c in cols})
+
+          def sha256_file(path):
+              h = hashlib.sha256()
+              with open(path, "rb") as f:
+                  for b in iter(lambda: f.read(1024 * 1024), b""):
+                      h.update(b)
+              return h.hexdigest()
+
+          def final_decision(decision, next_stage, extra=None):
+              obj = {
+                  "stage": STAGE,
+                  "decision": decision,
+                  "next_stage": next_stage,
+                  "claim_ceiling": LOCKED["claim_ceiling"],
+                  "timestamp_utc": datetime.datetime.now(datetime.UTC).isoformat()
+              }
+              if extra:
+                  obj.update(extra)
+              write_json("R13MPAD_R2_FINAL_DECISION.json", obj)
+              log("FINAL_DECISION: " + decision)
+              return obj
+
+          def run_cmd(cmd, timeout=120):
+              try:
+                  p = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=timeout)
+                  return p.returncode, p.stdout
+              except Exception as e:
+                  return 999, repr(e)
+
+          def download_fast(url, dest, label, max_time=240):
+              """Fast bounded download: curl then wget then urllib. No long loops."""
+              dest.parent.mkdir(parents=True, exist_ok=True)
+              tmp = dest.with_suffix(dest.suffix + ".part")
+              if tmp.exists():
+                  try: tmp.unlink()
+                  except Exception: pass
+              row = {"label": label, "url": url, "download_ok": False, "path": str(dest), "size_bytes": "", "sha256": "", "method": "", "exit_code": "", "error": ""}
+              logs = []
+              cmd = ["bash", "-lc", "curl -L --fail --connect-timeout 20 --max-time %d --retry 2 --retry-delay 4 --retry-all-errors -o " % max_time + repr(str(tmp)) + " " + repr(url)]
+              code, out = run_cmd(cmd, timeout=max_time + 40)
+              logs.append("CURL_EXIT_%s\n%s" % (code, out[-2000:]))
+              if code == 0 and tmp.exists() and tmp.stat().st_size > 0:
+                  tmp.rename(dest)
+                  row.update({"download_ok": True, "size_bytes": dest.stat().st_size, "sha256": sha256_file(dest), "method": "curl", "exit_code": code})
+                  return row, "\n".join(logs)
+              if tmp.exists():
+                  try: tmp.unlink()
+                  except Exception: pass
+              cmd = ["bash", "-lc", "wget -T 20 -t 2 --waitretry=4 --retry-connrefused --no-check-certificate -O " + repr(str(tmp)) + " " + repr(url)]
+              code, out = run_cmd(cmd, timeout=max_time + 40)
+              logs.append("WGET_EXIT_%s\n%s" % (code, out[-2000:]))
+              if code == 0 and tmp.exists() and tmp.stat().st_size > 0:
+                  tmp.rename(dest)
+                  row.update({"download_ok": True, "size_bytes": dest.stat().st_size, "sha256": sha256_file(dest), "method": "wget", "exit_code": code})
+                  return row, "\n".join(logs)
+              if tmp.exists():
+                  try: tmp.unlink()
+                  except Exception: pass
+              try:
+                  req = Request(url, headers={"User-Agent": "ACIRM-R13MPAD-R2/1.0"})
+                  with urlopen(req, timeout=max_time) as r, open(tmp, "wb") as f:
+                      shutil.copyfileobj(r, f, length=1024 * 1024)
+                  if tmp.exists() and tmp.stat().st_size > 0:
+                      tmp.rename(dest)
+                      row.update({"download_ok": True, "size_bytes": dest.stat().st_size, "sha256": sha256_file(dest), "method": "urllib", "exit_code": 0})
+                      logs.append("URLLIB_OK")
+                      return row, "\n".join(logs)
+              except Exception as e:
+                  logs.append("URLLIB_EXCEPTION\n" + repr(e))
+              row.update({"method": "curl_wget_urllib", "exit_code": "FAILED", "error": "download_failed_fast_bounded"})
+              return row, "\n".join(logs)
+
+          def col_array(data, col):
+              try:
+                  arr = np.asarray(data[col])
+                  if arr.size == 0:
+                      return None
+                  if not np.issubdtype(arr.dtype, np.number):
+                      arr = arr.astype(float)
+                  return np.asarray(arr, dtype=float)
+              except Exception:
+                  return None
+
+          def scalar_or_first(x):
+              try:
+                  arr = np.asarray(x, dtype=float).ravel()
+                  arr = arr[np.isfinite(arr)]
+                  return float(arr[0]) if arr.size else None
+              except Exception:
+                  return None
+
+          def edge_indices(emin, emax, window):
+              return np.where((emax > window[0]) & (emin < window[1]))[0]
+
+          def validate_edges(edges, nchan, method):
+              edges = np.asarray(edges, dtype=float).ravel()
+              if edges.size != nchan + 1:
+                  return None, None, "bad_edge_length_%d" % edges.size, method
+              if not np.all(np.isfinite(edges)):
+                  return None, None, "nonfinite_edges", method
+              dif = np.diff(edges)
+              if np.all(dif > 0):
+                  emin, emax = edges[:-1], edges[1:]
+              elif np.all(dif < 0):
+                  emin, emax = edges[1:], edges[:-1]
+              else:
+                  return None, None, "nonmonotonic_edges", method
+              if np.nanmin(emin) > 100.0 or np.nanmax(emax) < 1000.0:
+                  return None, None, "does_not_cover_511_or_gamma_range", method
+              if np.nanmin(emin) < -100.0 or np.nanmax(emax) > 20000.0:
+                  return None, None, "implausible_energy_range", method
+              widths = emax - emin
+              medw = float(np.nanmedian(widths))
+              if medw <= 0.0 or medw > 20.0:
+                  return None, None, "implausible_channel_width_%g" % medw, method
+              if len(edge_indices(emin, emax, LOWER)) == 0 or len(edge_indices(emin, emax, LINE)) == 0 or len(edge_indices(emin, emax, UPPER)) == 0:
+                  return None, None, "locked_windows_not_bracketed", method
+              return emin, emax, "ok", method
+
+          def decode_chan_kev_to_edges(chan_kev_value, nchan=16384):
+              """Decode CHAN_KEV into energy bin edges.
+              Accepted forms:
+              - 16385 direct edges
+              - 16384 direct centers
+              - 2..12 polynomial coefficients, tested low-to-high and high-to-low
+              Outputs are always validated against locked 490-532 keV windows.
+              """
+              arr = np.asarray(chan_kev_value, dtype=float)
+              flat = arr.ravel()
+              flat = flat[np.isfinite(flat)]
+              if flat.size == 0:
+                  return None, None, "empty_CHAN_KEV", ""
+              if flat.size == nchan + 1:
+                  return validate_edges(flat, nchan, "CHAN_KEV_DIRECT_EDGES")
+              if flat.size == nchan:
+                  centers = flat
+                  mids = 0.5 * (centers[:-1] + centers[1:])
+                  first = centers[0] - (mids[0] - centers[0])
+                  last = centers[-1] + (centers[-1] - mids[-1])
+                  edges = np.concatenate([[first], mids, [last]])
+                  return validate_edges(edges, nchan, "CHAN_KEV_DIRECT_CENTERS")
+              if 2 <= flat.size <= 12:
+                  ch_edges = np.arange(nchan + 1, dtype=float)
+                  edges = np.zeros_like(ch_edges)
+                  for power, coef in enumerate(flat):
+                      edges += coef * np.power(ch_edges, power)
+                  emin, emax, status, method = validate_edges(edges, nchan, "CHAN_KEV_POLY_LOW_TO_HIGH_LEN_%d" % flat.size)
+                  if status == "ok":
+                      return emin, emax, status, method
+                  try:
+                      edges2 = np.polyval(flat, ch_edges)
+                      emin, emax, status2, method2 = validate_edges(edges2, nchan, "CHAN_KEV_POLY_HIGH_TO_LOW_LEN_%d" % flat.size)
+                      if status2 == "ok":
+                          return emin, emax, status2, method2
+                  except Exception:
+                      pass
+                  return None, None, status, method
+              return None, None, "unsupported_CHAN_KEV_shape_%s" % str(arr.shape), ""
+
+          def decode_kev_chan_windows(kev_chan_value, nchan=16384):
+              arr = np.asarray(kev_chan_value, dtype=float).ravel()
+              arr = arr[np.isfinite(arr)]
+              if not (2 <= arr.size <= 12):
+                  return None, "unsupported_KEV_CHAN_shape_%s" % str(np.asarray(kev_chan_value).shape)
+              for order_name, coeffs in [("LOW_TO_HIGH", arr), ("HIGH_TO_LOW", arr)]:
+                  idxs = []
+                  ok = True
+                  for w in [LOWER, LINE, UPPER]:
+                      vals = []
+                      for e in w:
+                          if order_name == "LOW_TO_HIGH":
+                              v = sum(float(c) * (float(e) ** i) for i, c in enumerate(coeffs))
+                          else:
+                              v = float(np.polyval(coeffs, float(e)))
+                          vals.append(v)
+                      lo = int(max(0, math.floor(min(vals))))
+                      hi = int(min(nchan, math.ceil(max(vals))))
+                      if hi <= lo or lo < 0 or hi > nchan:
+                          ok = False
+                      idxs.append(np.arange(lo, hi, dtype=int))
+                  if ok and all(len(x) > 0 for x in idxs):
+                      return {"lower": idxs[0], "line": idxs[1], "upper": idxs[2], "method": "KEV_CHAN_%s_DIAGNOSTIC" % order_name}, "ok"
+              return None, "KEV_CHAN_not_plausible"
+
+          def time_overlap_score(spec_start, spec_end, cal_start, cal_end):
+              try:
+                  ss = scalar_or_first(spec_start)
+                  se = scalar_or_first(spec_end)
+                  cs = scalar_or_first(cal_start)
+                  ce = scalar_or_first(cal_end)
+                  if ss is None or se is None or cs is None or ce is None:
+                      return 0.0, False, None
+                  mid = 0.5 * (ss + se)
+                  inside = (cs <= mid <= ce) or (cs <= ss <= ce) or (cs <= se <= ce)
+                  overlap = max(0.0, min(se, ce) - max(ss, cs))
+                  distance = 0.0 if inside or overlap > 0 else min(abs(mid - cs), abs(mid - ce))
+                  return float(overlap), bool(inside or overlap > 0), float(distance)
+              except Exception:
+                  return 0.0, False, None
+
+          write_json("R13MPAD_R2_LOCKED_CONTEXT.json", LOCKED)
+          log("R13MPAD_R2 started. Targeted calibration indices: 0014..0024 only.")
+
+          spectra_download_rows = []
+          spectra_records = []
+          spectra_parse_rows = []
+          dlog_dir = OUT / "download_logs"
+          dlog_dir.mkdir(exist_ok=True)
+          for scw in LOCKED["locked_scw_ids"]:
+              url = f"{LOCKED['heasarc_scw_base']}/{scw}.001/{LOCKED['target_public_file']}"
+              dest = DATA / "spectra" / scw / LOCKED["target_public_file"]
+              row, dlog = download_fast(url, dest, label="spectra_" + scw, max_time=300)
+              row["scw_id"] = scw
+              spectra_download_rows.append(row)
+              (dlog_dir / ("spectra_%s.log" % scw)).write_text(dlog, encoding="utf-8")
+              if not row["download_ok"]:
+                  continue
+              try:
+                  with fits.open(dest, memmap=False) as hdul:
+                      for hdu_i, hdu in enumerate(hdul):
+                          data = getattr(hdu, "data", None)
+                          cols = []
+                          if hasattr(hdu, "columns") and hdu.columns is not None:
+                              try: cols = list(hdu.columns.names)
+                              except Exception: cols = []
+                          upper = {str(c).upper(): c for c in cols}
+                          if data is None or "COUNTS" not in upper:
+                              continue
+                          counts = col_array(data, upper["COUNTS"])
+                          if counts is None or counts.shape[-1] != 16384:
+                              continue
+                          det = col_array(data, upper["DET_ID"]) if "DET_ID" in upper else None
+                          erange = col_array(data, upper["E_RANGE"]) if "E_RANGE" in upper else None
+                          lobt_s = col_array(data, upper["LOBT_START"]) if "LOBT_START" in upper else None
+                          lobt_e = col_array(data, upper["LOBT_END"]) if "LOBT_END" in upper else None
+                          nrows = counts.shape[0] if counts.ndim >= 2 else 1
+                          spectra_parse_rows.append({"scw_id": scw, "file": str(dest), "hdu_index": hdu_i, "hdu_name": getattr(hdu,"name",""), "columns": "|".join(cols), "counts_shape": str(counts.shape), "rows": nrows, "error": ""})
+                          for ridx in range(nrows):
+                              spectrum = counts[ridx] if counts.ndim >= 2 else counts
+                              det_id = int(det.ravel()[ridx]) if det is not None and ridx < det.size and np.isfinite(det.ravel()[ridx]) else None
+                              e_range = int(erange.ravel()[ridx]) if erange is not None and ridx < erange.size and np.isfinite(erange.ravel()[ridx]) else None
+                              ls = scalar_or_first(lobt_s[ridx] if lobt_s is not None and getattr(lobt_s, 'shape', [0])[0] > ridx else None)
+                              le = scalar_or_first(lobt_e[ridx] if lobt_e is not None and getattr(lobt_e, 'shape', [0])[0] > ridx else None)
+                              spectra_records.append({"scw_id": scw, "file": str(dest), "hdu_index": hdu_i, "hdu_name": getattr(hdu,"name",""), "row_index": ridx, "counts": spectrum, "det_id": det_id, "e_range": e_range, "lobt_start": ls, "lobt_end": le})
+              except Exception as e:
+                  spectra_parse_rows.append({"scw_id": scw, "file": str(dest), "hdu_index": "", "hdu_name": "", "columns": "", "counts_shape": "", "rows": "", "error": repr(e)[:500]})
+
+          write_csv("R13MPAD_R2_SPI_SPECTRA_DOWNLOADS.csv", spectra_download_rows, ["scw_id", "label", "url", "download_ok", "path", "size_bytes", "sha256", "method", "exit_code", "error"])
+          write_csv("R13MPAD_R2_SPI_SPECTRA_PARSE_AUDIT.csv", spectra_parse_rows, ["scw_id", "file", "hdu_index", "hdu_name", "columns", "counts_shape", "rows", "error"])
+
+          cal_download_rows = []
+          cal_files = []
+          for idx in LOCKED["target_cal_indices"]:
+              fname = f"spi_coef_cal_{idx:04d}.fits"
+              url = f"{LOCKED['heasarc_ic_spi_cal_base']}/{fname}"
+              dest = DATA / "cal" / fname
+              row, dlog = download_fast(url, dest, label="cal_" + fname, max_time=180)
+              row["filename"] = fname
+              cal_download_rows.append(row)
+              (dlog_dir / ("cal_%04d.log" % idx)).write_text(dlog, encoding="utf-8")
+              if row["download_ok"]:
+                  cal_files.append(dest)
+          write_csv("R13MPAD_R2_SPI_COEF_CAL_DOWNLOADS.csv", cal_download_rows, ["filename", "label", "url", "download_ok", "path", "size_bytes", "sha256", "method", "exit_code", "error"])
+
+          cal_schema_rows = []
+          cal_audit_rows = []
+          cal_records = []
+          errors = []
+          for pth in cal_files:
+              try:
+                  with fits.open(pth, memmap=False) as hdul:
+                      for hdu_i, hdu in enumerate(hdul):
+                          hname = str(getattr(hdu, "name", ""))
+                          data = getattr(hdu, "data", None)
+                          cols = []
+                          if hasattr(hdu, "columns") and hdu.columns is not None:
+                              try: cols = list(hdu.columns.names)
+                              except Exception: cols = []
+                          cal_schema_rows.append({"file": str(pth), "filename": pth.name, "hdu_index": hdu_i, "hdu_name": hname, "columns": "|".join(cols), "n_columns": len(cols), "data_shape": str(getattr(data, "shape", ""))})
+                          if data is None or hname.upper() != LOCKED["accepted_cal_hdu"]:
+                              continue
+                          upper = {str(c).upper(): c for c in cols}
+                          if not all(c in upper for c in LOCKED["required_columns"]):
+                              cal_audit_rows.append({"file": str(pth), "filename": pth.name, "hdu_index": hdu_i, "hdu_name": hname, "row_index": "", "det_id": "", "e_range": "", "obt_start": "", "obt_end": "", "ontime": "", "chan_kev_shape": "", "kev_chan_shape": "", "mapping_status": "required_columns_missing", "mapping_method": "", "edge_min": "", "edge_max": "", "line_bins": ""})
+                              continue
+                          det = col_array(data, upper["DET_ID"])
+                          erange = col_array(data, upper["E_RANGE"])
+                          obt_s = col_array(data, upper["OBT_START"])
+                          obt_e = col_array(data, upper["OBT_END"])
+                          ontime = col_array(data, upper["ONTIME"]) if "ONTIME" in upper else None
+                          chan_kev = col_array(data, upper["CHAN_KEV"])
+                          kev_chan = col_array(data, upper["KEV_CHAN"])
+                          nrows = len(data)
+                          for ridx in range(nrows):
+                              ck = chan_kev[ridx] if chan_kev is not None and getattr(chan_kev, 'shape', [0])[0] > ridx else None
+                              kc = kev_chan[ridx] if kev_chan is not None and getattr(kev_chan, 'shape', [0])[0] > ridx else None
+                              emin, emax, status, method = decode_chan_kev_to_edges(ck, 16384)
+                              kcwin, kc_status = decode_kev_chan_windows(kc, 16384) if kc is not None else (None, "no_KEV_CHAN")
+                              det_id = int(det.ravel()[ridx]) if det is not None and ridx < det.size and np.isfinite(det.ravel()[ridx]) else None
+                              e_range = int(erange.ravel()[ridx]) if erange is not None and ridx < erange.size and np.isfinite(erange.ravel()[ridx]) else None
+                              os0 = scalar_or_first(obt_s[ridx] if obt_s is not None and getattr(obt_s, 'shape', [0])[0] > ridx else None)
+                              oe0 = scalar_or_first(obt_e[ridx] if obt_e is not None and getattr(obt_e, 'shape', [0])[0] > ridx else None)
+                              ot0 = scalar_or_first(ontime[ridx] if ontime is not None and getattr(ontime, 'shape', [0])[0] > ridx else None)
+                              line_bins = ""
+                              edge_min = edge_max = ""
+                              if status == "ok" and emin is not None:
+                                  li = edge_indices(emin, emax, LINE)
+                                  line_bins = int(len(li))
+                                  edge_min = float(np.nanmin(emin)); edge_max = float(np.nanmax(emax))
+                              cal_audit_rows.append({"file": str(pth), "filename": pth.name, "hdu_index": hdu_i, "hdu_name": hname, "row_index": ridx, "det_id": det_id, "e_range": e_range, "obt_start": os0, "obt_end": oe0, "ontime": ot0, "chan_kev_shape": str(np.asarray(ck).shape), "kev_chan_shape": str(np.asarray(kc).shape), "mapping_status": status, "mapping_method": method or kc_status, "edge_min": edge_min, "edge_max": edge_max, "line_bins": line_bins})
+                              cal_records.append({"file": str(pth), "filename": pth.name, "hdu_index": hdu_i, "hdu_name": hname, "row_index": ridx, "det_id": det_id, "e_range": e_range, "obt_start": os0, "obt_end": oe0, "ontime": ot0, "chan_kev_shape": str(np.asarray(ck).shape), "kev_chan_shape": str(np.asarray(kc).shape), "mapping_status": status, "mapping_method": method, "emin": emin, "emax": emax, "kev_chan_windows": kcwin, "kev_chan_status": kc_status})
+              except Exception as e:
+                  errors.append({"stage": "cal_parse", "file": str(pth), "error": repr(e)[:500], "traceback": traceback.format_exc()[:1500]})
+
+          write_csv("R13MPAD_R2_STRICT_COEF_CAL_SCHEMA.csv", cal_schema_rows, ["file", "filename", "hdu_index", "hdu_name", "columns", "n_columns", "data_shape"])
+          write_csv("R13MPAD_R2_CHAN_KEV_DECODE_AUDIT.csv", cal_audit_rows, ["file", "filename", "hdu_index", "hdu_name", "row_index", "det_id", "e_range", "obt_start", "obt_end", "ontime", "chan_kev_shape", "kev_chan_shape", "mapping_status", "mapping_method", "edge_min", "edge_max", "line_bins"])
+
+          usable_cals = [r for r in cal_records if r.get("mapping_status") == "ok" and r.get("emin") is not None and r.get("emax") is not None]
+          diagnostic_kc_cals = [r for r in cal_records if r.get("kev_chan_status") == "ok" and r.get("kev_chan_windows") is not None]
+          readout_rows = []
+          diagnostic_kc_rows = []
+          match_rows = []
+
+          for s in spectra_records:
+              candidates = []
+              for c in usable_cals:
+                  if s["det_id"] is not None and c["det_id"] is not None and int(s["det_id"]) != int(c["det_id"]):
+                      continue
+                  if s["e_range"] is not None and c["e_range"] is not None and int(s["e_range"]) != int(c["e_range"]):
+                      continue
+                  overlap, inside, distance = time_overlap_score(s["lobt_start"], s["lobt_end"], c["obt_start"], c["obt_end"])
+                  score = (1000000.0 if inside else 0.0) + overlap - (distance if distance is not None else 1e18) * 1e-9
+                  candidates.append((score, inside, overlap, distance, c))
+              candidates = sorted(candidates, key=lambda x: x[0], reverse=True)
+              if candidates and (candidates[0][1] or candidates[0][2] > 0):
+                  score, inside, overlap, distance, c = candidates[0]
+                  emin, emax = c["emin"], c["emax"]
+                  li = edge_indices(emin, emax, LINE); lo = edge_indices(emin, emax, LOWER); up = edge_indices(emin, emax, UPPER)
+                  if len(li) and len(lo) and len(up):
+                      spec = np.asarray(s["counts"], dtype=float)
+                      lv = float(np.nansum(spec[li])); lov = float(np.nansum(spec[lo])); uv = float(np.nansum(spec[up]))
+                      side = 0.5 * (lov + uv)
+                      ratio = lv / side if side > 0 else None
+                      readout_rows.append({"scw_id": s["scw_id"], "spectra_file": Path(s["file"]).name, "spectra_hdu": s["hdu_name"], "spectra_row_index": s["row_index"], "det_id": s["det_id"], "e_range": s["e_range"], "lobt_start": s["lobt_start"], "lobt_end": s["lobt_end"], "cal_file": c["filename"], "cal_hdu": c["hdu_name"], "cal_row_index": c["row_index"], "cal_obt_start": c["obt_start"], "cal_obt_end": c["obt_end"], "mapping_method": c["mapping_method"], "match_overlap": overlap, "match_inside": inside, "line_bin_count": int(len(li)), "lower_bin_count": int(len(lo)), "upper_bin_count": int(len(up)), "line_508_514_counts": lv, "lower_490_500_counts": lov, "upper_522_532_counts": uv, "sideband_mean": side, "line_to_sideband_ratio": ratio, "candidate_ratio_ge_1p2": bool(ratio is not None and ratio >= MIN_RATIO), "claim": "STRICT_SPI_COEF_CAL_CHAN_KEV_DIAGNOSTIC_ONLY"})
+                      match_rows.append({"scw_id": s["scw_id"], "row_index": s["row_index"], "det_id": s["det_id"], "e_range": s["e_range"], "matched": True, "reason": "strict_time_overlapping_CHAN_KEV_match", "cal_file": c["filename"], "mapping_method": c["mapping_method"], "overlap": overlap, "inside": inside, "distance": distance})
+                  else:
+                      match_rows.append({"scw_id": s["scw_id"], "row_index": s["row_index"], "det_id": s["det_id"], "e_range": s["e_range"], "matched": False, "reason": "matched_CHAN_KEV_but_locked_bins_missing"})
+              elif candidates:
+                  score, inside, overlap, distance, c = candidates[0]
+                  match_rows.append({"scw_id": s["scw_id"], "row_index": s["row_index"], "det_id": s["det_id"], "e_range": s["e_range"], "matched": False, "reason": "nearest_CHAN_KEV_cal_exists_but_no_time_overlap", "cal_file": c["filename"], "mapping_method": c["mapping_method"], "overlap": overlap, "inside": inside, "distance": distance})
+              else:
+                  match_rows.append({"scw_id": s["scw_id"], "row_index": s["row_index"], "det_id": s["det_id"], "e_range": s["e_range"], "matched": False, "reason": "no_DET_ERANGE_matching_CHAN_KEV_calibration"})
+
+              kc_candidates = []
+              for c in diagnostic_kc_cals:
+                  if s["det_id"] is not None and c["det_id"] is not None and int(s["det_id"]) != int(c["det_id"]):
+                      continue
+                  if s["e_range"] is not None and c["e_range"] is not None and int(s["e_range"]) != int(c["e_range"]):
+                      continue
+                  overlap, inside, distance = time_overlap_score(s["lobt_start"], s["lobt_end"], c["obt_start"], c["obt_end"])
+                  score = (1000000.0 if inside else 0.0) + overlap - (distance if distance is not None else 1e18) * 1e-9
+                  kc_candidates.append((score, inside, overlap, distance, c))
+              kc_candidates = sorted(kc_candidates, key=lambda x: x[0], reverse=True)
+              if kc_candidates and (kc_candidates[0][1] or kc_candidates[0][2] > 0):
+                  score, inside, overlap, distance, c = kc_candidates[0]
+                  win = c["kev_chan_windows"]
+                  try:
+                      spec = np.asarray(s["counts"], dtype=float)
+                      lv = float(np.nansum(spec[win["line"]])); lov = float(np.nansum(spec[win["lower"]])); uv = float(np.nansum(spec[win["upper"]]))
+                      side = 0.5 * (lov + uv)
+                      ratio = lv / side if side > 0 else None
+                      diagnostic_kc_rows.append({"scw_id": s["scw_id"], "spectra_row_index": s["row_index"], "det_id": s["det_id"], "e_range": s["e_range"], "cal_file": c["filename"], "cal_row_index": c["row_index"], "mapping_method": win["method"], "line_508_514_counts": lv, "lower_490_500_counts": lov, "upper_522_532_counts": uv, "sideband_mean": side, "line_to_sideband_ratio": ratio, "claim": "KEV_CHAN_DIAGNOSTIC_NOT_PRIMARY_CLAIM"})
+                  except Exception:
+                      pass
+
+          match_cols = ["scw_id", "row_index", "det_id", "e_range", "matched", "reason", "cal_file", "mapping_method", "overlap", "inside", "distance"]
+          write_csv("R13MPAD_R2_STRICT_COEF_CAL_MATCH_AUDIT.csv", match_rows, match_cols)
+          readout_cols = ["scw_id", "spectra_file", "spectra_hdu", "spectra_row_index", "det_id", "e_range", "lobt_start", "lobt_end", "cal_file", "cal_hdu", "cal_row_index", "cal_obt_start", "cal_obt_end", "mapping_method", "match_overlap", "match_inside", "line_bin_count", "lower_bin_count", "upper_bin_count", "line_508_514_counts", "lower_490_500_counts", "upper_522_532_counts", "sideband_mean", "line_to_sideband_ratio", "candidate_ratio_ge_1p2", "claim"]
+          write_csv("R13MPAD_R2_STRICT_CHAN_KEV_511_READOUT.csv", readout_rows if readout_rows else [{"claim": "NO_STRICT_CHAN_KEV_READOUT"}], readout_cols)
+          write_csv("R13MPAD_R2_KEV_CHAN_FALLBACK_DIAGNOSTIC_NOT_PRIMARY.csv", diagnostic_kc_rows if diagnostic_kc_rows else [{"claim": "NO_KEV_CHAN_DIAGNOSTIC_READOUT"}], ["scw_id", "spectra_row_index", "det_id", "e_range", "cal_file", "cal_row_index", "mapping_method", "line_508_514_counts", "lower_490_500_counts", "upper_522_532_counts", "sideband_mean", "line_to_sideband_ratio", "claim"])
+          write_json("R13MPAD_R2_ERRORS.json", {"errors_count": len(errors), "errors": errors[:200]})
+
+          if readout_rows:
+              line_sum = sum(float(r["line_508_514_counts"]) for r in readout_rows)
+              lower_sum = sum(float(r["lower_490_500_counts"]) for r in readout_rows)
+              upper_sum = sum(float(r["upper_522_532_counts"]) for r in readout_rows)
+              side = 0.5 * (lower_sum + upper_sum)
+              ratio = line_sum / side if side > 0 else None
+              candidate = bool(ratio is not None and ratio >= MIN_RATIO)
+          else:
+              line_sum = lower_sum = upper_sum = side = ratio = None
+              candidate = False
+
+          n_spectra = sum(1 for r in spectra_download_rows if r.get("download_ok"))
+          n_cal = sum(1 for r in cal_download_rows if r.get("download_ok"))
+          summary = {
+              "targeted_cal_indices": LOCKED["target_cal_indices"],
+              "downloaded_spectra_files": n_spectra,
+              "spectra_records": len(spectra_records),
+              "downloaded_spi_coef_cal_files": n_cal,
+              "strict_coef_cal_rows": len(cal_records),
+              "usable_chan_kev_mappings": len(usable_cals),
+              "diagnostic_kev_chan_mappings": len(diagnostic_kc_cals),
+              "strict_readout_rows": len(readout_rows),
+              "kev_chan_diagnostic_rows": len(diagnostic_kc_rows),
+              "line_508_514_sum": line_sum,
+              "lower_490_500_sum": lower_sum,
+              "upper_522_532_sum": upper_sum,
+              "sideband_mean": side,
+              "line_to_sideband_ratio": ratio,
+              "minimum_candidate_ratio": MIN_RATIO,
+              "candidate_ratio_ge_1p2": candidate,
+              "errors_count": len(errors),
+              "claim_ceiling": LOCKED["claim_ceiling"]
+          }
+          write_json("R13MPAD_R2_STRICT_CHAN_KEV_511_SUMMARY.json", summary)
+
+          if n_spectra == 0 and n_cal == 0:
+              decision = "TECHNICAL_STOP_NETWORK_OR_URL_DOWNLOAD_FAILURE_NO_SCIENCE_READOUT"
+              next_stage = "RERUN_LATER_OR_RUN_IN_COLAB_WITH_BROWSER_NETWORK"
+          elif n_spectra == 0:
+              decision = "TECHNICAL_STOP_NO_SPI_SPECTRA_DOWNLOADED_NO_SCIENCE_READOUT"
+              next_stage = "CHECK_HEASARC_SCW_URLS_OR_NETWORK_THEN_RERUN"
+          elif n_cal == 0:
+              decision = "TECHNICAL_STOP_NO_TARGETED_SPI_COEF_CAL_DOWNLOADED_NO_SCIENCE_READOUT"
+              next_stage = "CHECK_HEASARC_IC_SPI_CAL_URLS_OR_NETWORK_THEN_RERUN"
+          elif candidate:
+              decision = "STRICT_CHAN_KEV_511_RATIO_CANDIDATE_DIAGNOSTIC_ONLY_REQUIRES_BACKGROUND_RESPONSE_AND_OSA_REPLICATION"
+              next_stage = "RUN_BACKGROUND_RESPONSE_OFF_ENERGY_OFF_TIME_NULLS_AND_OFFICIAL_OSA_REPLICATION_BEFORE_ANY_CLAIM"
+          elif readout_rows:
+              decision = "STRICT_CHAN_KEV_511_READOUT_COMPLETED_NO_RATIO_EXCESS"
+              next_stage = "STOP_OR_OPTIONAL_OFF_ENERGY_BACKGROUND_CONTROLS_NO_DETECTION_CLAIM"
+          elif usable_cals:
+              decision = "CHAN_KEV_MAPPINGS_FOUND_BUT_NO_TIME_MATCHED_511_READOUT"
+              next_stage = "AUDIT_LOBT_OBT_TIME_MATCH_OR_RUN_OFFICIAL_OSA_SPIBOUNDS_SPIHIST"
+          elif diagnostic_kc_rows:
+              decision = "KEV_CHAN_DIAGNOSTIC_READOUT_AVAILABLE_BUT_PRIMARY_CHAN_KEV_READOUT_BLOCKED"
+              next_stage = "MANUAL_REVIEW_CHAN_KEV_SCHEMA_OR_OFFICIAL_OSA_SPIBOUNDS_SPIHIST_REQUIRED"
+          else:
+              decision = "TARGETED_COEF_CAL_DOWNLOADED_BUT_CHAN_KEV_MAPPING_NOT_USABLE"
+              next_stage = "MANUAL_REVIEW_R13MPAD_R2_CHAN_KEV_DECODE_AUDIT_OR_OFFICIAL_OSA_SPIBOUNDS_SPIHIST"
+          final_decision(decision, next_stage, {"summary": summary})
+          try:
+              shutil.rmtree(DATA)
+          except Exception:
+              pass
+          PYCODE
+          python3 "$GITHUB_WORKSPACE/r13mpad_r2_controller.py" > "$OUT/R13MPAD_R2_CONTROLLER_STDOUT.txt" 2> "$OUT/R13MPAD_R2_CONTROLLER_STDERR.txt"
+          CODE=$?
+          echo "controller_exit_code=$CODE" > "$OUT/R13MPAD_R2_STEP_STATUS.log"
+          if [ ! -f "$OUT/R13MPAD_R2_FINAL_DECISION.json" ]; then
+            cat > "$OUT/R13MPAD_R2_FINAL_DECISION.json" <<'JSON'
+          {
+            "stage": "ACIRM_R13MPAD_R2_FAST_TARGETED_SPI_COEF_CAL_CHAN_KEV_511_READOUT",
+            "decision": "CONTROLLER_FAILED_BEFORE_FINAL_DECISION",
+            "next_stage": "REPAIR_FROM_STDOUT_STDERR",
+            "claim_ceiling": "no reliable result"
+          }
+          JSON
+          fi
+          cd "$GITHUB_WORKSPACE"
+          ZIP="$GITHUB_WORKSPACE/${STAGE}_RESULTS.zip"
+          SHA="$ZIP.sha256.txt"
+          rm -f "$ZIP" "$SHA"
+          rm -rf "$GITHUB_WORKSPACE/${STAGE}_DATA"
+          zip -r "$ZIP" "$(basename "$OUT")"
+          sha256sum "$ZIP" > "$SHA"
+          exit 0
+
+      - name: Upload artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ACIRM_R13MPAD_R2_FAST_TARGETED_SPI_COEF_CAL_CHAN_KEV_511_READOUT_RESULTS
+          path: |
+            ACIRM_R13MPAD_R2_FAST_TARGETED_SPI_COEF_CAL_CHAN_KEV_511_READOUT_RESULTS.zip
+            ACIRM_R13MPAD_R2_FAST_TARGETED_SPI_COEF_CAL_CHAN_KEV_511_READOUT_RESULTS.zip.sha256.txt
+          retention-days: 7
