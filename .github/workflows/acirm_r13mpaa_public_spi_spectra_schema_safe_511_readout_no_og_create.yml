@@ -1,0 +1,570 @@
+name: ACIRM R13MPAA public SPI spectra schema safe 511 readout no og_create
+
+on:
+  workflow_dispatch:
+
+jobs:
+  r13mpaa-public-spi-schema-readout:
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+
+    steps:
+      - name: R13MPAA inspect public SPI spectra schema and read locked 511 only if safe
+        shell: bash
+        run: |
+          set +e
+          STAGE="ACIRM_R13MPAA_PUBLIC_SPI_SPECTRA_SCHEMA_SAFE_511_READOUT_NO_OG_CREATE"
+          OUT="$GITHUB_WORKSPACE/${STAGE}_OUTPUT"
+          mkdir -p "$OUT"
+          python3 -m pip install --user --no-cache-dir --upgrade numpy astropy > "$OUT/R13MPAA_PIP_INSTALL.log" 2>&1
+          cat > "$GITHUB_WORKSPACE/r13mpaa_controller.py" <<'PYCODE'
+          # ACIRM_R13MPAA controller
+          from pathlib import Path
+          from urllib.request import Request, urlopen, urlretrieve
+          from urllib.parse import urljoin
+          import csv, datetime, gzip, hashlib, json, math, os, re, shutil, subprocess, sys, time, traceback
+          
+          STAGE = "ACIRM_R13MPAA_PUBLIC_SPI_SPECTRA_SCHEMA_SAFE_511_READOUT_NO_OG_CREATE"
+          BASE = Path(os.environ.get("GITHUB_WORKSPACE", "/tmp/acirm_r13mpaa"))
+          OUT = BASE / (STAGE + "_OUTPUT")
+          DATA = BASE / (STAGE + "_DATA")
+          OUT.mkdir(parents=True, exist_ok=True)
+          DATA.mkdir(parents=True, exist_ok=True)
+          
+          LOCKED = {
+              "stage": STAGE,
+              "purpose": "Inspect public SPI/SCW FITS products directly after R13MPZ-R1 showed IC/IDX/CAT/SCW were acquired but og_create did not generate og_spi.fits; read 511 only if a safe keV energy mapping and counts-like spectral array are present in public products.",
+              "locked_scw_ids": [
+                  "250400090010", "250400020010", "250400080010", "250400030010",
+                  "250400070021", "250400040010", "250400060010", "250400050010"
+              ],
+              "heasarc_scw_base": "https://heasarc.gsfc.nasa.gov/FTP/integral/data/scw/2504",
+              "line_keV": [508.0, 514.0],
+              "lower_sideband_keV": [490.0, 500.0],
+              "upper_sideband_keV": [522.0, 532.0],
+              "minimum_candidate_ratio": 1.2,
+              "safe_mapping_rule": "A readout is allowed only when finite monotonically increasing energy lower/upper arrays bracket all locked windows and a counts-like numeric array has an axis equal to the energy-bin count. Same-HDU mapping is strongest; same-file unique mapping is allowed; cross-file mapping is blocked.",
+              "claim_ceiling": "schema/readout diagnostic only; no evidence/proof/discovery claim",
+              "artifact_policy": "Do not include downloaded FITS files in final artifact. Keep JSON, CSV, logs only."
+          }
+          
+          LINE = tuple(LOCKED["line_keV"])
+          LOWER = tuple(LOCKED["lower_sideband_keV"])
+          UPPER = tuple(LOCKED["upper_sideband_keV"])
+          MIN_RATIO = LOCKED["minimum_candidate_ratio"]
+          
+          
+          def log(msg):
+              print(msg, flush=True)
+              with (OUT / "R13MPAA_PROGRESS.log").open("a", encoding="utf-8") as f:
+                  f.write(str(msg) + "\n")
+          
+          
+          def write_json(name, obj):
+              (OUT / name).write_text(json.dumps(obj, indent=2, ensure_ascii=False), encoding="utf-8")
+          
+          
+          def write_csv(name, rows, cols):
+              with (OUT / name).open("w", newline="", encoding="utf-8") as f:
+                  w = csv.DictWriter(f, fieldnames=cols)
+                  w.writeheader()
+                  for r in rows:
+                      w.writerow({c: r.get(c, "") for c in cols})
+          
+          
+          def sha256_file(path):
+              h = hashlib.sha256()
+              with open(path, "rb") as f:
+                  for b in iter(lambda: f.read(1024 * 1024), b""):
+                      h.update(b)
+              return h.hexdigest()
+          
+          
+          def final_decision(decision, next_stage, extra=None):
+              obj = {
+                  "stage": STAGE,
+                  "decision": decision,
+                  "next_stage": next_stage,
+                  "claim_ceiling": LOCKED["claim_ceiling"],
+                  "timestamp_utc": datetime.datetime.utcnow().isoformat() + "Z"
+              }
+              if extra:
+                  obj.update(extra)
+              write_json("R13MPAA_FINAL_DECISION.json", obj)
+              log("FINAL_DECISION: " + decision)
+              return obj
+          
+          write_json("R13MPAA_LOCKED_CONTEXT.json", LOCKED)
+          
+          try:
+              import numpy as np
+              from astropy.io import fits
+          except Exception as e:
+              final_decision("TECHNICAL_STOP_DEPENDENCY_IMPORT_FAILED", "REPAIR_NUMPY_ASTROPY_INSTALL", {"error": repr(e)})
+              sys.exit(0)
+          
+          
+          def fetch_text(url, timeout=40, max_bytes=5_000_000):
+              try:
+                  req = Request(url, headers={"User-Agent": "ACIRM-R13MPAA/1.0", "Accept": "text/html,text/plain,*/*"})
+                  with urlopen(req, timeout=timeout) as r:
+                      data = r.read(max_bytes)
+                      return True, r.geturl(), data.decode("utf-8", errors="replace"), ""
+              except Exception as e:
+                  return False, "", "", repr(e)[:500]
+          
+          
+          def extract_hrefs(html):
+              out = []
+              for m in re.finditer(r"<a\s+[^>]*href=[\"']([^\"']+)[\"'][^>]*>(.*?)</a>", html, flags=re.I | re.S):
+                  href = m.group(1).strip()
+                  label = re.sub(r"<[^>]+>", "", m.group(2))
+                  label = re.sub(r"\s+", " ", label).strip()
+                  out.append((href, label))
+              if not out:
+                  for m in re.finditer(r"href=[\"']([^\"']+)[\"']", html, flags=re.I):
+                      out.append((m.group(1).strip(), ""))
+              return out
+          
+          
+          def url_probe(url, timeout=30):
+              last = ""
+              for method in ["HEAD", "GET"]:
+                  try:
+                      headers = {"User-Agent": "ACIRM-R13MPAA/1.0"}
+                      if method == "GET":
+                          headers["Range"] = "bytes=0-0"
+                      req = Request(url, headers=headers, method=method)
+                      with urlopen(req, timeout=timeout) as r:
+                          cl = r.headers.get("Content-Length") or r.headers.get("Content-length")
+                          return {
+                              "ok": True,
+                              "status": getattr(r, "status", ""),
+                              "content_length": int(cl) if str(cl).isdigit() else None,
+                              "content_type": r.headers.get("Content-Type", ""),
+                              "final_url": r.geturl(),
+                              "error": ""
+                          }
+                  except Exception as e:
+                      last = repr(e)[:350]
+              return {"ok": False, "status": "", "content_length": None, "content_type": "", "final_url": "", "error": last}
+          
+          
+          def download_url(url, dest, timeout=1800):
+              dest.parent.mkdir(parents=True, exist_ok=True)
+              tmp = dest.with_suffix(dest.suffix + ".part")
+              if tmp.exists():
+                  tmp.unlink()
+              req = Request(url, headers={"User-Agent": "ACIRM-R13MPAA/1.0"})
+              with urlopen(req, timeout=timeout) as r, open(tmp, "wb") as f:
+                  shutil.copyfileobj(r, f, length=1024 * 1024)
+              tmp.rename(dest)
+              return dest
+          
+          
+          def candidate_priority(name):
+              low = name.lower()
+              score = 0
+              if low == "spi_spectra.fits.gz" or low == "spi_spectra.fits":
+                  score += 1000
+              if low.startswith("spi_"):
+                  score += 250
+              if any(k in low for k in ["spectra", "spectrum", "spec"]):
+                  score += 250
+              if any(k in low for k in ["energy", "ebound", "ebounds"]):
+                  score += 200
+              if low in ["swg.fits", "swg.fits.gz"]:
+                  score += 150
+              if any(k in low for k in ["gti", "science_param", "hk", "dead"]):
+                  score += 40
+              if low.endswith(".fits") or low.endswith(".fits.gz"):
+                  score += 10
+              return score
+          
+          log("Discovering and downloading public SPI/SCW FITS candidates.")
+          index_rows = []
+          probe_rows = []
+          download_rows = []
+          all_candidates = []
+          explicit_names = [
+              "spi_spectra.fits.gz", "spi_spectra.fits", "spi_spectrum.fits.gz", "spi_spectrum.fits",
+              "swg.fits", "swg.fits.gz", "spi_gti.fits.gz", "spi_hk.fits.gz",
+              "spi_science_param.fits.gz", "spi_dead.fits.gz"
+          ]
+          
+          for scw in LOCKED["locked_scw_ids"]:
+              base_url = f"{LOCKED['heasarc_scw_base']}/{scw}.001/"
+              ok, final_url, html, err = fetch_text(base_url)
+              hrefs = extract_hrefs(html) if ok else []
+              index_rows.append({"scw_id": scw, "index_url": base_url, "ok": ok, "final_url": final_url, "href_count": len(hrefs), "error": err})
+              for href, label in hrefs:
+                  fname = Path(href).name
+                  if fname.lower().endswith((".fits", ".fits.gz")):
+                      score = candidate_priority(fname)
+                      if score > 0:
+                          all_candidates.append({"source": "index", "scw_id": scw, "filename": fname, "url": urljoin(final_url or base_url, href), "priority": score})
+              for fname in explicit_names:
+                  all_candidates.append({"source": "explicit", "scw_id": scw, "filename": fname, "url": base_url + fname, "priority": candidate_priority(fname)})
+          
+          seen = set()
+          unique_candidates = []
+          for c in sorted(all_candidates, key=lambda r: (r["scw_id"], -r["priority"], r["filename"])):
+              key = (c["scw_id"], c["url"])
+              if key not in seen:
+                  seen.add(key)
+                  unique_candidates.append(c)
+          
+          max_total_download = 8 * 1024**3
+          max_file_size = 700 * 1024**2
+          total_downloaded = 0
+          local_files = []
+          for i, c in enumerate(unique_candidates, start=1):
+              h = url_probe(c["url"])
+              row = dict(c)
+              row.update(h)
+              probe_rows.append(row)
+              if not h["ok"]:
+                  continue
+              if h["content_length"] is not None and h["content_length"] > max_file_size:
+                  download_rows.append({**c, "download_ok": False, "path": "", "size_bytes": "", "sha256": "", "error": "SKIP_FILE_TOO_LARGE"})
+                  continue
+              if h["content_length"] is not None and total_downloaded + h["content_length"] > max_total_download:
+                  download_rows.append({**c, "download_ok": False, "path": "", "size_bytes": "", "sha256": "", "error": "SKIP_TOTAL_CAP"})
+                  continue
+              dest = DATA / c["scw_id"] / c["filename"]
+              try:
+                  log(f"Downloading {i}/{len(unique_candidates)} scw={c['scw_id']} file={c['filename']}")
+                  download_url(c["url"], dest)
+                  total_downloaded += dest.stat().st_size
+                  local_files.append({"scw_id": c["scw_id"], "path": str(dest), "filename": c["filename"], "source_url": c["url"]})
+                  download_rows.append({**c, "download_ok": True, "path": str(dest), "size_bytes": dest.stat().st_size, "sha256": sha256_file(dest), "error": ""})
+              except Exception as e:
+                  download_rows.append({**c, "download_ok": False, "path": str(dest), "size_bytes": "", "sha256": "", "error": repr(e)[:500]})
+          
+          write_csv("R13MPAA_SCW_INDEX_DISCOVERY.csv", index_rows, ["scw_id", "index_url", "ok", "final_url", "href_count", "error"])
+          write_csv("R13MPAA_PUBLIC_FITS_PROBES.csv", probe_rows, ["source", "scw_id", "filename", "url", "priority", "ok", "status", "content_length", "content_type", "final_url", "error"])
+          write_csv("R13MPAA_PUBLIC_FITS_DOWNLOADS.csv", download_rows, ["source", "scw_id", "filename", "url", "priority", "download_ok", "path", "size_bytes", "sha256", "error"])
+          
+          ENERGY_LO_NAMES = {"E_MIN", "E_LO", "ENERG_LO", "ENERGY_LO", "CHANNEL_E_MIN", "EMIN", "E_LOW", "EBOUND_LO", "E_MIN_KEV", "ENER_LO", "ENERGY_MIN"}
+          ENERGY_HI_NAMES = {"E_MAX", "E_HI", "ENERG_HI", "ENERGY_HI", "CHANNEL_E_MAX", "EMAX", "E_HIGH", "EBOUND_HI", "E_MAX_KEV", "ENER_HI", "ENERGY_MAX"}
+          COUNT_NAME_HINTS = ["COUNT", "COUNTS", "SPECTR", "SPEC", "RATE", "FLUX"]
+          BAD_COUNT_HINTS = ["ERR", "ERROR", "QUALITY", "FLAG", "EXPOS", "TIME", "DEAD", "GTI", "FRAC"]
+          
+          schema_rows = []
+          energy_map_rows = []
+          count_array_rows = []
+          readout_rows = []
+          errors = []
+          
+          
+          def col_unit(hdu, col_name):
+              try:
+                  for c in hdu.columns:
+                      if c.name == col_name:
+                          return str(c.unit or "")
+              except Exception:
+                  return ""
+              return ""
+          
+          
+          def numeric_array_from_column(data, col):
+              try:
+                  arr = np.asarray(data[col])
+                  if arr.size == 0:
+                      return None
+                  if not np.issubdtype(arr.dtype, np.number):
+                      arr = arr.astype(float)
+                  return np.asarray(arr, dtype=float)
+              except Exception:
+                  return None
+          
+          
+          def safe_energy_mapping(emin, emax, lo_unit="", hi_unit=""):
+              try:
+                  emin = np.asarray(emin, dtype=float).ravel()
+                  emax = np.asarray(emax, dtype=float).ravel()
+                  if len(emin) != len(emax) or len(emin) < 2:
+                      return False, "bad_length"
+                  if not np.all(np.isfinite(emin)) or not np.all(np.isfinite(emax)):
+                      return False, "nonfinite_edges"
+                  if not np.all(emax > emin):
+                      return False, "nonpositive_bins"
+                  if np.sum(np.diff(emin) < -1e-6) > 0 or np.sum(np.diff(emax) < -1e-6) > 0:
+                      return False, "nonmonotonic_edges"
+                  if not (np.nanmin(emin) <= LOWER[0] and np.nanmax(emax) >= UPPER[1]):
+                      return False, "does_not_bracket_locked_windows"
+                  widths = emax - emin
+                  if np.nanmedian(widths) <= 0 or np.nanmedian(widths) > 200:
+                      return False, "implausible_keV_widths"
+                  unit_text = (str(lo_unit) + " " + str(hi_unit)).lower()
+                  unit_ok = ("kev" in unit_text) or (np.nanmax(emax) < 20000 and np.nanmin(emin) >= -1)
+                  if not unit_ok:
+                      return False, "unit_not_keV_or_values_not_keV_like"
+                  line_idx = np.where((emax > LINE[0]) & (emin < LINE[1]))[0]
+                  lower_idx = np.where((emax > LOWER[0]) & (emin < LOWER[1]))[0]
+                  upper_idx = np.where((emax > UPPER[0]) & (emin < UPPER[1]))[0]
+                  if len(line_idx) == 0 or len(lower_idx) == 0 or len(upper_idx) == 0:
+                      return False, "missing_locked_window_bins"
+                  return True, "safe_keV_mapping"
+              except Exception as e:
+                  return False, "exception_" + repr(e)[:100]
+          
+          energy_maps = []
+          count_arrays = []
+          
+          for lf in local_files:
+              path = Path(lf["path"])
+              scw_id = lf["scw_id"]
+              try:
+                  with fits.open(path, memmap=False) as hdul:
+                      for hdu_i, hdu in enumerate(hdul):
+                          hdu_name = getattr(hdu, "name", "")
+                          data = getattr(hdu, "data", None)
+                          cols = []
+                          if hasattr(hdu, "columns") and hdu.columns is not None:
+                              try:
+                                  cols = list(hdu.columns.names)
+                              except Exception:
+                                  cols = []
+                          shape = ""
+                          try:
+                              if data is not None and not cols:
+                                  shape = str(np.asarray(data).shape)
+                              elif data is not None and cols:
+                                  shape = str(data.shape)
+                          except Exception:
+                              shape = ""
+                          schema_rows.append({
+                              "scw_id": scw_id,
+                              "filename": path.name,
+                              "path": str(path),
+                              "hdu_index": hdu_i,
+                              "hdu_name": hdu_name,
+                              "hdu_class": hdu.__class__.__name__,
+                              "columns": "|".join(map(str, cols[:80])),
+                              "data_shape": shape,
+                              "n_columns": len(cols)
+                          })
+                          if data is None:
+                              continue
+                          upper_map = {str(c).upper(): c for c in cols}
+                          lo_col = None
+                          hi_col = None
+                          for k in ENERGY_LO_NAMES:
+                              if k in upper_map:
+                                  lo_col = upper_map[k]
+                                  break
+                          for k in ENERGY_HI_NAMES:
+                              if k in upper_map:
+                                  hi_col = upper_map[k]
+                                  break
+                          if lo_col and hi_col:
+                              emin = numeric_array_from_column(data, lo_col)
+                              emax = numeric_array_from_column(data, hi_col)
+                              if emin is not None and emax is not None:
+                                  lo_unit = col_unit(hdu, lo_col)
+                                  hi_unit = col_unit(hdu, hi_col)
+                                  safe, reason = safe_energy_mapping(emin, emax, lo_unit, hi_unit)
+                                  row = {
+                                      "scw_id": scw_id,
+                                      "filename": path.name,
+                                      "hdu_index": hdu_i,
+                                      "hdu_name": hdu_name,
+                                      "lo_col": lo_col,
+                                      "hi_col": hi_col,
+                                      "lo_unit": lo_unit,
+                                      "hi_unit": hi_unit,
+                                      "n_bins": int(len(np.asarray(emin).ravel())),
+                                      "emin_min": float(np.nanmin(emin)),
+                                      "emax_max": float(np.nanmax(emax)),
+                                      "safe_mapping": bool(safe),
+                                      "mapping_reason": reason
+                                  }
+                                  energy_map_rows.append(row)
+                                  energy_maps.append({**row, "emin": np.asarray(emin, dtype=float).ravel(), "emax": np.asarray(emax, dtype=float).ravel(), "file_path": str(path)})
+                          if cols:
+                              for col in cols:
+                                  cu = str(col).upper()
+                                  if not any(h in cu for h in COUNT_NAME_HINTS):
+                                      continue
+                                  if any(h in cu for h in BAD_COUNT_HINTS):
+                                      continue
+                                  arr = numeric_array_from_column(data, col)
+                                  if arr is None:
+                                      continue
+                                  arr_shape = tuple(arr.shape)
+                                  if arr.size == 0:
+                                      continue
+                                  finite_frac = float(np.isfinite(arr).sum()) / float(arr.size)
+                                  row = {
+                                      "scw_id": scw_id,
+                                      "filename": path.name,
+                                      "hdu_index": hdu_i,
+                                      "hdu_name": hdu_name,
+                                      "array_name": col,
+                                      "array_shape": str(arr_shape),
+                                      "array_ndim": arr.ndim,
+                                      "finite_fraction": finite_frac,
+                                      "array_min": float(np.nanmin(arr)) if np.isfinite(arr).any() else "",
+                                      "array_max": float(np.nanmax(arr)) if np.isfinite(arr).any() else ""
+                                  }
+                                  count_array_rows.append(row)
+                                  count_arrays.append({**row, "array": arr, "file_path": str(path)})
+                          else:
+                              try:
+                                  arr = np.asarray(data, dtype=float)
+                                  if arr.size > 0:
+                                      row = {
+                                          "scw_id": scw_id,
+                                          "filename": path.name,
+                                          "hdu_index": hdu_i,
+                                          "hdu_name": hdu_name,
+                                          "array_name": "IMAGE_OR_PRIMARY_ARRAY",
+                                          "array_shape": str(arr.shape),
+                                          "array_ndim": arr.ndim,
+                                          "finite_fraction": float(np.isfinite(arr).sum()) / float(arr.size),
+                                          "array_min": float(np.nanmin(arr)) if np.isfinite(arr).any() else "",
+                                          "array_max": float(np.nanmax(arr)) if np.isfinite(arr).any() else ""
+                                      }
+                                      count_array_rows.append(row)
+                                      count_arrays.append({**row, "array": arr, "file_path": str(path)})
+                              except Exception:
+                                  pass
+              except Exception as e:
+                  errors.append({"file": str(path), "error": repr(e)[:500], "traceback": traceback.format_exc()[:1500]})
+          
+          for ca in count_arrays:
+              arr = ca["array"]
+              candidate_maps = [m for m in energy_maps if m["file_path"] == ca["file_path"] and m["safe_mapping"]]
+              if not candidate_maps:
+                  continue
+              candidate_maps = sorted(candidate_maps, key=lambda m: (m["hdu_index"] != ca["hdu_index"], abs(m["n_bins"] - (arr.shape[-1] if arr.ndim else 0))))
+              for em in candidate_maps:
+                  emin, emax = em["emin"], em["emax"]
+                  axes = [ax for ax, dim in enumerate(arr.shape) if dim == len(emin)]
+                  if not axes:
+                      continue
+                  axis = axes[-1]
+                  line_idx = np.where((emax > LINE[0]) & (emin < LINE[1]))[0]
+                  lower_idx = np.where((emax > LOWER[0]) & (emin < LOWER[1]))[0]
+                  upper_idx = np.where((emax > UPPER[0]) & (emin < UPPER[1]))[0]
+                  try:
+                      line_val = float(np.nansum(np.take(arr, line_idx, axis=axis)))
+                      lower_val = float(np.nansum(np.take(arr, lower_idx, axis=axis)))
+                      upper_val = float(np.nansum(np.take(arr, upper_idx, axis=axis)))
+                      side = 0.5 * (lower_val + upper_val)
+                      ratio = line_val / side if side > 0 else None
+                      readout_rows.append({
+                          "scw_id": ca["scw_id"],
+                          "filename": ca["filename"],
+                          "counts_hdu_index": ca["hdu_index"],
+                          "counts_hdu_name": ca["hdu_name"],
+                          "counts_array_name": ca["array_name"],
+                          "counts_array_shape": ca["array_shape"],
+                          "energy_hdu_index": em["hdu_index"],
+                          "energy_hdu_name": em["hdu_name"],
+                          "energy_lo_col": em["lo_col"],
+                          "energy_hi_col": em["hi_col"],
+                          "energy_bins": em["n_bins"],
+                          "energy_axis": axis,
+                          "mapping_relation": "same_hdu" if em["hdu_index"] == ca["hdu_index"] else "same_file_unique_or_candidate",
+                          "line_508_514_value": line_val,
+                          "lower_490_500_value": lower_val,
+                          "upper_522_532_value": upper_val,
+                          "sideband_mean": side,
+                          "line_to_sideband_ratio": ratio,
+                          "candidate_ratio_ge_1p2": bool(ratio is not None and ratio >= MIN_RATIO),
+                          "claim": "PUBLIC_PRODUCT_SCHEMA_READOUT_DIAGNOSTIC_ONLY"
+                      })
+                      break
+                  except Exception as e:
+                      errors.append({"file": ca["file_path"], "array": ca["array_name"], "error": "readout_" + repr(e)[:300]})
+          
+          write_csv("R13MPAA_FITS_SCHEMA_MANIFEST.csv", schema_rows, ["scw_id", "filename", "path", "hdu_index", "hdu_name", "hdu_class", "columns", "data_shape", "n_columns"])
+          write_csv("R13MPAA_ENERGY_MAPPING_CANDIDATES.csv", energy_map_rows, ["scw_id", "filename", "hdu_index", "hdu_name", "lo_col", "hi_col", "lo_unit", "hi_unit", "n_bins", "emin_min", "emax_max", "safe_mapping", "mapping_reason"])
+          write_csv("R13MPAA_COUNT_ARRAY_CANDIDATES.csv", count_array_rows, ["scw_id", "filename", "hdu_index", "hdu_name", "array_name", "array_shape", "array_ndim", "finite_fraction", "array_min", "array_max"])
+          write_csv("R13MPAA_GUARDED_PUBLIC_PRODUCT_511_READOUT.csv", readout_rows if readout_rows else [{"claim": "NO_SAFE_PUBLIC_PRODUCT_READOUT_EXTRACTED"}], ["scw_id", "filename", "counts_hdu_index", "counts_hdu_name", "counts_array_name", "counts_array_shape", "energy_hdu_index", "energy_hdu_name", "energy_lo_col", "energy_hi_col", "energy_bins", "energy_axis", "mapping_relation", "line_508_514_value", "lower_490_500_value", "upper_522_532_value", "sideband_mean", "line_to_sideband_ratio", "candidate_ratio_ge_1p2", "claim"])
+          write_json("R13MPAA_ERRORS.json", {"errors_count": len(errors), "errors": errors[:200]})
+          
+          if readout_rows:
+              line_sum = sum(float(r["line_508_514_value"]) for r in readout_rows)
+              lower_sum = sum(float(r["lower_490_500_value"]) for r in readout_rows)
+              upper_sum = sum(float(r["upper_522_532_value"]) for r in readout_rows)
+              side = 0.5 * (lower_sum + upper_sum)
+              ratio = line_sum / side if side > 0 else None
+              candidate = bool(ratio is not None and ratio >= MIN_RATIO)
+          else:
+              line_sum = lower_sum = upper_sum = side = ratio = None
+              candidate = False
+          
+          summary = {
+              "stage": STAGE,
+              "downloaded_fits_count": len(local_files),
+              "downloaded_total_bytes": int(total_downloaded),
+              "schema_hdu_rows": len(schema_rows),
+              "energy_mapping_candidate_count": len(energy_map_rows),
+              "safe_energy_mapping_count": sum(1 for r in energy_map_rows if str(r.get("safe_mapping")) == "True" or r.get("safe_mapping") is True),
+              "count_array_candidate_count": len(count_array_rows),
+              "readout_rows": len(readout_rows),
+              "combined_line_sum": line_sum,
+              "combined_lower_sum": lower_sum,
+              "combined_upper_sum": upper_sum,
+              "combined_sideband_mean": side,
+              "combined_line_to_sideband_ratio": ratio,
+              "minimum_candidate_ratio": MIN_RATIO,
+              "candidate_ratio_ge_1p2": candidate,
+              "errors_count": len(errors),
+              "claim_ceiling": LOCKED["claim_ceiling"]
+          }
+          write_json("R13MPAA_GUARDED_PUBLIC_PRODUCT_NUMERIC_SUMMARY.json", summary)
+          
+          if candidate:
+              decision = "PUBLIC_SPI_SPECTRA_SCHEMA_511_RATIO_CANDIDATE_DIAGNOSTIC_ONLY_REQUIRES_OSA_BACKGROUND_RESPONSE_AUDIT"
+              next_stage = "RUN_OFF_TIME_OFF_ENERGY_NULLS_AND_OFFICIAL_OSA_BACKGROUND_RESPONSE_REPLICATION_BEFORE_ANY_CLAIM"
+          elif readout_rows:
+              decision = "SAFE_PUBLIC_SPI_SPECTRA_SCHEMA_511_READOUT_COMPLETED_NO_LOCKED_RATIO_EXCESS"
+              next_stage = "STOP_OR_RUN_ADDITIONAL_PUBLIC_PRODUCT_CONTROLS_NO_DETECTION_CLAIM"
+          elif len(energy_map_rows) > 0 or len(count_array_rows) > 0:
+              decision = "PUBLIC_SPI_PRODUCTS_SCHEMA_INSPECTED_NO_SAFE_KEV_COUNTS_PAIR_FOR_511_READOUT"
+              next_stage = "OFFICIAL_OSA_GENERATION_OR_MANUAL_SPI_SCHEMA_AUDIT_REQUIRED"
+          else:
+              decision = "PUBLIC_SCW_FITS_DOWNLOADED_BUT_NO_RELEVANT_SPI_SPECTRAL_SCHEMA_FOUND"
+              next_stage = "OFFICIAL_OSA_GENERATION_REQUIRED"
+          final_decision(decision, next_stage, {"summary": summary})
+          
+          try:
+              shutil.rmtree(DATA)
+          except Exception:
+              pass
+          PYCODE
+          python3 "$GITHUB_WORKSPACE/r13mpaa_controller.py" > "$OUT/R13MPAA_CONTROLLER_STDOUT.txt" 2> "$OUT/R13MPAA_CONTROLLER_STDERR.txt"
+          CODE=$?
+          echo "controller_exit_code=$CODE" > "$OUT/R13MPAA_STEP_STATUS.log"
+          if [ ! -f "$OUT/R13MPAA_FINAL_DECISION.json" ]; then
+            cat > "$OUT/R13MPAA_FINAL_DECISION.json" <<'JSON'
+          {
+            "stage": "ACIRM_R13MPAA_PUBLIC_SPI_SPECTRA_SCHEMA_SAFE_511_READOUT_NO_OG_CREATE",
+            "decision": "CONTROLLER_FAILED_BEFORE_FINAL_DECISION",
+            "next_stage": "REPAIR_FROM_STDOUT_STDERR",
+            "claim_ceiling": "no reliable result"
+          }
+          JSON
+          fi
+          cd "$GITHUB_WORKSPACE"
+          ZIP="$GITHUB_WORKSPACE/${STAGE}_RESULTS.zip"
+          SHA="$ZIP.sha256.txt"
+          rm -f "$ZIP" "$SHA"
+          rm -rf "$GITHUB_WORKSPACE/${STAGE}_DATA"
+          zip -r "$ZIP" "$(basename "$OUT")"
+          sha256sum "$ZIP" > "$SHA"
+          exit 0
+
+      - name: Upload artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ACIRM_R13MPAA_PUBLIC_SPI_SPECTRA_SCHEMA_SAFE_511_READOUT_NO_OG_CREATE_RESULTS
+          path: |
+            ACIRM_R13MPAA_PUBLIC_SPI_SPECTRA_SCHEMA_SAFE_511_READOUT_NO_OG_CREATE_RESULTS.zip
+            ACIRM_R13MPAA_PUBLIC_SPI_SPECTRA_SCHEMA_SAFE_511_READOUT_NO_OG_CREATE_RESULTS.zip.sha256.txt
+          retention-days: 7
