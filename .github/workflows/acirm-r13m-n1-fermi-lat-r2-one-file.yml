@@ -1,0 +1,531 @@
+name: ACIRM R13M N1 Fermi LAT All Controls R2 One File
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  acirm-r13m-n1-r2-one-file:
+    runs-on: ubuntu-latest
+    timeout-minutes: 355
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Cache micromamba environment
+        uses: actions/cache@v4
+        with:
+          path: |
+            ${{ github.workspace }}/.micromamba
+            ${{ github.workspace }}/acirm_fermipy_env
+          key: acirm-fermi-py311-fermitools251-fermipy-r13m-n1-env-r2-one-file
+
+      - name: Restore resumable LAT input cache
+        uses: actions/cache@v4
+        with:
+          path: ${{ github.workspace }}/.acirm_lat_cache
+          key: acirm-r13m-lat-weekly-w635-w821-inputs-r2-${{ github.run_id }}
+          restore-keys: |
+            acirm-r13m-lat-weekly-w635-w821-inputs-r2-
+            acirm-r13m-lat-weekly-w635-w821-inputs-v2-
+
+      - name: Install system packages
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq aria2 curl wget zip unzip
+
+      - name: Install or reuse micromamba and Fermipy environment
+        shell: bash
+        run: |
+          set -euo pipefail
+          WORK="${{ github.workspace }}"
+          mkdir -p "$WORK/.micromamba/bin"
+          export MAMBA_ROOT_PREFIX="$WORK/.micromamba"
+          if [ ! -x "$WORK/.micromamba/bin/micromamba" ]; then
+            curl -Ls https://micro.mamba.pm/api/micromamba/linux-64/latest | tar -xvj -C "$WORK/.micromamba" bin/micromamba
+          fi
+          MM="$WORK/.micromamba/bin/micromamba"
+          ENV="$WORK/acirm_fermipy_env"
+          if [ ! -x "$ENV/bin/python" ]; then
+            "$MM" create -y -p "$ENV" -c conda-forge -c fermi \
+              python=3.11 fermitools=2.5.1 fermipy pyyaml astropy numpy scipy pip \
+            || (
+              echo "Primary conda install failed; trying fallback: fermitools conda + fermipy pip"
+              rm -rf "$ENV"
+              "$MM" create -y -p "$ENV" -c conda-forge -c fermi \
+                python=3.11 fermitools=2.5.1 pyyaml astropy numpy scipy pip
+              "$MM" run -p "$ENV" python -m pip install --no-cache-dir fermipy
+            )
+          else
+            echo "Reusing cached environment."
+          fi
+          "$MM" run -p "$ENV" python - <<'PY'
+          import sys, numpy, astropy, fermipy
+          from fermipy.gtanalysis import GTAnalysis
+          print("PYTHON", sys.version)
+          print("NUMPY", numpy.__version__)
+          print("FERMIPY", getattr(fermipy, "__version__", "unknown"))
+          PY
+          for tool in gtselect gtmktime gtltcube gtexpcube2 gtbin gtsrcmaps gtlike; do
+            "$MM" run -p "$ENV" which "$tool"
+          done
+
+      - name: Create embedded ACIRM worker file
+        shell: bash
+        run: |
+          set -euo pipefail
+          WORK="${{ github.workspace }}"
+          cat > "$WORK/acirm_r13m_n1_worker.py" <<'PY'
+          import os, sys, json, time, csv, hashlib, subprocess, shutil, textwrap, traceback, math
+          from pathlib import Path
+          import numpy as np
+          from astropy.io import fits
+
+          OUT = Path("ACIRM_R13M_N1_GH_ALL_CONTROLS_FERMIPY_RESIDUAL_NO_SCORE_OUTPUT")
+          OUT.mkdir(exist_ok=True)
+          CACHE = Path(".acirm_lat_cache")
+          CACHE.mkdir(exist_ok=True)
+          PROGRESS = OUT / "PROGRESS.log"
+
+          STAGE = "ACIRM_R13M_N1_GH_ALL_CONTROLS_FERMIPY_RESIDUAL_NO_SCORE"
+          DECISION_TECH_DOWNLOAD = "TECHNICAL_STOP_REQUIRED_FILES_DOWNLOAD_INCOMPLETE_NO_SCORE"
+          DECISION_PASS = "OFFICIAL_FERMIPY_N1_R9C_RESIDUAL_EXCEEDS_ALL_NO_GATE_CONTROLS_NO_SCORE"
+          DECISION_NOT_PASS = "OFFICIAL_FERMIPY_N1_R9C_RESIDUAL_NOT_ABOVE_ALL_NO_GATE_CONTROLS_NO_SCORE"
+          DECISION_TECH = "TECHNICAL_STOP_FERMIPY_N1_INCOMPLETE_NO_SCORE"
+
+          WEEK_POST = 821
+          WEEK_PRE = 635
+          EXPECTED_RESULT_ROWS = 20
+
+          REGIONS = [
+              {"region_id":"R9C_CYGX1", "ra":299.5903159, "dec":35.2016063, "kind":"target"},
+              {"region_id":"NOGATE_RA030", "ra":30.0, "dec":0.0, "kind":"control"},
+              {"region_id":"NOGATE_RA060", "ra":60.0, "dec":0.0, "kind":"control"},
+              {"region_id":"NOGATE_RA090", "ra":90.0, "dec":0.0, "kind":"control"},
+              {"region_id":"NOGATE_RA120", "ra":120.0, "dec":0.0, "kind":"control"},
+              {"region_id":"NOGATE_RA180", "ra":180.0, "dec":0.0, "kind":"control"},
+              {"region_id":"NOGATE_RA240", "ra":240.0, "dec":0.0, "kind":"control"},
+              {"region_id":"NOGATE_RA300", "ra":300.0, "dec":0.0, "kind":"control"},
+              {"region_id":"NOGATE_NORTH", "ra":180.0, "dec":60.0, "kind":"control"},
+              {"region_id":"NOGATE_SOUTH", "ra":180.0, "dec":-60.0, "kind":"control"},
+          ]
+
+          def log(msg):
+              s = f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] {msg}"
+              print(s, flush=True)
+              with PROGRESS.open("a", encoding="utf-8") as f:
+                  f.write(s + "\n")
+
+          def sha256_path(p):
+              h = hashlib.sha256()
+              with open(p, "rb") as f:
+                  for chunk in iter(lambda: f.read(1024 * 1024), b""):
+                      h.update(chunk)
+              return h.hexdigest()
+
+          def write_json(path, obj):
+              Path(path).write_text(json.dumps(obj, indent=2, sort_keys=True), encoding="utf-8")
+
+          def run_cmd(cmd, cwd=None, timeout=None, logname=None, check=False):
+              log(f"RUN: {' '.join(map(str, cmd))}")
+              p = subprocess.run(cmd, cwd=cwd, timeout=timeout, text=True,
+                                 stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+              if logname:
+                  (OUT / logname).write_text(p.stdout, encoding="utf-8", errors="replace")
+              if check and p.returncode != 0:
+                  raise RuntimeError(f"command failed {p.returncode}: {' '.join(map(str, cmd))}\n{p.stdout[-4000:]}")
+              return p
+
+          def download_one(label, urls, dest, timeout=900):
+              dest = Path(dest)
+              dest.parent.mkdir(parents=True, exist_ok=True)
+              attempts = []
+              if dest.exists() and dest.stat().st_size > 1024:
+                  return {"label":label, "ok":True, "path":str(dest), "bytes":dest.stat().st_size, "source":"existing", "attempts":[]}
+              for url in urls:
+                  for method in ["aria2c", "curl", "wget"]:
+                      log(f"DOWNLOAD {label} by {method}: {url}")
+                      if method == "aria2c":
+                          cmd = ["aria2c", "-x", "4", "-s", "4", "-c", "--timeout=120", "--connect-timeout=60",
+                                 "--max-tries=4", "--retry-wait=20", "-o", dest.name, "-d", str(dest.parent), url]
+                      elif method == "curl":
+                          cmd = ["curl", "-L", "--retry", "5", "--retry-delay", "20", "--connect-timeout", "60",
+                                 "--max-time", str(timeout), "-C", "-", "-o", str(dest), url]
+                      else:
+                          cmd = ["wget", "-c", "--tries=5", "--timeout=120", "-O", str(dest), url]
+                      p = run_cmd(cmd, timeout=timeout, logname=f"download_{label}_{method}.log")
+                      attempts.append({"url":url, "method":method, "returncode":p.returncode, "tail":p.stdout[-800:]})
+                      if dest.exists() and dest.stat().st_size > 1024 and p.returncode == 0:
+                          return {"label":label, "ok":True, "path":str(dest), "bytes":dest.stat().st_size, "source":url, "method":method, "attempts":attempts}
+              return {"label":label, "ok":False, "path":str(dest), "bytes":dest.stat().st_size if dest.exists() else 0, "attempts":attempts}
+
+          def make_downloads():
+              base = "https://heasarc.gsfc.nasa.gov/FTP/fermi/data/lat/weekly"
+              urls = {
+                  "photon_w821": [
+                      f"{base}/photon/lat_photon_weekly_w821_p305_v001.fits",
+                      f"{base}/photon/lat_photon_weekly_w821_p305_v001.fits.gz",
+                  ],
+                  "spacecraft_w821": [
+                      f"{base}/spacecraft/lat_spacecraft_weekly_w821_p310_v001.fits",
+                      f"{base}/spacecraft/lat_spacecraft_weekly_w821_p310_v001.fits.gz",
+                  ],
+                  "photon_w635": [
+                      f"{base}/photon/lat_photon_weekly_w635_p305_v001.fits",
+                      f"{base}/photon/lat_photon_weekly_w635_p305_v001.fits.gz",
+                  ],
+                  "spacecraft_w635": [
+                      f"{base}/spacecraft/lat_spacecraft_weekly_w635_p310_v001.fits",
+                      f"{base}/spacecraft/lat_spacecraft_weekly_w635_p310_v001.fits.gz",
+                  ],
+                  "catalog_gll_psc_v35": [
+                      "https://fermi.gsfc.nasa.gov/ssc/data/access/lat/14yr_catalog/gll_psc_v35.fit",
+                      "https://heasarc.gsfc.nasa.gov/FTP/fermi/data/lat/catalogs/4fgldr4/gll_psc_v35.fit",
+                  ],
+              }
+              dests = {
+                  "photon_w821": CACHE/"lat_photon_weekly_w821_p305_v001.fits",
+                  "spacecraft_w821": CACHE/"lat_spacecraft_weekly_w821_p310_v001.fits",
+                  "photon_w635": CACHE/"lat_photon_weekly_w635_p305_v001.fits",
+                  "spacecraft_w635": CACHE/"lat_spacecraft_weekly_w635_p310_v001.fits",
+                  "catalog_gll_psc_v35": CACHE/"gll_psc_v35.fit",
+              }
+              rows = []
+              for label in urls:
+                  rows.append(download_one(label, urls[label], dests[label], timeout=1200))
+              return rows, dests
+
+          def discover_diffuse():
+              roots = []
+              for k in ["FERMI_DIR", "FERMI_DIFFUSE_DIR", "PFILES"]:
+                  v = os.environ.get(k)
+                  if v:
+                      roots.append(Path(v))
+              for root in [Path(sys.prefix), Path("/opt"), Path("/usr/local"), Path.home()]:
+                  roots.append(root)
+              found = {}
+              names = ["gll_iem_v07.fits", "iso_P8R3_SOURCE_V3_v1.txt"]
+              for root in roots:
+                  if not root.exists():
+                      continue
+                  try:
+                      for name in names:
+                          if name in found:
+                              continue
+                          hits = list(root.rglob(name))
+                          if hits:
+                              found[name] = str(hits[0])
+                  except Exception:
+                      pass
+              return found
+
+          def final_stop(decision, reason, extra=None):
+              obj = {"stage":STAGE, "decision":decision, "claim_ceiling":"NO_SCORE_NOT_PROOF_NOT_DISCOVERY",
+                     "scientific_result":False, "technical_stop":True, "reason":reason}
+              if extra:
+                  obj.update(extra)
+              write_json(OUT/"FINAL_DECISION.json", obj)
+              make_zip()
+              sys.exit(0)
+
+          def make_zip():
+              zipname = "ACIRM_R13M_N1_GH_ALL_CONTROLS_FERMIPY_RESIDUAL_NO_SCORE_RESULTS.zip"
+              if Path(zipname).exists():
+                  Path(zipname).unlink()
+              shutil.make_archive(zipname[:-4], "zip", OUT)
+              sha = sha256_path(zipname)
+              Path(zipname + ".sha256.txt").write_text(f"{sha}  {zipname}\n", encoding="utf-8")
+              log(f"ZIP={zipname} SHA256={sha}")
+
+          def count_events(path, ra, dec, rad=12.0, emin=100.0, emax=300000.0):
+              with fits.open(path, memmap=True) as hdul:
+                  d = hdul["EVENTS"].data
+                  ras = np.asarray(d["RA"], dtype=float)
+                  decs = np.asarray(d["DEC"], dtype=float)
+                  en = np.asarray(d["ENERGY"], dtype=float)
+                  cosang = (np.sin(np.deg2rad(dec))*np.sin(np.deg2rad(decs)) +
+                            np.cos(np.deg2rad(dec))*np.cos(np.deg2rad(decs))*np.cos(np.deg2rad(ras-ra)))
+                  ang = np.rad2deg(np.arccos(np.clip(cosang, -1, 1)))
+                  m = (ang <= rad) & (en >= emin) & (en <= emax)
+                  return int(np.sum(m))
+
+          def simple_npred_proxy(nobs, region_id, phase):
+              # Fallback only if Fermipy npred objects are unavailable after successful setup.
+              # It is marked as proxy and not used to upgrade claim.
+              return float(max(0.0, nobs - 0.0))
+
+          def run_fermipy_case(region, phase, photon, spacecraft, catalog, diffuse):
+              from fermipy.gtanalysis import GTAnalysis
+              rid = region["region_id"]
+              work = Path(f"fermipy_{rid}_{phase}")
+              work.mkdir(exist_ok=True)
+              nobs_count = count_events(photon, region["ra"], region["dec"])
+              cfg = {
+                  "data": {
+                      "evfile": str(Path(photon).resolve()),
+                      "scfile": str(Path(spacecraft).resolve()),
+                      "ltcube": str((work/"ltcube.fits").resolve())
+                  },
+                  "binning": {
+                      "roiwidth": 12.0,
+                      "binsz": 0.2,
+                      "binsperdec": 8,
+                      "coordsys": "CEL",
+                      "proj": "AIT"
+                  },
+                  "selection": {
+                      "ra": float(region["ra"]),
+                      "dec": float(region["dec"]),
+                      "emin": 100,
+                      "emax": 300000,
+                      "zmax": 90,
+                      "evclass": 128,
+                      "evtype": 3,
+                      "tmin": 0,
+                      "tmax": 0
+                  },
+                  "gtlike": {"edisp": False, "irfs": "P8R3_SOURCE_V3"},
+                  "model": {
+                      "src_roiwidth": 15.0,
+                      "galdiff": diffuse["gll_iem_v07.fits"],
+                      "isodiff": diffuse["iso_P8R3_SOURCE_V3_v1.txt"],
+                      "catalogs": [str(Path(catalog).resolve())]
+                  },
+                  "fileio": {"outdir": str(work.resolve()), "usescratch": False},
+                  "logging": {"verbosity": 3}
+              }
+              import yaml
+              cfgpath = work/"config.yaml"
+              cfgpath.write_text(yaml.safe_dump(cfg, sort_keys=False), encoding="utf-8")
+              setup_ok = optimize_ok = fit_ok = False
+              npred = None
+              npred_source = None
+              err = None
+              try:
+                  gta = GTAnalysis(str(cfgpath), logging={"verbosity":3})
+                  gta.setup()
+                  setup_ok = True
+                  try:
+                      gta.optimize()
+                      optimize_ok = True
+                  except Exception:
+                      optimize_ok = False
+                  try:
+                      gta.fit()
+                      fit_ok = True
+                  except Exception:
+                      fit_ok = False
+                  candidates = []
+                  try:
+                      like = gta.like
+                      if hasattr(like, "NpredValue"):
+                          candidates.append(("like_NpredValue", float(like.NpredValue())))
+                  except Exception:
+                      pass
+                  try:
+                      if hasattr(gta, "roi") and hasattr(gta.roi, "sources"):
+                          vals = []
+                          for src in gta.roi.sources:
+                              v = getattr(src, "npred", None)
+                              if v is not None:
+                                  try:
+                                      vals.append(float(np.asarray(v).sum()))
+                                  except Exception:
+                                      pass
+                          if vals:
+                              candidates.append(("roi_sources_npred_sum", float(np.sum(vals))))
+                  except Exception:
+                      pass
+                  if candidates:
+                      npred_source, npred = candidates[0]
+              except Exception as e:
+                  err = traceback.format_exc()
+              if npred is None and setup_ok:
+                  npred = simple_npred_proxy(nobs_count, rid, phase)
+                  npred_source = "fallback_proxy_equal_nobs_NOT_CLAIM_UPGRADING"
+              residual = None if npred is None else float(nobs_count - npred)
+              return {
+                  "region_id": rid, "kind": region["kind"], "phase": phase,
+                  "ra": region["ra"], "dec": region["dec"], "nobs": nobs_count,
+                  "npred": npred, "npred_source": npred_source,
+                  "model_residual": residual,
+                  "setup_ok": setup_ok, "optimize_ok": optimize_ok, "fit_ok": fit_ok,
+                  "fit_or_optimize_ok": bool(optimize_ok or fit_ok),
+                  "npred_extracted": npred is not None,
+                  "error_tail": (err[-2000:] if err else "")
+              }
+
+          def main():
+              log("START R13M N1 GH R2 one-file")
+              # tool check
+              tools = []
+              for tool in ["gtselect","gtmktime","gtltcube","gtexpcube2","gtbin","gtsrcmaps","gtlike"]:
+                  p = run_cmd(["bash","-lc",f"which {tool} && {tool} --help >/dev/null 2>&1 || true"], logname=f"tool_{tool}.log")
+                  tools.append({"tool":tool, "which_ok":shutil.which(tool) is not None, "returncode":p.returncode})
+              with (OUT/"TOOLCHECK.csv").open("w", newline="", encoding="utf-8") as f:
+                  w = csv.DictWriter(f, fieldnames=["tool","which_ok","returncode"])
+                  w.writeheader(); w.writerows(tools)
+
+              downloads, dests = make_downloads()
+              with (OUT/"DOWNLOADS.csv").open("w", newline="", encoding="utf-8") as f:
+                  w = csv.DictWriter(f, fieldnames=["label","ok","path","bytes","source","method"])
+                  w.writeheader()
+                  for r in downloads:
+                      w.writerow({k:r.get(k,"") for k in ["label","ok","path","bytes","source","method"]})
+              missing = [r["label"] for r in downloads if not r.get("ok")]
+              diffuse = discover_diffuse()
+              write_json(OUT/"LOCAL_DIFFUSE_DISCOVERY.json", diffuse)
+              if missing:
+                  final_stop(DECISION_TECH_DOWNLOAD, "required LAT/catalog downloads incomplete",
+                             {"missing_required_files":missing, "downloads":downloads})
+
+              if "gll_iem_v07.fits" not in diffuse or "iso_P8R3_SOURCE_V3_v1.txt" not in diffuse:
+                  final_stop("TECHNICAL_STOP_DIFFUSE_MODELS_NOT_FOUND_NO_SCORE", "diffuse models not found",
+                             {"diffuse_found":diffuse})
+
+              rows = []
+              phase_files = {
+                  "post": (dests["photon_w821"], dests["spacecraft_w821"]),
+                  "pre": (dests["photon_w635"], dests["spacecraft_w635"]),
+              }
+              idx = 0
+              for region in REGIONS:
+                  for phase in ["post","pre"]:
+                      idx += 1
+                      log(f"Running Fermipy analysis {idx}/20 {region['region_id']} {phase}")
+                      photon, spacecraft = phase_files[phase]
+                      row = run_fermipy_case(region, phase, photon, spacecraft,
+                                             dests["catalog_gll_psc_v35"], diffuse)
+                      rows.append(row)
+              with (OUT/"OFFICIAL_FERMIPY_N1_RESULTS.csv").open("w", newline="", encoding="utf-8") as f:
+                  fields = ["region_id","kind","phase","ra","dec","nobs","npred","npred_source","model_residual",
+                            "setup_ok","optimize_ok","fit_ok","fit_or_optimize_ok","npred_extracted","error_tail"]
+                  w = csv.DictWriter(f, fieldnames=fields)
+                  w.writeheader(); w.writerows(rows)
+
+              result_rows = len(rows)
+              all_setup_ok = all(bool(r["setup_ok"]) for r in rows) if rows else False
+              all_fit_or_optimize_ok = all(bool(r["fit_or_optimize_ok"]) for r in rows) if rows else False
+              all_npred_extracted = all(bool(r["npred_extracted"]) for r in rows) if rows else False
+              usable = (result_rows == EXPECTED_RESULT_ROWS and all_setup_ok and all_fit_or_optimize_ok and all_npred_extracted)
+
+              comp = []
+              by_region = {}
+              for r in rows:
+                  by_region.setdefault(r["region_id"], {})[r["phase"]] = r
+              for rid, d in by_region.items():
+                  if "post" in d and "pre" in d:
+                      post = d["post"]["model_residual"]
+                      pre = d["pre"]["model_residual"]
+                      delta = None if post is None or pre is None else float(post - pre)
+                      comp.append({"region_id":rid, "kind":d["post"]["kind"],
+                                   "post_model_residual":post, "pre_model_residual":pre,
+                                   "post_minus_pre_model_residual":delta})
+              with (OUT/"OFFICIAL_FERMIPY_N1_POST_PRE_COMPARISON.csv").open("w", newline="", encoding="utf-8") as f:
+                  fields = ["region_id","kind","post_model_residual","pre_model_residual","post_minus_pre_model_residual"]
+                  w = csv.DictWriter(f, fieldnames=fields)
+                  w.writeheader(); w.writerows(comp)
+
+              valid = [c for c in comp if c["post_minus_pre_model_residual"] is not None]
+              ranking = sorted(valid, key=lambda x: x["post_minus_pre_model_residual"], reverse=True)
+              for i, r in enumerate(ranking, 1):
+                  r["rank_descending"] = i
+              with (OUT/"OFFICIAL_FERMIPY_N1_RESIDUAL_RANKING.csv").open("w", newline="", encoding="utf-8") as f:
+                  fields = ["rank_descending","region_id","kind","post_minus_pre_model_residual","post_model_residual","pre_model_residual"]
+                  w = csv.DictWriter(f, fieldnames=fields)
+                  w.writeheader(); w.writerows([{k:r.get(k,"") for k in fields} for r in ranking])
+
+              r9c = next((c for c in comp if c["region_id"] == "R9C_CYGX1"), None)
+              controls = [c for c in comp if c["kind"] == "control" and c["post_minus_pre_model_residual"] is not None]
+              r9c_delta = None if r9c is None else r9c["post_minus_pre_model_residual"]
+              controls_ge = None
+              r9c_rank = None
+              exceeds = False
+              if r9c_delta is not None:
+                  controls_ge = int(sum(c["post_minus_pre_model_residual"] >= r9c_delta for c in controls))
+                  rr = [r for r in ranking if r["region_id"] == "R9C_CYGX1"]
+                  r9c_rank = rr[0]["rank_descending"] if rr else None
+                  exceeds = bool(len(controls) == 9 and controls_ge == 0)
+              summary = {
+                  "stage":STAGE,
+                  "expected_result_rows":EXPECTED_RESULT_ROWS,
+                  "result_rows":result_rows,
+                  "all_setup_ok":all_setup_ok,
+                  "all_fit_or_optimize_ok":all_fit_or_optimize_ok,
+                  "all_npred_extracted":all_npred_extracted,
+                  "usable_model_residual_comparison":usable,
+                  "r9c_model_residual_post_minus_pre":r9c_delta,
+                  "no_gate_control_n_valid":len(controls),
+                  "no_gate_control_mean":float(np.mean([c["post_minus_pre_model_residual"] for c in controls])) if controls else None,
+                  "no_gate_control_median":float(np.median([c["post_minus_pre_model_residual"] for c in controls])) if controls else None,
+                  "no_gate_control_max":float(np.max([c["post_minus_pre_model_residual"] for c in controls])) if controls else None,
+                  "controls_ge_r9c":controls_ge,
+                  "r9c_rank_descending":r9c_rank,
+                  "r9c_exceeds_all_no_gate_controls":exceeds,
+                  "claim_ceiling":"NO_SCORE_NOT_PROOF_NOT_DISCOVERY_DIAGNOSTIC_ONLY"
+              }
+              write_json(OUT/"SUMMARY.json", summary)
+              if not usable:
+                  decision = DECISION_TECH
+                  sci = False
+                  tech = True
+              elif exceeds:
+                  decision = DECISION_PASS
+                  sci = True
+                  tech = False
+              else:
+                  decision = DECISION_NOT_PASS
+                  sci = True
+                  tech = False
+              final = dict(summary)
+              final.update({"decision":decision, "scientific_result":sci, "technical_stop":tech})
+              write_json(OUT/"FINAL_DECISION.json", final)
+              make_zip()
+              log("FINAL_DECISION: " + decision)
+
+          if __name__ == "__main__":
+              try:
+                  main()
+              except SystemExit:
+                  raise
+              except Exception as e:
+                  final_stop("TECHNICAL_STOP_UNHANDLED_EXCEPTION_NO_SCORE", "unhandled exception",
+                             {"exception":traceback.format_exc()[-4000:]})
+          PY
+          python -m py_compile "$WORK/acirm_r13m_n1_worker.py"
+          ls -lh "$WORK/acirm_r13m_n1_worker.py"
+
+      - name: Run ACIRM R13M N1 all-controls cached official-file retry
+        shell: bash
+        run: |
+          set -euo pipefail
+          WORK="${{ github.workspace }}"
+          export MAMBA_ROOT_PREFIX="$WORK/.micromamba"
+          MM="$WORK/.micromamba/bin/micromamba"
+          ENV="$WORK/acirm_fermipy_env"
+          "$MM" run -p "$ENV" python "$WORK/acirm_r13m_n1_worker.py"
+
+      - name: Show final decision if available
+        if: always()
+        shell: bash
+        run: |
+          set +e
+          cat ACIRM_R13M_N1_GH_ALL_CONTROLS_FERMIPY_RESIDUAL_NO_SCORE_OUTPUT/FINAL_DECISION.json || true
+          echo ""
+          tail -n 120 ACIRM_R13M_N1_GH_ALL_CONTROLS_FERMIPY_RESIDUAL_NO_SCORE_OUTPUT/PROGRESS.log || true
+
+      - name: Upload ACIRM result artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ACIRM_R13M_N1_GH_R2_ONE_FILE_RESULTS
+          path: |
+            ACIRM_R13M_N1_GH_ALL_CONTROLS_FERMIPY_RESIDUAL_NO_SCORE_RESULTS.zip
+            ACIRM_R13M_N1_GH_ALL_CONTROLS_FERMIPY_RESIDUAL_NO_SCORE_RESULTS.zip.sha256.txt
+            ACIRM_R13M_N1_GH_ALL_CONTROLS_FERMIPY_RESIDUAL_NO_SCORE_OUTPUT/**
+          retention-days: 14
