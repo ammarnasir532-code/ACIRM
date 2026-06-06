@@ -1,0 +1,290 @@
+name: ACIRM R13M K R1 midpoint sky controls
+
+on:
+  workflow_dispatch:
+
+jobs:
+  r13m-k-r1:
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    steps:
+      - name: Run midpoint no gate sky controls
+        shell: bash
+        run: |
+          set +e
+          STAGE="ACIRM_R13M_K_R1_MIDPOINT_NO_GATE_SKY_CONTROL_NO_SCORE"
+          OUT="$GITHUB_WORKSPACE/${STAGE}_OUTPUT"
+          DATA="$GITHUB_WORKSPACE/${STAGE}_DATA"
+          mkdir -p "$OUT" "$DATA"
+          python3 -m pip install --user --no-cache-dir --upgrade numpy astropy > "$OUT/PIP_INSTALL.log" 2>&1
+          python3 - <<'PY' > "$OUT/STDOUT.txt" 2> "$OUT/STDERR.txt"
+          from pathlib import Path
+          import csv, datetime, hashlib, json, math, os, shutil, subprocess, traceback
+          import numpy as np
+          from astropy.io import fits
+
+          STAGE = "ACIRM_R13M_K_R1_MIDPOINT_NO_GATE_SKY_CONTROL_NO_SCORE"
+          BASE = Path(os.environ.get("GITHUB_WORKSPACE", "/tmp/acirm_r13m_k_r1"))
+          OUT = BASE / (STAGE + "_OUTPUT")
+          DATA = BASE / (STAGE + "_DATA")
+          OUT.mkdir(parents=True, exist_ok=True)
+          DATA.mkdir(parents=True, exist_ok=True)
+
+          CFG = {
+              "r9c_utc": "2022-05-18T20:40:57.672000+00:00",
+              "cygx1_ra_deg": 299.590315,
+              "cygx1_dec_deg": 35.201606,
+              "roi_deg": 5.0,
+              "zmax": 90.0,
+              "weekly_dir": "https://heasarc.gsfc.nasa.gov/FTP/fermi/data/lat/weekly/photon/",
+              "post_mid_week": 821,
+              "pre_mid_week": 635,
+              "claim_ceiling": "midpoint no-gate sky-control raw photon diagnostic only; no likelihood, no exposure correction, no score, no evidence/proof/discovery claim",
+              "theory_policy": "R9C is the locked gate. This tests whether the strongest +650d midpoint excess is unusual versus no-gate sky directions. It is compatible with the resonant-seed hypothesis only as a raw diagnostic, not proof."
+          }
+
+          REGIONS = [
+              ("R9C_CYGX1", "r9c_gate_target", 299.590315, 35.201606),
+              ("NOGATE_RA030", "no_gate_sky_control", 329.590315, 35.201606),
+              ("NOGATE_RA060", "no_gate_sky_control", 359.590315, 35.201606),
+              ("NOGATE_RA090", "no_gate_sky_control", 29.590315, 35.201606),
+              ("NOGATE_RA120", "no_gate_sky_control", 59.590315, 35.201606),
+              ("NOGATE_RA180", "no_gate_sky_control", 119.590315, 35.201606),
+              ("NOGATE_RA240", "no_gate_sky_control", 179.590315, 35.201606),
+              ("NOGATE_RA300", "no_gate_sky_control", 239.590315, 35.201606),
+              ("NOGATE_NORTH", "no_gate_sky_control", 299.590315, 70.201606),
+              ("NOGATE_SOUTH", "no_gate_sky_control", 299.590315, 0.201606)
+          ]
+
+          TARGETS = [
+              {"direction": "post", "sample_point": "mid_650d", "week": CFG["post_mid_week"]},
+              {"direction": "pre", "sample_point": "mid_minus650d", "week": CFG["pre_mid_week"]}
+          ]
+
+          def log(msg):
+              print(str(msg), flush=True)
+              with (OUT / "PROGRESS.log").open("a", encoding="utf-8") as f:
+                  f.write(str(msg) + "\n")
+
+          def write_json(name, obj):
+              (OUT / name).write_text(json.dumps(obj, indent=2, ensure_ascii=False), encoding="utf-8")
+
+          def write_csv(name, rows, cols):
+              with (OUT / name).open("w", newline="", encoding="utf-8") as f:
+                  w = csv.DictWriter(f, fieldnames=cols)
+                  w.writeheader()
+                  for r in rows:
+                      w.writerow({c: r.get(c, "") for c in cols})
+
+          def sha256_file(path):
+              h = hashlib.sha256()
+              with open(path, "rb") as f:
+                  for b in iter(lambda: f.read(1024 * 1024), b""):
+                      h.update(b)
+              return h.hexdigest()
+
+          def final(decision, next_stage, extra=None):
+              obj = {
+                  "stage": STAGE,
+                  "decision": decision,
+                  "next_stage": next_stage,
+                  "claim_ceiling": CFG["claim_ceiling"],
+                  "theory_policy": CFG["theory_policy"],
+                  "timestamp_utc": datetime.datetime.now(datetime.UTC).isoformat()
+              }
+              if extra:
+                  obj.update(extra)
+              write_json("FINAL_DECISION.json", obj)
+              log("FINAL_DECISION: " + decision)
+
+          def run(cmd, timeout=120):
+              try:
+                  p = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=timeout)
+                  return p.returncode, p.stdout
+              except Exception as e:
+                  return 999, repr(e)
+
+          def url_for_week(week):
+              fname = f"lat_photon_weekly_w{int(week):03d}_p305_v001.fits"
+              return CFG["weekly_dir"] + fname, fname
+
+          def download_week(week):
+              url, fname = url_for_week(week)
+              dest = DATA / fname
+              tmp = dest.with_suffix(dest.suffix + ".part")
+              if tmp.exists():
+                  try: tmp.unlink()
+                  except Exception: pass
+              row = {"week": int(week), "file": fname, "url": url, "download_ok": False, "size_bytes": "", "sha256": "", "exit_code": "", "path": ""}
+              cmd = ["bash", "-lc", "curl -L --fail --connect-timeout 30 --max-time 1800 --retry 3 --retry-delay 5 --retry-all-errors -o " + repr(str(tmp)) + " " + repr(url)]
+              code, out = run(cmd, timeout=1950)
+              (OUT / ("download_w%03d.log" % int(week))).write_text(out[-5000:], encoding="utf-8")
+              ok = code == 0 and tmp.exists() and tmp.stat().st_size > 0
+              if ok:
+                  tmp.rename(dest)
+                  row.update({"download_ok": True, "size_bytes": dest.stat().st_size, "sha256": sha256_file(dest), "exit_code": code, "path": str(dest)})
+              else:
+                  if tmp.exists():
+                      try: tmp.unlink()
+                      except Exception: pass
+                  row.update({"exit_code": code})
+              return row
+
+          def sep_deg_vec(ra, dec, ra0, dec0):
+              r1 = np.radians(np.asarray(ra, float))
+              d1 = np.radians(np.asarray(dec, float))
+              r2 = math.radians(float(ra0))
+              d2 = math.radians(float(dec0))
+              x = np.sin((d1 - d2) / 2.0) ** 2 + np.cos(d1) * math.cos(d2) * np.sin((r1 - r2) / 2.0) ** 2
+              return np.degrees(2 * np.arcsin(np.sqrt(np.clip(x, 0, 1))))
+
+          def met_to_utc(met):
+              epoch = datetime.datetime.fromisoformat("2001-01-01T00:00:00+00:00").astimezone(datetime.UTC)
+              return epoch + datetime.timedelta(seconds=float(met))
+
+          def iso(t):
+              return t.astimezone(datetime.UTC).isoformat().replace("+00:00", "Z")
+
+          def find_event_hdu(hdul):
+              for h in hdul:
+                  if hasattr(h, "columns") and h.columns is not None:
+                      try:
+                          cols = [c.upper() for c in h.columns.names]
+                      except Exception:
+                          cols = []
+                      if all(x in cols for x in ["TIME", "ENERGY", "RA", "DEC"]):
+                          return h
+              return None
+
+          def count_file(path, target):
+              rows = []
+              top_rows = []
+              schema_rows = []
+              try:
+                  with fits.open(path, memmap=True) as hdul:
+                      h = find_event_hdu(hdul)
+                      if h is None:
+                          schema_rows.append({"week": target["week"], "status": "NO_EVENT_HDU"})
+                          return rows, top_rows, schema_rows
+                      d = h.data
+                      cols = [c.upper() for c in h.columns.names]
+                      t = np.asarray(d["TIME"], float)
+                      en = np.asarray(d["ENERGY"], float)
+                      ra = np.asarray(d["RA"], float)
+                      de = np.asarray(d["DEC"], float)
+                      if "ZENITH_ANGLE" in cols:
+                          zen = np.asarray(d["ZENITH_ANGLE"], float)
+                          good = zen <= CFG["zmax"]
+                      else:
+                          zen = np.zeros_like(t) + np.nan
+                          good = np.ones_like(t, dtype=bool)
+                      good = good & np.isfinite(t) & np.isfinite(en) & np.isfinite(ra) & np.isfinite(de)
+                      schema_rows.append({"week": target["week"], "status": "OK", "rows_total": int(len(t)), "rows_good": int(good.sum())})
+                      for rid, role, rra, rdec in REGIONS:
+                          s = sep_deg_vec(ra, de, rra, rdec)
+                          base = good & (s <= CFG["roi_deg"])
+                          primary = base & (en >= 1000.0) & (en < 1000000.0)
+                          low = base & (en >= 100.0) & (en < 1000.0)
+                          for band, mask in [("primary_1_1000GeV", primary), ("low_0p1_1GeV", low)]:
+                              n = int(mask.sum())
+                              maxe = ""
+                              maxt = ""
+                              mins = ""
+                              if n:
+                                  idx = np.where(mask)[0]
+                                  im = idx[np.argmax(en[idx])]
+                                  maxe = float(en[im])
+                                  maxt = iso(met_to_utc(float(t[im])))
+                                  mins = float(s[idx].min())
+                                  top_rows.append({"week": target["week"], "direction": target["direction"], "region_id": rid, "region_role": role, "band": band, "energy_mev": maxe, "time_utc": maxt, "sep_deg": float(s[im])})
+                              rows.append({"week": target["week"], "direction": target["direction"], "sample_point": target["sample_point"], "region_id": rid, "region_role": role, "band": band, "raw_count": n, "max_energy_mev": maxe, "max_time_utc": maxt, "min_sep_deg": mins})
+              except Exception as e:
+                  schema_rows.append({"week": target["week"], "status": "EXCEPTION:" + repr(e)[:300]})
+              return rows, top_rows, schema_rows
+
+          def summarize(counts):
+              primary = [r for r in counts if r["band"] == "primary_1_1000GeV"]
+              by = {(r["region_id"], r["direction"]): int(r["raw_count"]) for r in primary}
+              rows = []
+              for rid, role, rra, rdec in REGIONS:
+                  post = by.get((rid, "post"), 0)
+                  pre = by.get((rid, "pre"), 0)
+                  rows.append({"region_id": rid, "region_role": role, "post_count": post, "pre_count": pre, "post_minus_pre": post - pre, "post_over_pre": post / pre if pre > 0 else ""})
+              target = [r for r in rows if r["region_id"] == "R9C_CYGX1"][0]
+              controls = [r for r in rows if r["region_role"] == "no_gate_sky_control"]
+              vals = [int(r["post_minus_pre"]) for r in controls]
+              target_excess = int(target["post_minus_pre"])
+              meanv = float(np.mean(vals)) if vals else None
+              maxv = max(vals) if vals else None
+              return rows, {
+                  "target_post_minus_pre_midpoint": target_excess,
+                  "no_gate_control_n": len(vals),
+                  "no_gate_control_mean_midpoint": meanv,
+                  "no_gate_control_max_midpoint": maxv,
+                  "controls_with_excess_ge_target": sum(1 for v in vals if v >= target_excess),
+                  "target_exceeds_all_controls": bool(vals and target_excess > maxv),
+                  "target_minus_control_mean": target_excess - meanv if meanv is not None else ""
+              }
+
+          try:
+              write_json("LOCKED_CONTEXT.json", {"stage": STAGE, **CFG, "regions": REGIONS, "targets": TARGETS})
+              log("R13M_K_R1 started: midpoint no-gate sky controls only; no score.")
+              downloads = []
+              counts = []
+              tops = []
+              schemas = []
+              for target in TARGETS:
+                  log("Downloading week %03d %s" % (target["week"], target["direction"]))
+                  drow = download_week(target["week"])
+                  downloads.append(drow)
+                  if drow["download_ok"]:
+                      log("Counting week %03d" % target["week"])
+                      c, t, s = count_file(Path(drow["path"]), target)
+                      counts += c
+                      tops += t
+                      schemas += s
+              region_rows, sky_summary = summarize(counts)
+              write_csv("DOWNLOADS.csv", downloads, ["week", "file", "url", "download_ok", "size_bytes", "sha256", "exit_code", "path"])
+              write_csv("SCHEMA.csv", schemas, ["week", "status", "rows_total", "rows_good"])
+              write_csv("RAW_COUNTS.csv", counts, ["week", "direction", "sample_point", "region_id", "region_role", "band", "raw_count", "max_energy_mev", "max_time_utc", "min_sep_deg"])
+              write_csv("TOP_EVENTS_NOT_SCORE.csv", tops, ["week", "direction", "region_id", "region_role", "band", "energy_mev", "time_utc", "sep_deg"])
+              write_csv("MIDPOINT_REGION_PRIMARY_SUMMARY.csv", region_rows, ["region_id", "region_role", "post_count", "pre_count", "post_minus_pre", "post_over_pre"])
+              summary = {"downloaded_week_files": sum(1 for d in downloads if d["download_ok"]), "raw_rows": len(counts), "sky_control_summary": sky_summary, "claim_ceiling": CFG["claim_ceiling"]}
+              write_json("SUMMARY.json", summary)
+              if summary["downloaded_week_files"] < 2:
+                  final("TECHNICAL_STOP_MIDPOINT_WEEK_DOWNLOAD_INCOMPLETE_NO_SCORE", "RETRY_OR_USE_COLAB_WITH_BETTER_NETWORK", {"summary": summary})
+              elif sky_summary["target_exceeds_all_controls"]:
+                  final("MIDPOINT_300_1000D_R9C_EXCEEDS_NO_GATE_SKY_CONTROLS_NO_SCORE", "ACIRM_R13M_L_FULL_TARGETED_CONTROL_OR_EXPOSURE_AWARE_PROTOCOL", {"summary": summary})
+              else:
+                  final("MIDPOINT_300_1000D_R9C_NOT_UNIQUE_VS_NO_GATE_SKY_CONTROLS_NO_SCORE", "ACIRM_R13M_L_ADJUDICATE_WITH_MORE_CONTROLS_OR_CLOSE_RAW_BRANCH", {"summary": summary})
+              try:
+                  shutil.rmtree(DATA)
+              except Exception:
+                  pass
+          except Exception as e:
+              (OUT / "EXCEPTION_TRACEBACK.txt").write_text(traceback.format_exc(), encoding="utf-8")
+              final("TECHNICAL_STOP_EXCEPTION_DURING_R13M_K_R1", "REPAIR_FROM_TRACEBACK", {"error": repr(e)[:500]})
+          PY
+          CODE=$?
+          echo "controller_exit_code=$CODE" > "$OUT/STEP_STATUS.log"
+          if [ ! -f "$OUT/FINAL_DECISION.json" ]; then
+            echo '{"decision":"CONTROLLER_FAILED_BEFORE_FINAL_DECISION"}' > "$OUT/FINAL_DECISION.json"
+          fi
+          cd "$GITHUB_WORKSPACE"
+          ZIP="$GITHUB_WORKSPACE/${STAGE}_RESULTS.zip"
+          SHA="$ZIP.sha256.txt"
+          rm -f "$ZIP" "$SHA"
+          rm -rf "$GITHUB_WORKSPACE/${STAGE}_DATA"
+          zip -r "$ZIP" "$(basename "$OUT")"
+          sha256sum "$ZIP" > "$SHA"
+          exit 0
+
+      - name: Upload artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ACIRM_R13M_K_R1_MIDPOINT_NO_GATE_SKY_CONTROL_NO_SCORE_RESULTS
+          path: |
+            ACIRM_R13M_K_R1_MIDPOINT_NO_GATE_SKY_CONTROL_NO_SCORE_RESULTS.zip
+            ACIRM_R13M_K_R1_MIDPOINT_NO_GATE_SKY_CONTROL_NO_SCORE_RESULTS.zip.sha256.txt
+          retention-days: 7
