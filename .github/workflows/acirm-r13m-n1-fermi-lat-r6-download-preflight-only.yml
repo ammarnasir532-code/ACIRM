@@ -1,0 +1,217 @@
+name: ACIRM R13M N1 Fermi LAT R6 Download Preflight Only
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  acirm-r13m-n1-r6-download-preflight:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install lightweight tools
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq curl wget zip dnsutils
+
+      - name: Run ACIRM R13M N1 R6 download preflight only
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import csv, json, socket, ssl, time, hashlib, shutil, subprocess, urllib.request
+          from pathlib import Path
+          from datetime import datetime, timezone
+
+          STAGE = "ACIRM_R13M_N1_GH_R6_DOWNLOAD_PREFLIGHT_ONLY"
+          OUT = Path(f"{STAGE}_OUTPUT")
+          OUT.mkdir(exist_ok=True)
+          PROGRESS = OUT / "PROGRESS.log"
+
+          REQUIRED = [
+              {"label":"photon_w821", "kind":"photon", "week":821, "url":"https://heasarc.gsfc.nasa.gov/FTP/fermi/data/lat/weekly/photon/lat_photon_weekly_w821_p305_v001.fits", "required":True},
+              {"label":"spacecraft_w821", "kind":"spacecraft", "week":821, "url":"https://heasarc.gsfc.nasa.gov/FTP/fermi/data/lat/weekly/spacecraft/lat_spacecraft_weekly_w821_p310_v001.fits", "required":True},
+              {"label":"photon_w635", "kind":"photon", "week":635, "url":"https://heasarc.gsfc.nasa.gov/FTP/fermi/data/lat/weekly/photon/lat_photon_weekly_w635_p305_v001.fits", "required":True},
+              {"label":"spacecraft_w635", "kind":"spacecraft", "week":635, "url":"https://heasarc.gsfc.nasa.gov/FTP/fermi/data/lat/weekly/spacecraft/lat_spacecraft_weekly_w635_p310_v001.fits", "required":True},
+              {"label":"catalog_gll_psc_v35_primary", "kind":"catalog", "week":"", "url":"https://fermi.gsfc.nasa.gov/ssc/data/access/lat/14yr_catalog/gll_psc_v35.fit", "required":False},
+              {"label":"catalog_gll_psc_v35_alt", "kind":"catalog", "week":"", "url":"https://heasarc.gsfc.nasa.gov/FTP/fermi/data/lat/catalogs/4FGL/gll_psc_v35.fit", "required":False},
+          ]
+
+          def log(msg):
+              s = f"[{datetime.now(timezone.utc).isoformat()}] {msg}"
+              print(s, flush=True)
+              with PROGRESS.open("a", encoding="utf-8") as f:
+                  f.write(s + "\n")
+
+          def write_json(name, obj):
+              (OUT / name).write_text(json.dumps(obj, indent=2, sort_keys=True), encoding="utf-8")
+
+          def write_csv(name, rows, fields):
+              with (OUT / name).open("w", newline="", encoding="utf-8") as f:
+                  w = csv.DictWriter(f, fieldnames=fields)
+                  w.writeheader()
+                  for r in rows:
+                      w.writerow({k: r.get(k, "") for k in fields})
+
+          def host_from_url(url):
+              return url.split("/")[2]
+
+          def dns_check(host):
+              t0 = time.time()
+              try:
+                  infos = socket.getaddrinfo(host, 443, proto=socket.IPPROTO_TCP)
+                  addrs = sorted({x[4][0] for x in infos})
+                  return {"host":host, "dns_ok":True, "addresses":";".join(addrs), "elapsed_sec":round(time.time()-t0,3), "error":""}
+              except Exception as e:
+                  return {"host":host, "dns_ok":False, "addresses":"", "elapsed_sec":round(time.time()-t0,3), "error":repr(e)[:500]}
+
+          def tcp_tls_check(host, timeout=20):
+              t0 = time.time()
+              try:
+                  raw = socket.create_connection((host, 443), timeout=timeout)
+                  ctx = ssl.create_default_context()
+                  ssock = ctx.wrap_socket(raw, server_hostname=host)
+                  proto = ssock.version()
+                  ssock.close()
+                  return {"host":host, "tls_ok":True, "tls_version":proto, "elapsed_sec":round(time.time()-t0,3), "error":""}
+              except Exception as e:
+                  return {"host":host, "tls_ok":False, "tls_version":"", "elapsed_sec":round(time.time()-t0,3), "error":repr(e)[:700]}
+
+          def curl_head(url, label):
+              t0 = time.time()
+              cmd = ["curl", "-I", "-L", "--connect-timeout", "25", "--max-time", "90", "--retry", "1", "--silent", "--show-error", url]
+              try:
+                  p = subprocess.run(cmd, text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=120)
+                  out = p.stdout or ""
+                  (OUT / f"HEAD_{label}.log").write_text(out[-8000:], encoding="utf-8", errors="replace")
+                  http_codes = []
+                  content_length = ""
+                  accept_ranges = ""
+                  for line in out.splitlines():
+                      low = line.lower().strip()
+                      if low.startswith("http/"):
+                          parts = line.split()
+                          if len(parts) >= 2:
+                              http_codes.append(parts[1])
+                      if low.startswith("content-length:"):
+                          content_length = line.split(":",1)[1].strip()
+                      if low.startswith("accept-ranges:"):
+                          accept_ranges = line.split(":",1)[1].strip()
+                  ok = p.returncode == 0 and any(c in ("200","206") for c in http_codes)
+                  return {"label":label, "url":url, "head_ok":ok, "http_codes":";".join(http_codes), "content_length":content_length, "accept_ranges":accept_ranges, "elapsed_sec":round(time.time()-t0,3), "returncode":p.returncode, "error_tail":out[-600:] if not ok else ""}
+              except Exception as e:
+                  return {"label":label, "url":url, "head_ok":False, "http_codes":"", "content_length":"", "accept_ranges":"", "elapsed_sec":round(time.time()-t0,3), "returncode":"EXC", "error_tail":repr(e)[:700]}
+
+          def partial_read(url, label, max_bytes=1048576, timeout=120):
+              t0 = time.time()
+              h = hashlib.sha256()
+              got = 0
+              try:
+                  req = urllib.request.Request(url, headers={"Range": f"bytes=0-{max_bytes-1}", "User-Agent":"ACIRM-R13M-R6-download-preflight"})
+                  with urllib.request.urlopen(req, timeout=timeout) as r:
+                      status = getattr(r, "status", "")
+                      headers = dict(r.headers.items())
+                      while got < max_bytes:
+                          chunk = r.read(min(65536, max_bytes-got))
+                          if not chunk:
+                              break
+                          h.update(chunk)
+                          got += len(chunk)
+                  ok = got > 0 and status in (200, 206)
+                  return {"label":label, "url":url, "partial_ok":ok, "http_status":status, "bytes_read":got, "sha256_first_bytes":h.hexdigest() if got else "", "elapsed_sec":round(time.time()-t0,3), "content_range":headers.get("Content-Range", ""), "error":""}
+              except Exception as e:
+                  return {"label":label, "url":url, "partial_ok":False, "http_status":"", "bytes_read":got, "sha256_first_bytes":"", "elapsed_sec":round(time.time()-t0,3), "content_range":"", "error":repr(e)[:900]}
+
+          log("START R6 download preflight only. No Fermipy analysis. No score.")
+          write_json("LOCKED_CONTEXT.json", {
+              "stage": STAGE,
+              "purpose": "Connectivity and small-range read preflight for official LAT weekly photon/spacecraft/catalog inputs before rerunning N1.",
+              "no_scientific_result": True,
+              "claim_ceiling": "NO_SCORE_NOT_PROOF_NOT_DISCOVERY",
+              "required_science_inputs": REQUIRED,
+          })
+
+          hosts = sorted({host_from_url(x["url"]) for x in REQUIRED})
+          host_rows = []
+          for host in hosts:
+              log(f"DNS/TLS check host={host}")
+              d = dns_check(host)
+              t = tcp_tls_check(host)
+              row = dict(d)
+              row.update({"tls_ok": t["tls_ok"], "tls_version": t["tls_version"], "tls_elapsed_sec": t["elapsed_sec"], "tls_error": t["error"]})
+              host_rows.append(row)
+          write_csv("HOST_CHECKS.csv", host_rows, ["host","dns_ok","addresses","elapsed_sec","error","tls_ok","tls_version","tls_elapsed_sec","tls_error"])
+
+          url_rows = []
+          partial_rows = []
+          for item in REQUIRED:
+              log(f"HEAD check {item['label']}")
+              hr = curl_head(item["url"], item["label"])
+              hr.update({"kind":item["kind"], "week":item["week"], "required":item["required"]})
+              url_rows.append(hr)
+              log(f"PARTIAL read check {item['label']}")
+              pr = partial_read(item["url"], item["label"])
+              pr.update({"kind":item["kind"], "week":item["week"], "required":item["required"]})
+              partial_rows.append(pr)
+          write_csv("URL_CHECKS.csv", url_rows, ["label","kind","week","required","url","head_ok","http_codes","content_length","accept_ranges","elapsed_sec","returncode","error_tail"])
+          write_csv("PARTIAL_READ_CHECKS.csv", partial_rows, ["label","kind","week","required","url","partial_ok","http_status","bytes_read","sha256_first_bytes","content_range","elapsed_sec","error"])
+
+          required_labels = {"photon_w821", "spacecraft_w821", "photon_w635", "spacecraft_w635"}
+          required_partial_ok = all(r["partial_ok"] for r in partial_rows if r["label"] in required_labels)
+          catalog_ok = any(r["partial_ok"] for r in partial_rows if r["label"].startswith("catalog_gll_psc_v35"))
+          all_required_ok = bool(required_partial_ok and catalog_ok)
+          if all_required_ok:
+              decision = "DOWNLOAD_PREFLIGHT_PASSED_READY_FOR_N1_RETRY_NO_SCORE"
+              next_stage = "ACIRM_R13M_N1_GH_R7_ANALYSIS_RETRY_USING_VERIFIED_URLS_NO_SCORE"
+          else:
+              decision = "TECHNICAL_STOP_DOWNLOAD_PREFLIGHT_FAILED_NO_SCORE"
+              next_stage = "WAIT_AND_RETRY_OR_USE_MANUAL_LAT_SERVER_EXPORT_NO_SCORE"
+
+          final = {
+              "stage": STAGE,
+              "decision": decision,
+              "scientific_result": False,
+              "technical_stop": not all_required_ok,
+              "required_weekly_files_partial_ok": required_partial_ok,
+              "catalog_partial_ok": catalog_ok,
+              "next_stage": next_stage,
+              "claim_ceiling": "NO_SCORE_NOT_PROOF_NOT_DISCOVERY",
+              "timestamp_utc": datetime.now(timezone.utc).isoformat(),
+          }
+          write_json("FINAL_DECISION.json", final)
+
+          zipname = f"{STAGE}_RESULTS.zip"
+          shutil.make_archive(zipname[:-4], "zip", root_dir=".", base_dir=str(OUT))
+          sha = hashlib.sha256(Path(zipname).read_bytes()).hexdigest()
+          Path(zipname + ".sha256.txt").write_text(f"{sha}  {zipname}\n", encoding="utf-8")
+          log("FINAL_DECISION=" + decision)
+          log("ZIP=" + zipname + " SHA256=" + sha)
+          PY
+
+      - name: Show final decision
+        if: always()
+        shell: bash
+        run: |
+          set +e
+          cat ACIRM_R13M_N1_GH_R6_DOWNLOAD_PREFLIGHT_ONLY_OUTPUT/FINAL_DECISION.json || true
+          echo ""
+          tail -n 120 ACIRM_R13M_N1_GH_R6_DOWNLOAD_PREFLIGHT_ONLY_OUTPUT/PROGRESS.log || true
+
+      - name: Upload R6 preflight artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ACIRM_R13M_N1_GH_R6_DOWNLOAD_PREFLIGHT_ONLY_RESULTS
+          path: |
+            ACIRM_R13M_N1_GH_R6_DOWNLOAD_PREFLIGHT_ONLY_RESULTS.zip
+            ACIRM_R13M_N1_GH_R6_DOWNLOAD_PREFLIGHT_ONLY_RESULTS.zip.sha256.txt
+            ACIRM_R13M_N1_GH_R6_DOWNLOAD_PREFLIGHT_ONLY_OUTPUT/**
+          retention-days: 14
