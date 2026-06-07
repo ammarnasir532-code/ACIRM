@@ -1,0 +1,399 @@
+name: ACIRM R13M N2F R1 Successful Lag Aperture Localization Preflight
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  acirm-r13m-n2f-r1-aperture-localization:
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Restore R8 LAG300D LAT cache
+        uses: actions/cache@v4
+        with:
+          path: ${{ github.workspace }}/.acirm_lat_cache_n2b_lag300d
+          key: acirm-r13m-n2f-r1-restore-lag300-${{ github.run_id }}
+          restore-keys: |
+            acirm-r13m-n2b-lag300d-w685-w771-inputs-r8-
+
+      - name: Restore or save N2F LAG650D LAT cache
+        uses: actions/cache@v4
+        with:
+          path: ${{ github.workspace }}/.acirm_lat_cache_n2f_lag650d
+          key: acirm-r13m-n2f-lag650d-w635-w821-inputs-r1-${{ github.run_id }}
+          restore-keys: |
+            acirm-r13m-n2f-lag650d-w635-w821-inputs-r1-
+            acirm-r13m-lat-weekly-w635-w821-inputs-r7-
+            acirm-r13m-lat-weekly-w635-w821-inputs-r2-
+            acirm-r13m-lat-weekly-w635-w821-inputs-v2-
+
+      - name: Install lightweight Python dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m pip install --upgrade pip -q
+          python -m pip install -q astropy numpy
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq curl zip
+
+      - name: Create N2F R1 aperture-localization worker part 1 of 2
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat > acirm_r13m_n2f_r1_worker.py <<'PY'
+          import csv, json, math, os, shutil, hashlib, subprocess, traceback, time
+          from pathlib import Path
+          from datetime import datetime, timezone
+
+          import numpy as np
+          from astropy.io import fits
+
+          STAGE = "ACIRM_R13M_N2F_R1_SUCCESSFUL_LAG_APERTURE_LOCALIZATION_PREFLIGHT_NO_SCORE"
+          BASE = Path.cwd()
+          OUT = BASE / f"{STAGE}_OUTPUT"
+          OUT.mkdir(exist_ok=True)
+          CACHE300 = BASE / ".acirm_lat_cache_n2b_lag300d"
+          CACHE650 = BASE / ".acirm_lat_cache_n2f_lag650d"
+          CACHE650.mkdir(exist_ok=True)
+          PROGRESS = OUT / "PROGRESS.log"
+
+          R9C_RA = 299.590315
+          R9C_DEC = 35.201606
+          ENERGY_MIN = 1000.0
+          ENERGY_MAX = 1000000.0
+
+          LAGS = {
+              "LAG300D": {
+                  "lag_days_nominal": 300,
+                  "post_week": 771,
+                  "pre_week": 685,
+                  "cache": CACHE300,
+                  "known_result": "R9C rank=1, post-pre residual +5.561814",
+              },
+              "LAG650D": {
+                  "lag_days_nominal": 650,
+                  "post_week": 821,
+                  "pre_week": 635,
+                  "cache": CACHE650,
+                  "known_result": "R9C rank=1, post-pre residual +21.718969, strongest peak",
+              },
+          }
+
+          URLS = {
+              821: {
+                  "photon": "https://heasarc.gsfc.nasa.gov/FTP/fermi/data/lat/weekly/photon/lat_photon_weekly_w821_p305_v001.fits",
+                  "spacecraft": "https://heasarc.gsfc.nasa.gov/FTP/fermi/data/lat/weekly/spacecraft/lat_spacecraft_weekly_w821_p310_v001.fits",
+              },
+              635: {
+                  "photon": "https://heasarc.gsfc.nasa.gov/FTP/fermi/data/lat/weekly/photon/lat_photon_weekly_w635_p305_v001.fits",
+                  "spacecraft": "https://heasarc.gsfc.nasa.gov/FTP/fermi/data/lat/weekly/spacecraft/lat_spacecraft_weekly_w635_p310_v001.fits",
+              },
+          }
+          CATALOG_URLS = [
+              "https://fermi.gsfc.nasa.gov/ssc/data/access/lat/14yr_catalog/gll_psc_v35.fit",
+              "https://heasarc.gsfc.nasa.gov/FTP/fermi/data/lat/catalogs/4FGL/gll_psc_v35.fit",
+          ]
+
+          def log(msg):
+              s = f"[{datetime.now(timezone.utc).isoformat()}] {msg}"
+              print(s, flush=True)
+              with PROGRESS.open("a", encoding="utf-8") as f:
+                  f.write(s + "\n")
+
+          def write_json(name, obj):
+              (OUT / name).write_text(json.dumps(obj, indent=2, sort_keys=True, ensure_ascii=False), encoding="utf-8")
+
+          def write_csv(name, rows, fields):
+              with (OUT / name).open("w", newline="", encoding="utf-8") as f:
+                  w = csv.DictWriter(f, fieldnames=fields)
+                  w.writeheader()
+                  for r in rows:
+                      w.writerow({k: r.get(k, "") for k in fields})
+
+          def sha256_file(path):
+              h = hashlib.sha256()
+              with open(path, "rb") as f:
+                  for b in iter(lambda: f.read(1024 * 1024), b""):
+                      h.update(b)
+              return h.hexdigest()
+
+          def run(cmd, timeout=None):
+              return subprocess.run(cmd, text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=timeout)
+
+          def download_url(url, dest, label, timeout=7200):
+              dest.parent.mkdir(parents=True, exist_ok=True)
+              if dest.exists() and dest.stat().st_size > 1024:
+                  return {"label": label, "ok": True, "method": "preexisting", "path": str(dest), "size_bytes": dest.stat().st_size, "sha256": sha256_file(dest), "url": "preexisting"}
+              log(f"DOWNLOAD {label}: {url}")
+              cmd = ["curl", "-L", "--fail", "--connect-timeout", "90", "--max-time", str(timeout),
+                     "--retry", "12", "--retry-delay", "20", "--retry-max-time", str(timeout),
+                     "-A", "ACIRM-R13M-N2F-R1", "-o", str(dest), url]
+              p = run(cmd, timeout=timeout + 120)
+              (OUT / f"download_{label}.log").write_text((p.stdout or "")[-12000:], encoding="utf-8", errors="replace")
+              ok = p.returncode == 0 and dest.exists() and dest.stat().st_size > 1024
+              return {"label": label, "ok": ok, "method": "curl", "path": str(dest), "size_bytes": dest.stat().st_size if dest.exists() else 0, "sha256": sha256_file(dest) if ok else "", "url": url, "returncode": p.returncode}
+
+          def fits_magic_ok(path):
+              try:
+                  with open(path, "rb") as f:
+                      return f.read(6) == b"SIMPLE"
+              except Exception:
+                  return False
+
+          def find_file(cache_dir, filename):
+              p = cache_dir / filename
+              if p.exists() and p.stat().st_size > 1024:
+                  return p
+              hits = list(cache_dir.rglob(filename)) if cache_dir.exists() else []
+              hits = [h for h in hits if h.is_file() and h.stat().st_size > 1024]
+              return hits[0] if hits else None
+
+          def ensure_success_lag_inputs():
+              downloads = []
+              required = []
+              # lag 300 comes from R8 cache; do not download if missing, to avoid accidental route change.
+              for week in [771, 685]:
+                  c = CACHE300
+                  required.append({"label": f"photon_w{week}", "path": c / f"lat_photon_weekly_w{week:03d}_p305_v001.fits", "must_exist": True})
+                  required.append({"label": f"spacecraft_w{week}", "path": c / f"lat_spacecraft_weekly_w{week:03d}_p310_v001.fits", "must_exist": True})
+              required.append({"label": "catalog_gll_psc_v35_from_R8", "path": CACHE300 / "gll_psc_v35.fit", "must_exist": False})
+              # lag 650 may be missing; download/cache only this successful-lag input if needed.
+              for week in [821, 635]:
+                  for kind in ["photon", "spacecraft"]:
+                      fname = f"lat_{kind}_weekly_w{week:03d}_{'p305' if kind=='photon' else 'p310'}_v001.fits"
+                      dest = CACHE650 / fname
+                      if dest.exists() and dest.stat().st_size > 1024:
+                          downloads.append({"label": f"{kind}_w{week}", "ok": True, "method": "preexisting", "path": str(dest), "size_bytes": dest.stat().st_size, "sha256": sha256_file(dest), "url": "preexisting"})
+                      else:
+                          downloads.append(download_url(URLS[week][kind], dest, f"{kind}_w{week}"))
+              cat = find_file(CACHE300, "gll_psc_v35.fit") or find_file(CACHE650, "gll_psc_v35.fit")
+              if cat is None:
+                  for i, url in enumerate(CATALOG_URLS, 1):
+                      res = download_url(url, CACHE650 / "gll_psc_v35.fit", f"catalog_source{i}", timeout=3600)
+                      downloads.append(res)
+                      if res["ok"]:
+                          cat = Path(res["path"])
+                          break
+              else:
+                  downloads.append({"label": "catalog_gll_psc_v35", "ok": True, "method": "cache", "path": str(cat), "size_bytes": cat.stat().st_size, "sha256": sha256_file(cat), "url": "cache"})
+              rows = []
+              missing = []
+              paths = {"catalog": cat}
+              for lag, cfg in LAGS.items():
+                  for phase, week in [("post", cfg["post_week"]), ("pre", cfg["pre_week"] )]:
+                      cache = cfg["cache"]
+                      photon = find_file(cache, f"lat_photon_weekly_w{week:03d}_p305_v001.fits")
+                      spacecraft = find_file(cache, f"lat_spacecraft_weekly_w{week:03d}_p310_v001.fits")
+                      paths[(lag, phase, "photon")] = photon
+                      paths[(lag, phase, "spacecraft")] = spacecraft
+                      for label, p in [(f"{lag}_{phase}_photon_w{week}", photon), (f"{lag}_{phase}_spacecraft_w{week}", spacecraft)]:
+                          ok = bool(p and p.exists() and p.stat().st_size > 1024 and fits_magic_ok(p))
+                          rows.append({"label": label, "ok": ok, "path": str(p) if p else "", "size_bytes": p.stat().st_size if p else 0, "fits_magic_ok": fits_magic_ok(p) if p else False})
+                          if not ok:
+                              missing.append(label)
+              okcat = bool(cat and cat.exists() and cat.stat().st_size > 1024 and fits_magic_ok(cat))
+              rows.append({"label": "catalog_gll_psc_v35", "ok": okcat, "path": str(cat) if cat else "", "size_bytes": cat.stat().st_size if cat else 0, "fits_magic_ok": fits_magic_ok(cat) if cat else False})
+              if not okcat:
+                  missing.append("catalog_gll_psc_v35")
+              write_csv("DOWNLOADS.csv", downloads, ["label", "ok", "method", "path", "size_bytes", "sha256", "url", "returncode"])
+              write_csv("INPUT_VALIDATION.csv", rows, ["label", "ok", "path", "size_bytes", "fits_magic_ok"])
+              return paths, missing
+
+          def colname(names, candidates):
+              up = {n.upper(): n for n in names}
+              for c in candidates:
+                  if c.upper() in up:
+                      return up[c.upper()]
+              return None
+
+          def angdeg(ra1, dec1, ra2, dec2):
+              ra1 = np.deg2rad(ra1); dec1 = np.deg2rad(dec1); ra2 = np.deg2rad(ra2); dec2 = np.deg2rad(dec2)
+              c = np.sin(dec1)*np.sin(dec2) + np.cos(dec1)*np.cos(dec2)*np.cos(ra1-ra2)
+              return np.rad2deg(np.arccos(np.clip(c, -1, 1)))
+
+          def read_catalog_candidates(cat_path):
+              with fits.open(cat_path, memmap=True) as hdul:
+                  h = None
+                  for x in hdul:
+                      if hasattr(x, "columns") and x.columns is not None:
+                          names = list(x.columns.names)
+                          if colname(names, ["RAJ2000", "RA", "GLON"]) and colname(names, ["DEJ2000", "DEC", "GLAT"]):
+                              h = x; break
+                  if h is None:
+                      raise RuntimeError("No suitable catalog table found")
+                  names = list(h.columns.names)
+                  cra = colname(names, ["RAJ2000", "RA"])
+                  cdec = colname(names, ["DEJ2000", "DEC"])
+                  cname = colname(names, ["Source_Name", "Source_Name_4FGL", "Name"])
+                  cassoc = colname(names, ["ASSOC1", "ASSOC", "ASSOC_FGL"])
+                  cclass = colname(names, ["CLASS1", "CLASS", "CLASS2"])
+                  rows = []
+                  for r in h.data:
+                      ra = float(r[cra]); dec = float(r[cdec])
+                      d = float(angdeg(R9C_RA, R9C_DEC, ra, dec))
+                      if d <= 15.0:
+                          def sval(c):
+                              if not c: return ""
+                              v = r[c]
+                              if isinstance(v, bytes): return v.decode("utf-8", errors="ignore").strip()
+                              return str(v).strip()
+                          rows.append({"source_name": sval(cname), "assoc": sval(cassoc), "class": sval(cclass), "ra": ra, "dec": dec, "dist_deg_from_R9C": d})
+                  rows.sort(key=lambda x: x["dist_deg_from_R9C"])
+              return rows
+
+          def read_events(path):
+              with fits.open(path, memmap=True) as hdul:
+                  for h in hdul:
+                      if hasattr(h, "columns") and h.columns is not None:
+                          names = [n.upper() for n in h.columns.names]
+                          if all(x in names for x in ["RA", "DEC", "ENERGY"]):
+                              ra = np.asarray(h.data["RA"], dtype=float)
+                              dec = np.asarray(h.data["DEC"], dtype=float)
+                              en = np.asarray(h.data["ENERGY"], dtype=float)
+                              m = np.isfinite(ra) & np.isfinite(dec) & np.isfinite(en) & (en >= ENERGY_MIN) & (en <= ENERGY_MAX)
+                              return ra[m], dec[m], en[m]
+              raise RuntimeError(f"No EVENTS-like table found in {path}")
+
+          def count_aperture(ra, dec, center_ra, center_dec, radius):
+              if len(ra) == 0:
+                  return 0
+              return int(np.sum(angdeg(center_ra, center_dec, ra, dec) <= radius))
+
+          PY
+
+      - name: Create N2F R1 aperture-localization worker part 2 of 2
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat >> acirm_r13m_n2f_r1_worker.py <<'PY'
+          def analyze(paths, candidates):
+              selected = []
+              selected.append({"source_name": "R9C_CENTER", "assoc": "R9C analysis center", "class": "center", "ra": R9C_RA, "dec": R9C_DEC, "dist_deg_from_R9C": 0.0})
+              for r in candidates:
+                  if r["dist_deg_from_R9C"] <= 5.0:
+                      selected.append(r)
+              selected = selected[:30]
+              apertures = [0.25, 0.5, 1.0]
+              raw_rows = []
+              radial_rows = []
+              for lag, cfg in LAGS.items():
+                  for phase in ["post", "pre"]:
+                      week = cfg["post_week"] if phase == "post" else cfg["pre_week"]
+                      photon = paths[(lag, phase, "photon")]
+                      log(f"READ EVENTS {lag} {phase} week={week}")
+                      ra, dec, en = read_events(photon)
+                      total_band_events = int(len(ra))
+                      for src in selected:
+                          for ap in apertures:
+                              raw_rows.append({"lag": lag, "phase": phase, "week": week, "source_name": src["source_name"], "assoc": src["assoc"], "class": src["class"], "source_ra": src["ra"], "source_dec": src["dec"], "dist_deg_from_R9C": src["dist_deg_from_R9C"], "aperture_deg": ap, "count_1gev_1tev": count_aperture(ra, dec, src["ra"], src["dec"], ap), "total_week_band_events": total_band_events})
+                      bins = [(0,0.25),(0.25,0.5),(0.5,1.0),(1.0,2.0),(2.0,3.0),(3.0,5.0)]
+                      d = angdeg(R9C_RA, R9C_DEC, ra, dec)
+                      for lo, hi in bins:
+                          radial_rows.append({"lag": lag, "phase": phase, "week": week, "r_inner_deg": lo, "r_outer_deg": hi, "count_1gev_1tev": int(np.sum((d > lo) & (d <= hi))), "total_week_band_events": total_band_events})
+              key = {}
+              for r in raw_rows:
+                  k = (r["lag"], r["source_name"], r["aperture_deg"])
+                  key.setdefault(k, {})[r["phase"]] = r
+              delta_rows = []
+              for k, v in key.items():
+                  lag, source_name, ap = k
+                  post = v.get("post"); pre = v.get("pre")
+                  if not post or not pre: continue
+                  delta_rows.append({"lag": lag, "source_name": source_name, "assoc": post["assoc"], "class": post["class"], "dist_deg_from_R9C": post["dist_deg_from_R9C"], "aperture_deg": ap, "post_count": post["count_1gev_1tev"], "pre_count": pre["count_1gev_1tev"], "post_minus_pre_count": post["count_1gev_1tev"] - pre["count_1gev_1tev"]})
+              delta_rows.sort(key=lambda x: (x["lag"], -x["post_minus_pre_count"], x["dist_deg_from_R9C"]))
+              return selected, raw_rows, delta_rows, radial_rows
+
+          def make_zip():
+              zip_path = BASE / f"{STAGE}_RESULTS.zip"
+              sha_path = BASE / f"{STAGE}_RESULTS.zip.sha256.txt"
+              if zip_path.exists(): zip_path.unlink()
+              shutil.make_archive(str(zip_path).replace(".zip", ""), "zip", root_dir=str(OUT.parent), base_dir=OUT.name)
+              sha = sha256_file(zip_path)
+              sha_path.write_text(f"{sha}  {zip_path.name}\n", encoding="utf-8")
+              log(f"ZIP={zip_path.name} SHA256={sha}")
+
+          try:
+              log("START N2F R1 aperture localization preflight. No proof/no discovery/no source attribution finalization.")
+              write_json("LOCKED_THEORY_CONTEXT.json", {
+                  "stage": STAGE,
+                  "theory_review_before_step": "R9C is treated as the locked gate/resonant-seed event. Multi-lag results show lag-selective energy response: success at 300d and peak 650d, not broad persistence. N2F tests whether successful-lag photons are spatially concentrated around Cyg X-1/R9C or spread across the ROI/catalog candidates.",
+                  "successful_lags_used": {"LAG300D": "+5.561814, rank 1", "LAG650D": "+21.718969, rank 1, peak"},
+                  "non_success_lags_not_used_for_source_attribution": ["450d", "850d", "1000d"],
+                  "claim_ceiling": "NO_SCORE_NOT_PROOF_NOT_DISCOVERY_LOCALIZATION_PREFLIGHT_ONLY",
+                  "energy_band_mev": [ENERGY_MIN, ENERGY_MAX]
+              })
+              paths, missing = ensure_success_lag_inputs()
+              if missing:
+                  write_json("FINAL_DECISION.json", {"stage": STAGE, "decision": "TECHNICAL_STOP_N2F_R1_REQUIRED_SUCCESS_LAG_INPUTS_MISSING_NO_SCORE", "technical_stop": True, "scientific_result": False, "missing": missing, "claim_ceiling": "NO_SCORE_NOT_PROOF_NOT_DISCOVERY"})
+                  make_zip(); raise SystemExit(0)
+              candidates = read_catalog_candidates(paths["catalog"])
+              write_csv("CATALOG_CANDIDATES_WITHIN_15DEG.csv", candidates, ["source_name", "assoc", "class", "ra", "dec", "dist_deg_from_R9C"])
+              counts_by_radius = []
+              for rad in [0.5, 1.0, 2.0, 5.0, 10.0, 15.0]:
+                  counts_by_radius.append({"radius_deg": rad, "catalog_sources_n": sum(1 for r in candidates if r["dist_deg_from_R9C"] <= rad)})
+              write_csv("CATALOG_SOURCE_COUNTS_BY_RADIUS.csv", counts_by_radius, ["radius_deg", "catalog_sources_n"])
+              selected, raw_rows, delta_rows, radial_rows = analyze(paths, candidates)
+              write_csv("SELECTED_LOCALIZATION_CANDIDATES.csv", selected, ["source_name", "assoc", "class", "ra", "dec", "dist_deg_from_R9C"])
+              write_csv("SUCCESS_LAG_APERTURE_COUNTS.csv", raw_rows, ["lag", "phase", "week", "source_name", "assoc", "class", "source_ra", "source_dec", "dist_deg_from_R9C", "aperture_deg", "count_1gev_1tev", "total_week_band_events"])
+              write_csv("SUCCESS_LAG_APERTURE_POST_PRE_DELTAS.csv", delta_rows, ["lag", "source_name", "assoc", "class", "dist_deg_from_R9C", "aperture_deg", "post_count", "pre_count", "post_minus_pre_count"])
+              write_csv("R9C_CENTER_RADIAL_BIN_COUNTS.csv", radial_rows, ["lag", "phase", "week", "r_inner_deg", "r_outer_deg", "count_1gev_1tev", "total_week_band_events"])
+              nearest = candidates[0] if candidates else None
+              cygx1_like = [r for r in candidates if "CYG" in (r.get("assoc", "") + r.get("source_name", "")).upper()]
+              summary = {
+                  "stage": STAGE,
+                  "decision": "N2F_R1_APERTURE_LOCALIZATION_PREFLIGHT_COMPLETED_NO_SCORE",
+                  "technical_stop": False,
+                  "scientific_result": False,
+                  "catalog_candidates_within_15deg_n": len(candidates),
+                  "nearest_catalog_source": nearest,
+                  "cygx1_like_candidates": cygx1_like[:5],
+                  "selected_candidates_n": len(selected),
+                  "aperture_delta_rows_n": len(delta_rows),
+                  "interpretation_boundary": "Aperture counts are localization preflight only. They do not prove source attribution and do not replace Fermipy source-resolved TS or residual mapping.",
+                  "claim_ceiling": "NO_SCORE_NOT_PROOF_NOT_DISCOVERY"
+              }
+              write_json("SUMMARY.json", summary)
+              write_json("FINAL_DECISION.json", summary)
+              make_zip()
+          except SystemExit:
+              raise
+          except Exception:
+              write_json("FINAL_DECISION.json", {"stage": STAGE, "decision": "TECHNICAL_STOP_N2F_R1_EXCEPTION_NO_SCORE", "technical_stop": True, "scientific_result": False, "exception_tail": traceback.format_exc()[-4000:], "claim_ceiling": "NO_SCORE_NOT_PROOF_NOT_DISCOVERY"})
+              (OUT / "EXCEPTION_TRACEBACK.txt").write_text(traceback.format_exc(), encoding="utf-8")
+              make_zip()
+          PY
+          python -m py_compile acirm_r13m_n2f_r1_worker.py
+          wc -c acirm_r13m_n2f_r1_worker.py
+
+      - name: Run N2F R1 aperture localization preflight
+        shell: bash
+        run: |
+          set -euo pipefail
+          python acirm_r13m_n2f_r1_worker.py
+
+      - name: Show final decision
+        if: always()
+        shell: bash
+        run: |
+          set +e
+          cat ACIRM_R13M_N2F_R1_SUCCESSFUL_LAG_APERTURE_LOCALIZATION_PREFLIGHT_NO_SCORE_OUTPUT/FINAL_DECISION.json || true
+          echo ""
+          tail -n 160 ACIRM_R13M_N2F_R1_SUCCESSFUL_LAG_APERTURE_LOCALIZATION_PREFLIGHT_NO_SCORE_OUTPUT/PROGRESS.log || true
+
+      - name: Upload N2F R1 artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ACIRM_R13M_N2F_R1_SUCCESSFUL_LAG_APERTURE_LOCALIZATION_PREFLIGHT_RESULTS
+          path: |
+            ACIRM_R13M_N2F_R1_SUCCESSFUL_LAG_APERTURE_LOCALIZATION_PREFLIGHT_NO_SCORE_RESULTS.zip
+            ACIRM_R13M_N2F_R1_SUCCESSFUL_LAG_APERTURE_LOCALIZATION_PREFLIGHT_NO_SCORE_RESULTS.zip.sha256.txt
+            ACIRM_R13M_N2F_R1_SUCCESSFUL_LAG_APERTURE_LOCALIZATION_PREFLIGHT_NO_SCORE_OUTPUT/**
+          retention-days: 14
