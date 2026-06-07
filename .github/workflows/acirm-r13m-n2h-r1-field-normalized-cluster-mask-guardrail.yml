@@ -1,0 +1,301 @@
+name: ACIRM R13M N2H R1 Field Normalized Cluster Mask Guardrail
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  n2h-r1-field-normalized-cluster-mask:
+    runs-on: ubuntu-latest
+    timeout-minutes: 150
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Restore photon caches
+        uses: actions/cache@v4
+        with:
+          path: |
+            ${{ github.workspace }}/.acirm_lat_cache_n2b_lag300d
+            ${{ github.workspace }}/.acirm_lat_cache_n2f_lag650d_split
+          key: acirm-r13m-n2h-r1-field-normalized-photon-inputs-${{ github.run_id }}
+          restore-keys: |
+            acirm-r13m-n2f-lag650d-split-photon-w821-
+            acirm-r13m-n2f-lag650d-split-photon-w635-
+            acirm-r13m-n2b-lag300d-w685-w771-inputs-r8-
+            acirm-r13m-lat-weekly-w635-w821-inputs-r7-
+            acirm-r13m-lat-weekly-w635-w821-inputs-r5-
+
+      - name: Install lightweight Python tools
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m pip install --upgrade pip -q
+          python -m pip install -q numpy astropy
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq aria2 curl zip unzip
+
+      - name: Create N2H worker part 1
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat > n2h_worker.py <<'PY'
+          import csv, json, math, os, shutil, subprocess, time, hashlib, traceback
+          from pathlib import Path
+          import numpy as np
+          from astropy.io import fits
+
+          STAGE = "ACIRM_R13M_N2H_R1_FIELD_NORMALIZED_CLUSTER_MASK_GUARDRAIL_NO_SCORE"
+          OUT = Path(f"{STAGE}_OUTPUT")
+          OUT.mkdir(exist_ok=True)
+          CLAIM = "NO_SCORE_NOT_PROOF_NOT_DISCOVERY"
+          R9C_RA = 299.590315
+          R9C_DEC = 35.201606
+          EMIN = 1000.0
+          EMAX = 1000000.0
+          PROGRESS = OUT / "PROGRESS.log"
+
+          INPUTS = [
+              {"label":"LAG300D_post_w771","lag":"LAG300D","phase":"post","week":771,"url":"https://heasarc.gsfc.nasa.gov/FTP/fermi/data/lat/weekly/photon/lat_photon_weekly_w771_p305_v001.fits","paths":[".acirm_lat_cache_n2b_lag300d/lat_photon_weekly_w771_p305_v001.fits", ".acirm_lat_cache_n2h/lat_photon_weekly_w771_p305_v001.fits"]},
+              {"label":"LAG300D_pre_w685","lag":"LAG300D","phase":"pre","week":685,"url":"https://heasarc.gsfc.nasa.gov/FTP/fermi/data/lat/weekly/photon/lat_photon_weekly_w685_p305_v001.fits","paths":[".acirm_lat_cache_n2b_lag300d/lat_photon_weekly_w685_p305_v001.fits", ".acirm_lat_cache_n2h/lat_photon_weekly_w685_p305_v001.fits"]},
+              {"label":"LAG650D_post_w821","lag":"LAG650D","phase":"post","week":821,"url":"https://heasarc.gsfc.nasa.gov/FTP/fermi/data/lat/weekly/photon/lat_photon_weekly_w821_p305_v001.fits","paths":[".acirm_lat_cache_n2f_lag650d_split/photon_w821/lat_photon_weekly_w821_p305_v001.fits", ".acirm_lat_cache_n2h/lat_photon_weekly_w821_p305_v001.fits"]},
+              {"label":"LAG650D_pre_w635","lag":"LAG650D","phase":"pre","week":635,"url":"https://heasarc.gsfc.nasa.gov/FTP/fermi/data/lat/weekly/photon/lat_photon_weekly_w635_p305_v001.fits","paths":[".acirm_lat_cache_n2f_lag650d_split/photon_w635/lat_photon_weekly_w635_p305_v001.fits", ".acirm_lat_cache_n2h/lat_photon_weekly_w635_p305_v001.fits"]},
+          ]
+
+          SOURCES = [
+            {"source_id":"R9C_CYGX1_CENTER","assoc":"R9C/Cyg X-1 center","cls":"target_center","ra":299.590315,"dec":35.201606,"dist":0.0},
+            {"source_id":"4FGL J1958.5+3512","assoc":"Cyg X-1","cls":"hmb","ra":299.6343078613281,"dec":35.20240020751953,"dist":0.0359564276304094},
+            {"source_id":"4FGL J1950.6+3456","assoc":"2MASS J19502776+3456224","cls":"bcu","ra":297.6642150878906,"dec":34.94340133666992,"dist":1.5973485808791534},
+            {"source_id":"4FGL J2004.9+3421","assoc":"","cls":"","ra":301.2484130859375,"dec":34.35060119628906,"dist":1.6059157889571691},
+            {"source_id":"4FGL J2004.3+3339","assoc":"B2 2002+33","cls":"unk","ra":301.09600830078125,"dec":33.655399322509766,"dist":1.983160957618444},
+            {"source_id":"4FGL J2005.8+3357","assoc":"","cls":"","ra":301.4739990234375,"dec":33.95610046386719,"dist":1.989057117545784},
+            {"source_id":"4FGL J1948.9+3414","assoc":"","cls":"","ra":297.2261962890625,"dec":34.239601135253906,"dist":2.1681655108615416},
+            {"source_id":"4FGL J2009.9+3544","assoc":"B2 2008+35","cls":"bcu","ra":302.4891967773437,"dec":35.74599838256836,"dist":2.422644339422418},
+            {"source_id":"4FGL J1954.4+3252e","assoc":"CTB 80","cls":"SPP","ra":298.6000061035156,"dec":32.869998931884766,"dist":2.471769439602049},
+            {"source_id":"4FGL J2002.3+3246","assoc":"SNR G069.7+01.0","cls":"spp","ra":300.5997009277344,"dec":32.77880096435547,"dist":2.5632321685955604},
+            {"source_id":"4FGL J1952.9+3252","assoc":"PSR J1952+3252","cls":"PSR","ra":298.247314453125,"dec":32.882999420166016,"dist":2.571757782717301},
+            {"source_id":"4FGL J2013.5+3613","assoc":"SNR G073.9+00.9","cls":"spp","ra":303.3844909667969,"dec":36.225399017333984,"dist":3.246048161207813},
+            {"source_id":"4FGL J1959.0+3844","assoc":"LQAC 299+038","cls":"bcu","ra":299.76629638671875,"dec":38.73680114746094,"dist":3.537987659798902},
+            {"source_id":"4FGL J1950.2+3822","assoc":"RX J1950.0+3821","cls":"unk","ra":297.56939697265625,"dec":38.371700286865234,"dist":3.559091895403688},
+            {"source_id":"4FGL J1953.5+3841","assoc":"","cls":"","ra":298.3848876953125,"dec":38.6880989074707,"dist":3.6170398911174417},
+            {"source_id":"4FGL J2017.3+3525","assoc":"","cls":"","ra":304.3492126464844,"dec":35.42259979248047,"dist":3.889238843639835},
+            {"source_id":"4FGL J2015.5+3710","assoc":"MG2 J201534+3710","cls":"FSRQ","ra":303.89239501953125,"dec":37.17599868774414,"dist":3.993576217978025},
+            {"source_id":"4FGL J2016.2+3712","assoc":"VER J2016+372","cls":"snr","ra":304.056884765625,"dec":37.21310043334961,"dist":4.126644299917183},
+            {"source_id":"4FGL J2017.9+3625","assoc":"PSR J2017+3625","cls":"PSR","ra":304.49090576171875,"dec":36.42770004272461,"dist":4.158222141614726},
+            {"source_id":"4FGL J2006.2+3102","assoc":"PSR J2006+3102","cls":"PSR","ra":301.56610107421875,"dec":31.04459953308105,"dist":4.473921852177352},
+            {"source_id":"4FGL J1935.4+3547","assoc":"","cls":"","ra":293.8646850585937,"dec":35.796199798583984,"dist":4.69845561778258},
+            {"source_id":"4FGL J2021.9+3609","assoc":"","cls":"","ra":305.4862976074219,"dec":36.15769958496094,"dist":4.882909314033249},
+            {"source_id":"4FGL J2021.1+3651","assoc":"PSR J2021+3651","cls":"PSR","ra":305.27960205078125,"dec":36.85609817504883,"dist":4.888469684256179},
+          ]
+          TOP4 = {"4FGL J2015.5+3710","4FGL J2016.2+3712","4FGL J2017.9+3625","4FGL J2013.5+3613"}
+
+          def log(msg):
+              s = f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] {msg}"
+              print(s, flush=True)
+              with PROGRESS.open('a', encoding='utf-8') as f:
+                  f.write(s + '\n')
+
+          def write_json(name, obj):
+              (OUT/name).write_text(json.dumps(obj, indent=2, sort_keys=True), encoding='utf-8')
+
+          def write_csv(name, rows, fields):
+              with (OUT/name).open('w', newline='', encoding='utf-8') as f:
+                  w = csv.DictWriter(f, fieldnames=fields)
+                  w.writeheader()
+                  for r in rows:
+                      w.writerow({k:r.get(k,'') for k in fields})
+
+          def sha256_file(p):
+              h=hashlib.sha256()
+              with open(p,'rb') as f:
+                  for b in iter(lambda:f.read(1024*1024), b''):
+                      h.update(b)
+              return h.hexdigest()
+
+          def fits_ok(p):
+              try:
+                  with open(p,'rb') as f:
+                      return f.read(6)==b'SIMPLE'
+              except Exception:
+                  return False
+
+          def run(cmd, timeout=None):
+              return subprocess.run(cmd, text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=timeout)
+
+          def ensure_file(item):
+              for raw in item['paths']:
+                  p=Path(raw)
+                  if p.exists() and p.stat().st_size>1024 and fits_ok(p):
+                      return p, 'cache'
+              dest=Path(item['paths'][-1])
+              dest.parent.mkdir(parents=True, exist_ok=True)
+              cmd=['aria2c','-x','4','-s','4','-c','--timeout=180','--connect-timeout=90','--max-tries=8','--retry-wait=20','-d',str(dest.parent),'-o',dest.name,item['url']]
+              log('download '+item['label'])
+              p=run(cmd, timeout=3600)
+              (OUT/(item['label']+'_aria2.log')).write_text((p.stdout or '')[-12000:], encoding='utf-8', errors='replace')
+              if p.returncode==0 and dest.exists() and fits_ok(dest):
+                  return dest, 'aria2c'
+              cmd2=['curl','-L','--fail','--connect-timeout','90','--max-time','3600','--retry','4','--retry-delay','20','-o',str(dest),item['url']]
+              p2=run(cmd2, timeout=3700)
+              (OUT/(item['label']+'_curl.log')).write_text((p2.stdout or '')[-12000:], encoding='utf-8', errors='replace')
+              if p2.returncode==0 and dest.exists() and fits_ok(dest):
+                  return dest, 'curl'
+              return dest, 'missing'
+
+          def angsep_deg(ra1,dec1,ra2,dec2):
+              ra1=np.deg2rad(ra1); dec1=np.deg2rad(dec1); ra2=np.deg2rad(ra2); dec2=np.deg2rad(dec2)
+              c=np.sin(dec1)*np.sin(dec2)+np.cos(dec1)*np.cos(dec2)*np.cos(ra1-ra2)
+              return np.rad2deg(np.arccos(np.clip(c,-1,1)))
+          PY
+      - name: Create N2H worker part 2
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat >> n2h_worker.py <<'PY'
+          def load_events(path):
+              with fits.open(path, memmap=True) as hdul:
+                  d=hdul['EVENTS'].data
+                  ra=np.asarray(d['RA'], dtype=float)
+                  dec=np.asarray(d['DEC'], dtype=float)
+                  e=np.asarray(d['ENERGY'], dtype=float)
+                  m=np.isfinite(ra)&np.isfinite(dec)&np.isfinite(e)&(e>=EMIN)&(e<=EMAX)
+                  return ra[m], dec[m], e[m]
+
+          def mask_events_by_sources(ra, dec, sources, radius):
+              if not sources:
+                  return np.zeros(len(ra), dtype=bool)
+              mask=np.zeros(len(ra), dtype=bool)
+              for s in sources:
+                  sep=angsep_deg(ra, dec, s['ra'], s['dec'])
+                  mask |= (sep <= radius)
+              return mask
+
+          def main():
+              log('START '+STAGE)
+              write_json('LOCKED_THEORY_CONTEXT.json', {
+                  'stage': STAGE,
+                  'energy_source_policy': 'Energy origin is deliberately source-neutral. The test asks what happens when resonant/gate conditions are met and energy is available/coupled, not whether energy originated inside or outside the black-hole system.',
+                  'claim_ceiling': CLAIM,
+                  'note': 'This is photon-field-normalized and cluster-mask guardrail. It is not true spacecraft/exposure-corrected Fermipy attribution.'
+              })
+              manifest=[]; loaded={}
+              for item in INPUTS:
+                  path, method = ensure_file(item)
+                  row={**{k:item[k] for k in ['label','lag','phase','week']}, 'path':str(path), 'method':method, 'exists':path.exists(), 'size_bytes':path.stat().st_size if path.exists() else 0, 'fits_magic_ok':fits_ok(path), 'sha256':sha256_file(path) if path.exists() and fits_ok(path) else ''}
+                  row['ready'] = bool(row['exists'] and row['fits_magic_ok'])
+                  manifest.append(row)
+                  if row['ready']:
+                      ra,dec,e=load_events(path)
+                      loaded[item['label']]={'ra':ra,'dec':dec,'e':e,'lag':item['lag'],'phase':item['phase'],'week':item['week'],'n_total':len(ra)}
+              write_csv('INPUT_PHOTON_MANIFEST.csv', manifest, ['label','lag','phase','week','path','method','exists','size_bytes','fits_magic_ok','sha256','ready'])
+              if len(loaded)!=4:
+                  write_json('FINAL_DECISION.json', {'stage':STAGE,'decision':'TECHNICAL_STOP_N2H_REQUIRED_PHOTON_INPUTS_MISSING_NO_SCORE','technical_stop':True,'scientific_result':False,'claim_ceiling':CLAIM,'ready_files':len(loaded)})
+                  package()
+                  return
+
+              # radial bins raw and normalized
+              bins=[(0,0.25),(0.25,0.5),(0.5,1),(1,2),(2,5),(5,10)]
+              radial=[]
+              for label,d in loaded.items():
+                  sep=angsep_deg(d['ra'], d['dec'], R9C_RA, R9C_DEC)
+                  for lo,hi in bins:
+                      c=int(((sep>=lo)&(sep<hi)).sum())
+                      radial.append({'input_label':label,'lag':d['lag'],'phase':d['phase'],'week':d['week'],'bin_lo_deg':lo,'bin_hi_deg':hi,'count':c,'total_selected_count':d['n_total'],'count_per_100k':100000*c/d['n_total'] if d['n_total'] else ''})
+              write_csv('FIELD_NORMALIZED_RADIAL_BINS.csv', radial, ['input_label','lag','phase','week','bin_lo_deg','bin_hi_deg','count','total_selected_count','count_per_100k'])
+
+              # post-pre normalized radial comparison
+              comp=[]
+              by={(r['lag'],r['phase'],r['bin_lo_deg'],r['bin_hi_deg']):r for r in radial}
+              for lag in ['LAG300D','LAG650D']:
+                  for lo,hi in bins:
+                      post=by.get((lag,'post',lo,hi)); pre=by.get((lag,'pre',lo,hi))
+                      if post and pre:
+                          comp.append({'lag':lag,'bin_lo_deg':lo,'bin_hi_deg':hi,'post_count':post['count'],'pre_count':pre['count'],'post_minus_pre_count':post['count']-pre['count'],'post_per_100k':post['count_per_100k'],'pre_per_100k':pre['count_per_100k'],'post_minus_pre_per_100k':post['count_per_100k']-pre['count_per_100k'],'post_over_pre_per_100k':(post['count_per_100k']/pre['count_per_100k'] if pre['count_per_100k'] else '')})
+              write_csv('FIELD_NORMALIZED_RADIAL_POST_PRE.csv', comp, ['lag','bin_lo_deg','bin_hi_deg','post_count','pre_count','post_minus_pre_count','post_per_100k','pre_per_100k','post_minus_pre_per_100k','post_over_pre_per_100k'])
+
+              # cluster mask guardrail
+              source_groups={
+                  'TOP4_650D_CLUSTER_CANDIDATES':[s for s in SOURCES if s['source_id'] in TOP4],
+                  'ALL_LOCKED_2_TO_5_DEG_NON_CYG':[s for s in SOURCES if s['dist']>=2 and s['dist']<=5 and '1958.5+3512' not in s['source_id']],
+                  'CYGX1_ONLY':[s for s in SOURCES if s['source_id']=='4FGL J1958.5+3512'],
+              }
+              guard=[]
+              for group_name, group_sources in source_groups.items():
+                  for mask_radius in [0.5,1.0]:
+                      for label,d in loaded.items():
+                          sep=angsep_deg(d['ra'], d['dec'], R9C_RA, R9C_DEC)
+                          base=(sep>=2.0)&(sep<5.0)
+                          smask=mask_events_by_sources(d['ra'], d['dec'], group_sources, mask_radius)
+                          c_before=int(base.sum())
+                          c_after=int((base & (~smask)).sum())
+                          guard.append({'input_label':label,'lag':d['lag'],'phase':d['phase'],'week':d['week'],'mask_group':group_name,'mask_radius_deg':mask_radius,'masked_source_n':len(group_sources),'ring_2_5_count_before_mask':c_before,'ring_2_5_count_after_mask':c_after,'total_selected_count':d['n_total'],'after_mask_per_100k':100000*c_after/d['n_total'] if d['n_total'] else ''})
+              write_csv('CLUSTER_MASK_RING_GUARDRAIL_RAW.csv', guard, ['input_label','lag','phase','week','mask_group','mask_radius_deg','masked_source_n','ring_2_5_count_before_mask','ring_2_5_count_after_mask','total_selected_count','after_mask_per_100k'])
+              gcomp=[]
+              gb={(r['lag'],r['phase'],r['mask_group'],r['mask_radius_deg']):r for r in guard}
+              for lag in ['LAG300D','LAG650D']:
+                  for group_name in source_groups:
+                      for mask_radius in [0.5,1.0]:
+                          post=gb.get((lag,'post',group_name,mask_radius)); pre=gb.get((lag,'pre',group_name,mask_radius))
+                          if post and pre:
+                              gcomp.append({'lag':lag,'mask_group':group_name,'mask_radius_deg':mask_radius,'post_after_mask_count':post['ring_2_5_count_after_mask'],'pre_after_mask_count':pre['ring_2_5_count_after_mask'],'post_minus_pre_after_mask_count':post['ring_2_5_count_after_mask']-pre['ring_2_5_count_after_mask'],'post_after_mask_per_100k':post['after_mask_per_100k'],'pre_after_mask_per_100k':pre['after_mask_per_100k'],'post_minus_pre_after_mask_per_100k':post['after_mask_per_100k']-pre['after_mask_per_100k']})
+              write_csv('CLUSTER_MASK_RING_GUARDRAIL_POST_PRE.csv', gcomp, ['lag','mask_group','mask_radius_deg','post_after_mask_count','pre_after_mask_count','post_minus_pre_after_mask_count','post_after_mask_per_100k','pre_after_mask_per_100k','post_minus_pre_after_mask_per_100k'])
+
+              # decision summary
+              key650=[r for r in comp if r['lag']=='LAG650D' and r['bin_lo_deg']==2.0 and r['bin_hi_deg']==5.0][0]
+              top4_1=[r for r in gcomp if r['lag']=='LAG650D' and r['mask_group']=='TOP4_650D_CLUSTER_CANDIDATES' and r['mask_radius_deg']==1.0][0]
+              all_1=[r for r in gcomp if r['lag']=='LAG650D' and r['mask_group']=='ALL_LOCKED_2_TO_5_DEG_NON_CYG' and r['mask_radius_deg']==1.0][0]
+              if key650['post_minus_pre_per_100k']>0 and top4_1['post_minus_pre_after_mask_per_100k']>0:
+                  decision='N2H_FIELD_NORMALIZED_RING_EXCESS_SURVIVES_TOP4_CLUSTER_MASK_NO_SCORE'
+              elif key650['post_minus_pre_per_100k']>0 and top4_1['post_minus_pre_after_mask_per_100k']<=0:
+                  decision='N2H_FIELD_NORMALIZED_RING_EXCESS_IS_TOP4_CLUSTER_DOMINATED_NO_SCORE'
+              else:
+                  decision='N2H_NO_FIELD_NORMALIZED_650D_RING_EXCESS_NO_SCORE'
+              summary={'stage':STAGE,'decision':decision,'technical_stop':False,'scientific_result':True,'claim_ceiling':CLAIM,'note':'Field-normalized photon guardrail; not true spacecraft/exposure-corrected attribution. Energy source origin remains unconstrained by theory.', 'lag650_ring_2_5_post_minus_pre_per_100k':key650['post_minus_pre_per_100k'],'lag650_top4_mask_1deg_post_minus_pre_per_100k':top4_1['post_minus_pre_after_mask_per_100k'],'lag650_all_2_5_mask_1deg_post_minus_pre_per_100k':all_1['post_minus_pre_after_mask_per_100k']}
+              write_json('SUMMARY.json', summary)
+              write_json('FINAL_DECISION.json', summary)
+              package()
+          
+          def package():
+              zipname=f'{STAGE}_RESULTS.zip'
+              shutil.make_archive(zipname[:-4], 'zip', root_dir='.', base_dir=str(OUT))
+              sha=hashlib.sha256(Path(zipname).read_bytes()).hexdigest()
+              Path(zipname+'.sha256.txt').write_text(f'{sha}  {zipname}\n', encoding='utf-8')
+              log('ZIP '+zipname+' SHA256 '+sha)
+
+          if __name__=='__main__':
+              try:
+                  main()
+              except Exception:
+                  (OUT/'EXCEPTION_TRACEBACK.txt').write_text(traceback.format_exc(), encoding='utf-8')
+                  write_json('FINAL_DECISION.json', {'stage':STAGE,'decision':'TECHNICAL_STOP_N2H_EXCEPTION_NO_SCORE','technical_stop':True,'scientific_result':False,'claim_ceiling':CLAIM,'error':traceback.format_exc()[-2000:]})
+                  package()
+          PY
+          python -m py_compile n2h_worker.py
+
+      - name: Run N2H field-normalized cluster-mask guardrail
+        shell: bash
+        run: |
+          set -euo pipefail
+          python n2h_worker.py
+
+      - name: Show final decision
+        if: always()
+        shell: bash
+        run: |
+          set +e
+          cat ACIRM_R13M_N2H_R1_FIELD_NORMALIZED_CLUSTER_MASK_GUARDRAIL_NO_SCORE_OUTPUT/FINAL_DECISION.json || true
+          echo ""
+          tail -n 80 ACIRM_R13M_N2H_R1_FIELD_NORMALIZED_CLUSTER_MASK_GUARDRAIL_NO_SCORE_OUTPUT/PROGRESS.log || true
+
+      - name: Upload N2H artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ACIRM_R13M_N2H_R1_FIELD_NORMALIZED_CLUSTER_MASK_GUARDRAIL_RESULTS
+          path: |
+            ACIRM_R13M_N2H_R1_FIELD_NORMALIZED_CLUSTER_MASK_GUARDRAIL_NO_SCORE_RESULTS.zip
+            ACIRM_R13M_N2H_R1_FIELD_NORMALIZED_CLUSTER_MASK_GUARDRAIL_NO_SCORE_RESULTS.zip.sha256.txt
+            ACIRM_R13M_N2H_R1_FIELD_NORMALIZED_CLUSTER_MASK_GUARDRAIL_NO_SCORE_OUTPUT/**
+          retention-days: 14
