@@ -1,0 +1,298 @@
+name: ACIRM R13M N2B R14 LAG1000D Download Cache Builder
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  acirm-r13m-n2b-r14-download-cache:
+    runs-on: ubuntu-latest
+    timeout-minutes: 70
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Restore persistent LAT cache for N2B LAG1000D
+        uses: actions/cache@v4
+        with:
+          path: ${{ github.workspace }}/.acirm_lat_cache_n2b_lag1000d
+          key: acirm-r13m-n2b-lag1000d-w585-w871-inputs-r14-${{ github.run_id }}
+          restore-keys: |
+            acirm-r13m-n2b-lag1000d-w585-w871-inputs-r14-
+            acirm-r13m-lat-weekly-w635-w821-inputs-r7-
+            acirm-r13m-lat-weekly-w635-w821-inputs-r5-
+
+      - name: Install lightweight download tools
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq curl wget aria2 zip unzip dnsutils
+
+      - name: Run ACIRM R13M N2B R14 fail-fast download cache builder
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import csv, json, hashlib, shutil, subprocess, time, socket, ssl
+          from pathlib import Path
+          from datetime import datetime, timezone
+          import urllib.request
+
+          STAGE = "ACIRM_R13M_N2B_R14_LAG1000D_DOWNLOAD_CACHE_BUILDER_NO_SCORE"
+          OUT = Path(f"{STAGE}_OUTPUT")
+          CACHE = Path(".acirm_lat_cache_n2b_lag1000d")
+          OUT.mkdir(exist_ok=True)
+          CACHE.mkdir(exist_ok=True)
+          PROGRESS = OUT / "PROGRESS.log"
+
+          FILES = [
+              {
+                  "label": "photon_w871",
+                  "kind": "photon",
+                  "week": 871,
+                  "url": "https://heasarc.gsfc.nasa.gov/FTP/fermi/data/lat/weekly/photon/lat_photon_weekly_w871_p305_v001.fits",
+                  "dest": CACHE / "lat_photon_weekly_w871_p305_v001.fits",
+                  "min_bytes": 50_000_000,
+                  "max_time": 1500,
+              },
+              {
+                  "label": "spacecraft_w871",
+                  "kind": "spacecraft",
+                  "week": 871,
+                  "url": "https://heasarc.gsfc.nasa.gov/FTP/fermi/data/lat/weekly/spacecraft/lat_spacecraft_weekly_w871_p310_v001.fits",
+                  "dest": CACHE / "lat_spacecraft_weekly_w871_p310_v001.fits",
+                  "min_bytes": 500_000,
+                  "max_time": 420,
+              },
+              {
+                  "label": "photon_w585",
+                  "kind": "photon",
+                  "week": 585,
+                  "url": "https://heasarc.gsfc.nasa.gov/FTP/fermi/data/lat/weekly/photon/lat_photon_weekly_w585_p305_v001.fits",
+                  "dest": CACHE / "lat_photon_weekly_w585_p305_v001.fits",
+                  "min_bytes": 50_000_000,
+                  "max_time": 1500,
+              },
+              {
+                  "label": "spacecraft_w585",
+                  "kind": "spacecraft",
+                  "week": 585,
+                  "url": "https://heasarc.gsfc.nasa.gov/FTP/fermi/data/lat/weekly/spacecraft/lat_spacecraft_weekly_w585_p310_v001.fits",
+                  "dest": CACHE / "lat_spacecraft_weekly_w585_p310_v001.fits",
+                  "min_bytes": 500_000,
+                  "max_time": 420,
+              },
+              {
+                  "label": "catalog_gll_psc_v35",
+                  "kind": "catalog",
+                  "week": "",
+                  "url": "https://fermi.gsfc.nasa.gov/ssc/data/access/lat/14yr_catalog/gll_psc_v35.fit",
+                  "dest": CACHE / "gll_psc_v35.fit",
+                  "min_bytes": 1_000_000,
+                  "max_time": 720,
+              },
+          ]
+
+          def log(msg):
+              s = f"[{datetime.now(timezone.utc).isoformat()}] {msg}"
+              print(s, flush=True)
+              with PROGRESS.open("a", encoding="utf-8") as f:
+                  f.write(s + "\n")
+
+          def write_json(name, obj):
+              (OUT / name).write_text(json.dumps(obj, indent=2, sort_keys=True), encoding="utf-8")
+
+          def write_csv(name, rows, fields):
+              with (OUT / name).open("w", newline="", encoding="utf-8") as f:
+                  w = csv.DictWriter(f, fieldnames=fields)
+                  w.writeheader()
+                  for r in rows:
+                      w.writerow({k: r.get(k, "") for k in fields})
+
+          def sha256_file(p):
+              h = hashlib.sha256()
+              with open(p, "rb") as f:
+                  for b in iter(lambda: f.read(1024 * 1024), b""):
+                      h.update(b)
+              return h.hexdigest()
+
+          def host(url):
+              return url.split("/")[2]
+
+          def dns_tls_check(h):
+              row = {"host": h, "dns_ok": False, "tls_ok": False, "addresses": "", "error": ""}
+              try:
+                  infos = socket.getaddrinfo(h, 443, proto=socket.IPPROTO_TCP)
+                  row["addresses"] = ";".join(sorted({x[4][0] for x in infos}))
+                  row["dns_ok"] = True
+                  raw = socket.create_connection((h, 443), timeout=25)
+                  ctx = ssl.create_default_context()
+                  ss = ctx.wrap_socket(raw, server_hostname=h)
+                  row["tls_version"] = ss.version()
+                  row["tls_ok"] = True
+                  ss.close()
+              except Exception as e:
+                  row["error"] = repr(e)[:500]
+              return row
+
+          def partial_read(url, label):
+              t0 = time.time()
+              try:
+                  req = urllib.request.Request(url, headers={"Range":"bytes=0-1048575", "User-Agent":"ACIRM-R13M-N2B-R14"})
+                  got = 0
+                  h = hashlib.sha256()
+                  with urllib.request.urlopen(req, timeout=90) as r:
+                      status = getattr(r, "status", "")
+                      while got < 1048576:
+                          chunk = r.read(min(65536, 1048576-got))
+                          if not chunk:
+                              break
+                          got += len(chunk)
+                          h.update(chunk)
+                  return {"label": label, "partial_ok": got > 0 and status in (200,206), "bytes_read": got, "http_status": status, "sha256_first_mb": h.hexdigest() if got else "", "elapsed_sec": round(time.time()-t0,3), "error": ""}
+              except Exception as e:
+                  return {"label": label, "partial_ok": False, "bytes_read": 0, "http_status": "", "sha256_first_mb": "", "elapsed_sec": round(time.time()-t0,3), "error": repr(e)[:800]}
+
+          def fits_magic_ok(p):
+              try:
+                  with open(p, "rb") as f:
+                      head = f.read(80)
+                  return head.startswith(b"SIMPLE")
+              except Exception:
+                  return False
+
+          def download_file(item):
+              label = item["label"]
+              url = item["url"]
+              dest = Path(item["dest"])
+              dest.parent.mkdir(parents=True, exist_ok=True)
+              min_bytes = int(item["min_bytes"])
+              max_time = int(item["max_time"])
+              result = {
+                  "label": label, "kind": item["kind"], "week": item["week"], "url": url,
+                  "path": str(dest), "ok": False, "method": "", "size_bytes": 0, "sha256": "",
+                  "fits_magic_ok": False, "error": ""
+              }
+              if dest.exists() and dest.stat().st_size >= min_bytes and fits_magic_ok(dest):
+                  result.update({"ok": True, "method": "cache_existing", "size_bytes": dest.stat().st_size, "sha256": sha256_file(dest), "fits_magic_ok": True})
+                  log(f"CACHE OK {label} bytes={result['size_bytes']}")
+                  return result
+
+              part = dest.with_suffix(dest.suffix + ".part")
+              if dest.exists() and dest.stat().st_size < min_bytes:
+                  try:
+                      dest.rename(part)
+                  except Exception:
+                      pass
+              log(f"DOWNLOAD START {label}: {url}")
+
+              commands = [
+                  ["curl", "-L", "--fail", "--connect-timeout", "60", "--max-time", str(max_time),
+                   "--retry", "6", "--retry-delay", "15", "--retry-max-time", str(max_time+300),
+                   "--speed-time", "180", "--speed-limit", "1024", "-A", "ACIRM-R13M-N2B-R14",
+                   "-C", "-", "-o", str(part), url],
+                  ["aria2c", "--allow-overwrite=true", "--auto-file-renaming=false", "--continue=true",
+                   "--max-tries=6", "--retry-wait=15", "--timeout=120", "--connect-timeout=60",
+                   "--lowest-speed-limit=1K", "--user-agent=ACIRM-R13M-N2B-R14",
+                   "-d", str(part.parent), "-o", part.name, url],
+                  ["wget", "-c", "--tries=4", "--timeout=120", "--user-agent=ACIRM-R13M-N2B-R14", "-O", str(part), url]
+              ]
+              logs = []
+              for cmd in commands:
+                  method = cmd[0]
+                  t0 = time.time()
+                  try:
+                      p = subprocess.run(cmd, text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=max_time+420)
+                      out = p.stdout or ""
+                      (OUT / f"download_{label}_{method}.log").write_text(out[-12000:], encoding="utf-8", errors="replace")
+                      logs.append(f"{method}:rc={p.returncode}:sec={round(time.time()-t0,1)}")
+                      if p.returncode == 0 and part.exists() and part.stat().st_size >= min_bytes:
+                          if dest.exists():
+                              dest.unlink()
+                          part.rename(dest)
+                          ok_magic = fits_magic_ok(dest)
+                          result.update({"ok": ok_magic, "method": method, "size_bytes": dest.stat().st_size, "sha256": sha256_file(dest), "fits_magic_ok": ok_magic, "error": "" if ok_magic else "downloaded_file_not_fits_magic"})
+                          log(f"DOWNLOAD DONE {label} method={method} bytes={result['size_bytes']} magic={ok_magic}")
+                          return result
+                  except Exception as e:
+                      logs.append(f"{method}:EXC:{repr(e)[:180]}")
+              result["size_bytes"] = part.stat().st_size if part.exists() else (dest.stat().st_size if dest.exists() else 0)
+              result["error"] = " | ".join(logs)[-1000:]
+              log(f"DOWNLOAD FAILED {label}: {result['error']}")
+              return result
+
+          log("START R14 download cache builder. No Fermipy. No science decision.")
+          write_json("LOCKED_CONTEXT.json", {
+              "stage": STAGE,
+              "purpose": "Build persistent GitHub cache for N2B LAG1000D required LAT/catalog inputs before analysis.",
+              "lag": "LAG_1000D_W143",
+              "weeks": {"post":871, "pre":585},
+              "claim_ceiling": "NO_SCORE_NOT_PROOF_NOT_DISCOVERY",
+              "scientific_result": False,
+          })
+
+          host_rows = [dns_tls_check(h) for h in sorted({host(x["url"]) for x in FILES})]
+          write_csv("HOST_CHECKS.csv", host_rows, ["host", "dns_ok", "tls_ok", "addresses", "tls_version", "error"])
+
+          partial_rows = []
+          for item in FILES:
+              log(f"PARTIAL CHECK {item['label']}")
+              pr = partial_read(item["url"], item["label"])
+              pr.update({"kind": item["kind"], "week": item["week"], "url": item["url"]})
+              partial_rows.append(pr)
+          write_csv("PARTIAL_READ_CHECKS.csv", partial_rows, ["label", "kind", "week", "url", "partial_ok", "http_status", "bytes_read", "sha256_first_mb", "elapsed_sec", "error"])
+
+          download_rows = []
+          for item in FILES:
+              download_rows.append(download_file(item))
+          write_csv("DOWNLOADS.csv", download_rows, ["label", "kind", "week", "url", "path", "ok", "method", "size_bytes", "sha256", "fits_magic_ok", "error"])
+
+          all_ok = all(r["ok"] for r in download_rows)
+          decision = "N2B_R14_DOWNLOAD_CACHE_READY_FOR_ANALYSIS_NO_SCORE" if all_ok else "TECHNICAL_STOP_N2B_R14_DOWNLOAD_CACHE_INCOMPLETE_NO_SCORE"
+          final = {
+              "stage": STAGE,
+              "decision": decision,
+              "scientific_result": False,
+              "technical_stop": not all_ok,
+              "all_required_downloads_ok": all_ok,
+              "download_ok_count": sum(1 for r in download_rows if r["ok"]),
+              "download_required_count": len(download_rows),
+              "missing_labels": [r["label"] for r in download_rows if not r["ok"]],
+              "cache_dir": str(CACHE),
+              "next_stage": "ACIRM_R13M_N2B_R15_LAG1000D_ANALYSIS_FROM_CACHE_NO_SCORE" if all_ok else "RETRY_R14_OR_USE_MANUAL_LAT_SERVER_EXPORT_NO_SCORE",
+              "claim_ceiling": "NO_SCORE_NOT_PROOF_NOT_DISCOVERY",
+              "timestamp_utc": datetime.now(timezone.utc).isoformat(),
+          }
+          write_json("FINAL_DECISION.json", final)
+
+          zipname = f"{STAGE}_RESULTS.zip"
+          shutil.make_archive(zipname[:-4], "zip", root_dir=".", base_dir=str(OUT))
+          sha = hashlib.sha256(Path(zipname).read_bytes()).hexdigest()
+          Path(zipname + ".sha256.txt").write_text(f"{sha}  {zipname}\n", encoding="utf-8")
+          log("FINAL_DECISION=" + decision)
+          log("ZIP=" + zipname + " SHA256=" + sha)
+          PY
+
+      - name: Show R14 final decision
+        if: always()
+        shell: bash
+        run: |
+          set +e
+          cat ACIRM_R13M_N2B_R14_LAG1000D_DOWNLOAD_CACHE_BUILDER_NO_SCORE_OUTPUT/FINAL_DECISION.json || true
+          echo ""
+          tail -n 160 ACIRM_R13M_N2B_R14_LAG1000D_DOWNLOAD_CACHE_BUILDER_NO_SCORE_OUTPUT/PROGRESS.log || true
+
+      - name: Upload R14 cache builder artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ACIRM_R13M_N2B_R14_LAG1000D_DOWNLOAD_CACHE_BUILDER_RESULTS
+          path: |
+            ACIRM_R13M_N2B_R14_LAG1000D_DOWNLOAD_CACHE_BUILDER_NO_SCORE_RESULTS.zip
+            ACIRM_R13M_N2B_R14_LAG1000D_DOWNLOAD_CACHE_BUILDER_NO_SCORE_RESULTS.zip.sha256.txt
+            ACIRM_R13M_N2B_R14_LAG1000D_DOWNLOAD_CACHE_BUILDER_NO_SCORE_OUTPUT/**
+          retention-days: 14
