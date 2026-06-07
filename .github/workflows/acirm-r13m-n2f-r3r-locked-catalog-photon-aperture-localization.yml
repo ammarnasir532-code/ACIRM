@@ -1,0 +1,228 @@
+name: ACIRM R13M N2F R3R Locked Catalog Photon Aperture Localization
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  acirm-r13m-n2f-r3r:
+    runs-on: ubuntu-latest
+    timeout-minutes: 80
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Restore R8 LAG300D photon cache
+        uses: actions/cache@v4
+        with:
+          path: ${{ github.workspace }}/.acirm_lat_cache_n2b_lag300d
+          key: acirm-r13m-n2b-lag300d-w685-w771-inputs-r8-${{ github.run_id }}
+          restore-keys: |
+            acirm-r13m-n2b-lag300d-w685-w771-inputs-r8-
+
+      - name: Restore R2S LAG650D photon w821 cache
+        uses: actions/cache@v4
+        with:
+          path: ${{ github.workspace }}/.acirm_lat_cache_n2f_lag650d_split/photon_w821
+          key: acirm-r13m-n2f-lag650d-split-photon_w821-v1
+
+      - name: Restore R2S LAG650D photon w635 cache
+        uses: actions/cache@v4
+        with:
+          path: ${{ github.workspace }}/.acirm_lat_cache_n2f_lag650d_split/photon_w635
+          key: acirm-r13m-n2f-lag650d-split-photon_w635-v1
+
+      - name: Install Python dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m pip install --quiet --upgrade pip
+          python -m pip install --quiet numpy astropy
+
+      - name: Run locked-catalog photon aperture localization
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import csv, json, math, hashlib, shutil, traceback, gc
+          from pathlib import Path
+          from datetime import datetime, timezone
+          import numpy as np
+          from astropy.io import fits
+
+          STAGE = "ACIRM_R13M_N2F_R3R_LOCKED_CATALOG_PHOTON_APERTURE_LOCALIZATION_NO_SCORE"
+          BASE = Path.cwd()
+          OUT = BASE / f"{STAGE}_OUTPUT"
+          OUT.mkdir(exist_ok=True)
+          PROGRESS = OUT / "PROGRESS.log"
+
+          R9C_RA = 299.590315
+          R9C_DEC = 35.201606
+          ENERGY_MIN = 1000.0
+          ENERGY_MAX = 1000000.0
+          APERTURES = [0.25, 0.5, 1.0]
+          RADIAL_BINS = [(0.0,0.25),(0.25,0.5),(0.5,1.0),(1.0,2.0),(2.0,5.0)]
+
+          FILES = {
+            "LAG300D_post_w771": BASE/".acirm_lat_cache_n2b_lag300d/lat_photon_weekly_w771_p305_v001.fits",
+            "LAG300D_pre_w685": BASE/".acirm_lat_cache_n2b_lag300d/lat_photon_weekly_w685_p305_v001.fits",
+            "LAG650D_post_w821": BASE/".acirm_lat_cache_n2f_lag650d_split/photon_w821/lat_photon_weekly_w821_p305_v001.fits",
+            "LAG650D_pre_w635": BASE/".acirm_lat_cache_n2f_lag650d_split/photon_w635/lat_photon_weekly_w635_p305_v001.fits",
+          }
+
+          # Locked from N2E R1. No catalog download in this stage.
+          SOURCES = [
+            {"source_name":"R9C_CYGX1_CENTER","assoc":"R9C/Cyg X-1 center","class":"target_center","ra":299.590315,"dec":35.201606,"sep_from_r9c_deg":0.0},
+            {"source_name":"4FGL J1958.5+3512","assoc":"Cyg X-1","class":"hmb","ra":299.6343078613281,"dec":35.20240020751953,"sep_from_r9c_deg":0.03595642763040945},
+            {"source_name":"4FGL J1950.6+3456","assoc":"2MASS J19502776+3456224","class":"bcu","ra":297.6642150878906,"dec":34.94340133666992,"sep_from_r9c_deg":1.5973485808791534},
+            {"source_name":"4FGL J2004.9+3421","assoc":"","class":"","ra":301.2484130859375,"dec":34.35060119628906,"sep_from_r9c_deg":1.6059157889571691},
+            {"source_name":"4FGL J2004.3+3339","assoc":"B2 2002+33","class":"unk","ra":301.09600830078125,"dec":33.655399322509766,"sep_from_r9c_deg":1.9831609576184441},
+            {"source_name":"4FGL J2005.8+3357","assoc":"","class":"","ra":301.4739990234375,"dec":33.95610046386719,"sep_from_r9c_deg":1.9890571175457838},
+            {"source_name":"4FGL J1948.9+3414","assoc":"","class":"","ra":297.2261962890625,"dec":34.239601135253906,"sep_from_r9c_deg":2.1681655108615416},
+            {"source_name":"4FGL J2009.9+3544","assoc":"B2 2008+35","class":"bcu","ra":302.48919677734375,"dec":35.74599838256836,"sep_from_r9c_deg":2.4226443394224186},
+            {"source_name":"4FGL J1954.4+3252e","assoc":"CTB 80","class":"SPP","ra":298.6000061035156,"dec":32.869998931884766,"sep_from_r9c_deg":2.471769439602049},
+            {"source_name":"4FGL J2002.3+3246","assoc":"SNR G069.7+01.0","class":"spp","ra":300.5997009277344,"dec":32.77880096435547,"sep_from_r9c_deg":2.5632321685955604},
+            {"source_name":"4FGL J1952.9+3252","assoc":"PSR J1952+3252","class":"PSR","ra":298.247314453125,"dec":32.882999420166016,"sep_from_r9c_deg":2.5717577827173015},
+            {"source_name":"4FGL J2013.5+3613","assoc":"SNR G073.9+00.9","class":"spp","ra":303.3844909667969,"dec":36.225399017333984,"sep_from_r9c_deg":3.246048161207813},
+            {"source_name":"4FGL J1959.0+3844","assoc":"LQAC 299+038","class":"bcu","ra":299.76629638671875,"dec":38.73680114746094,"sep_from_r9c_deg":3.537987659798902},
+            {"source_name":"4FGL J1950.2+3822","assoc":"RX J1950.0+3821","class":"unk","ra":297.56939697265625,"dec":38.371700286865234,"sep_from_r9c_deg":3.5590918954036876},
+            {"source_name":"4FGL J1953.5+3841","assoc":"","class":"","ra":298.3848876953125,"dec":38.6880989074707,"sep_from_r9c_deg":3.6170398911174417},
+            {"source_name":"4FGL J2017.3+3525","assoc":"","class":"","ra":304.3492126464844,"dec":35.42259979248047,"sep_from_r9c_deg":3.889238843639835},
+            {"source_name":"4FGL J2015.5+3710","assoc":"MG2 J201534+3710","class":"FSRQ","ra":303.89239501953125,"dec":37.17599868774414,"sep_from_r9c_deg":3.993576217978025},
+            {"source_name":"4FGL J2016.2+3712","assoc":"VER J2016+372","class":"snr","ra":304.056884765625,"dec":37.21310043334961,"sep_from_r9c_deg":4.126644299917183},
+            {"source_name":"4FGL J2017.9+3625","assoc":"PSR J2017+3625","class":"PSR","ra":304.49090576171875,"dec":36.42770004272461,"sep_from_r9c_deg":4.158222141614726},
+            {"source_name":"4FGL J2006.2+3102","assoc":"PSR J2006+3102","class":"PSR","ra":301.56610107421875,"dec":31.044599533081055,"sep_from_r9c_deg":4.473921852177352},
+            {"source_name":"4FGL J1935.4+3547","assoc":"","class":"","ra":293.86468505859375,"dec":35.796199798583984,"sep_from_r9c_deg":4.69845561778258},
+            {"source_name":"4FGL J2021.9+3609","assoc":"","class":"","ra":305.4862976074219,"dec":36.15769958496094,"sep_from_r9c_deg":4.882909314033249},
+            {"source_name":"4FGL J2021.1+3651","assoc":"PSR J2021+3651","class":"PSR","ra":305.27960205078125,"dec":36.85609817504883,"sep_from_r9c_deg":4.888469684256179},
+          ]
+
+          def log(msg):
+              s = f"[{datetime.now(timezone.utc).isoformat()}] {msg}"
+              print(s, flush=True)
+              with PROGRESS.open('a', encoding='utf-8') as f:
+                  f.write(s + '\n')
+          def sha256_file(path):
+              h=hashlib.sha256()
+              with open(path,'rb') as f:
+                  for chunk in iter(lambda:f.read(1024*1024), b''):
+                      h.update(chunk)
+              return h.hexdigest()
+          def write_json(name,obj):
+              (OUT/name).write_text(json.dumps(obj, indent=2, sort_keys=True), encoding='utf-8')
+          def write_csv(name, rows, fields):
+              with (OUT/name).open('w', newline='', encoding='utf-8') as f:
+                  w=csv.DictWriter(f, fieldnames=fields); w.writeheader()
+                  for r in rows: w.writerow({k:r.get(k,'') for k in fields})
+          def fits_magic_ok(path):
+              try:
+                  with open(path,'rb') as f: return f.read(9).startswith(b'SIMPLE  =')
+              except Exception: return False
+          def angsep_deg(ra1, dec1, ra2, dec2):
+              ra1=np.deg2rad(ra1); dec1=np.deg2rad(dec1); ra2=np.deg2rad(ra2); dec2=np.deg2rad(dec2)
+              c=np.sin(dec1)*np.sin(dec2)+np.cos(dec1)*np.cos(dec2)*np.cos(ra1-ra2)
+              return np.rad2deg(np.arccos(np.clip(c,-1,1)))
+          def find_event_hdu(hdul):
+              for h in hdul:
+                  if hasattr(h,'columns') and h.columns is not None and h.data is not None:
+                      cols=[c.upper() for c in h.columns.names]
+                      if all(x in cols for x in ['RA','DEC','ENERGY']): return h
+              return None
+          def load_events(path):
+              with fits.open(path, memmap=True) as hdul:
+                  h=find_event_hdu(hdul)
+                  if h is None: raise RuntimeError('No event table with RA/DEC/ENERGY')
+                  ra=np.asarray(h.data['RA'], dtype=float)
+                  dec=np.asarray(h.data['DEC'], dtype=float)
+                  en=np.asarray(h.data['ENERGY'], dtype=float)
+                  m=np.isfinite(ra)&np.isfinite(dec)&np.isfinite(en)&(en>=ENERGY_MIN)&(en<=ENERGY_MAX)
+                  return ra[m], dec[m]
+          def count_for_sources(ra, dec):
+              rows=[]
+              for s in SOURCES:
+                  d=angsep_deg(s['ra'], s['dec'], ra, dec)
+                  for ap in APERTURES:
+                      rows.append({**s, 'aperture_deg':ap, 'count':int(np.sum(d<=ap))})
+              radial=[]
+              d0=angsep_deg(R9C_RA, R9C_DEC, ra, dec)
+              for lo,hi in RADIAL_BINS:
+                  radial.append({'r_min_deg':lo,'r_max_deg':hi,'count':int(np.sum((d0>=lo)&(d0<hi)))})
+              return rows, radial
+          def package(decision, extra=None):
+              obj={'stage':STAGE,'decision':decision,'scientific_result':False,'claim_ceiling':'NO_SCORE_NOT_PROOF_NOT_DISCOVERY','timestamp_utc':datetime.now(timezone.utc).isoformat()}
+              if extra: obj.update(extra)
+              write_json('FINAL_DECISION.json',obj)
+              zipname=f'{STAGE}_RESULTS.zip'
+              shutil.make_archive(zipname[:-4],'zip',root_dir='.',base_dir=str(OUT))
+              sha=sha256_file(zipname)
+              Path(zipname+'.sha256.txt').write_text(f'{sha}  {zipname}\n', encoding='utf-8')
+              log('FINAL_DECISION='+decision+' ZIP='+zipname+' SHA256='+sha)
+
+          try:
+              log('START N2F R3R locked-catalog photon aperture localization')
+              write_json('LOCKED_SOURCE_LIST_FROM_N2E_R1.json', {'r9c_ra':R9C_RA,'r9c_dec':R9C_DEC,'source_count_including_center':len(SOURCES),'sources':SOURCES})
+              manifest=[]; missing=[]
+              for label,p in FILES.items():
+                  ok=p.exists() and fits_magic_ok(p)
+                  manifest.append({'label':label,'path':str(p),'exists':p.exists(),'fits_magic_ok':ok,'size_bytes':p.stat().st_size if p.exists() else 0,'sha256':sha256_file(p) if ok else ''})
+                  if not ok: missing.append(label)
+              write_csv('INPUT_MANIFEST.csv', manifest, ['label','path','exists','fits_magic_ok','size_bytes','sha256'])
+              if missing:
+                  package('TECHNICAL_STOP_N2F_R3R_REQUIRED_PHOTON_CACHES_MISSING_NO_SCORE', {'technical_stop':True,'missing_inputs':missing})
+                  raise SystemExit(0)
+              all_counts=[]; all_rad=[]
+              for lag,postlab,prelab in [('LAG300D','LAG300D_post_w771','LAG300D_pre_w685'),('LAG650D','LAG650D_post_w821','LAG650D_pre_w635')]:
+                  log('loading post events '+lag)
+                  pra,pdec=load_events(FILES[postlab])
+                  post_counts, post_rad = count_for_sources(pra,pdec)
+                  del pra,pdec; gc.collect()
+                  log('loading pre events '+lag)
+                  rra,rdec=load_events(FILES[prelab])
+                  pre_counts, pre_rad = count_for_sources(rra,rdec)
+                  del rra,rdec; gc.collect()
+                  bypost={(r['source_name'],r['aperture_deg']):r for r in post_counts}
+                  bypre={(r['source_name'],r['aperture_deg']):r for r in pre_counts}
+                  for key,pr in bypost.items():
+                      rr=bypre.get(key, {'count':0})
+                      row={k:pr[k] for k in ['source_name','assoc','class','ra','dec','sep_from_r9c_deg','aperture_deg']}
+                      row.update({'lag_label':lag,'post_count':pr['count'],'pre_count':rr['count'],'post_minus_pre_count':pr['count']-rr['count']})
+                      all_counts.append(row)
+                  for a,b in zip(post_rad, pre_rad):
+                      all_rad.append({'lag_label':lag,'r_min_deg':a['r_min_deg'],'r_max_deg':a['r_max_deg'],'post_count':a['count'],'pre_count':b['count'],'post_minus_pre_count':a['count']-b['count']})
+              fields=['lag_label','source_name','assoc','class','ra','dec','sep_from_r9c_deg','aperture_deg','post_count','pre_count','post_minus_pre_count']
+              write_csv('APERTURE_COUNTS_LOCKED_N2E_SOURCES.csv', all_counts, fields)
+              write_csv('RADIAL_BINS_AROUND_R9C.csv', all_rad, ['lag_label','r_min_deg','r_max_deg','post_count','pre_count','post_minus_pre_count'])
+              rank_rows=[]
+              for lag in ['LAG300D','LAG650D']:
+                  for ap in APERTURES:
+                      subset=[r for r in all_counts if r['lag_label']==lag and abs(r['aperture_deg']-ap)<1e-9]
+                      subset=sorted(subset, key=lambda r:r['post_minus_pre_count'], reverse=True)
+                      for i,r in enumerate(subset,1):
+                          rank_rows.append({'lag_label':lag,'aperture_deg':ap,'rank_descending':i,'source_name':r['source_name'],'assoc':r['assoc'],'class':r['class'],'sep_from_r9c_deg':r['sep_from_r9c_deg'],'post_minus_pre_count':r['post_minus_pre_count'],'post_count':r['post_count'],'pre_count':r['pre_count']})
+              write_csv('APERTURE_SOURCE_RANKING_BY_LAG.csv', rank_rows, ['lag_label','aperture_deg','rank_descending','source_name','assoc','class','sep_from_r9c_deg','post_minus_pre_count','post_count','pre_count'])
+              cyg_rows=[r for r in rank_rows if r['source_name']=='4FGL J1958.5+3512']
+              center_rows=[r for r in rank_rows if r['source_name']=='R9C_CYGX1_CENTER']
+              write_csv('R9C_CYGX1_APERTURE_SUMMARY.csv', center_rows+cyg_rows, ['lag_label','aperture_deg','rank_descending','source_name','assoc','class','sep_from_r9c_deg','post_minus_pre_count','post_count','pre_count'])
+              summary={'technical_stop':False,'locked_catalog_mode':'N2E_R1_hardcoded_no_catalog_download','photon_cache_mode':'R8_LAG300D_plus_R2S_LAG650D','source_count_including_center':len(SOURCES),'aperture_rows':len(all_counts),'radial_rows':len(all_rad),'note':'Photon aperture counts only. No exposure correction, no Fermipy, no source-attribution proof.'}
+              write_json('SUMMARY.json', summary)
+              package('N2F_R3R_LOCKED_CATALOG_PHOTON_APERTURE_LOCALIZATION_COMPLETED_NO_SCORE', summary)
+          except SystemExit:
+              raise
+          except Exception:
+              (OUT/'EXCEPTION_TRACEBACK.txt').write_text(traceback.format_exc(), encoding='utf-8')
+              package('TECHNICAL_STOP_N2F_R3R_EXCEPTION_NO_SCORE', {'technical_stop':True,'traceback_tail':traceback.format_exc()[-2000:]})
+          PY
+
+      - name: Upload N2F R3R artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ACIRM_R13M_N2F_R3R_LOCKED_CATALOG_PHOTON_APERTURE_LOCALIZATION_RESULTS
+          path: |
+            ACIRM_R13M_N2F_R3R_LOCKED_CATALOG_PHOTON_APERTURE_LOCALIZATION_NO_SCORE_RESULTS.zip
+            ACIRM_R13M_N2F_R3R_LOCKED_CATALOG_PHOTON_APERTURE_LOCALIZATION_NO_SCORE_RESULTS.zip.sha256.txt
+            ACIRM_R13M_N2F_R3R_LOCKED_CATALOG_PHOTON_APERTURE_LOCALIZATION_NO_SCORE_OUTPUT/**
+          retention-days: 14
