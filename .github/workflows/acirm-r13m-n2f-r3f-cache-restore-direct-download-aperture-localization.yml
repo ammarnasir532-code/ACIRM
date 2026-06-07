@@ -1,0 +1,356 @@
+name: ACIRM R13M N2F R3F Cache Restore Direct Download Aperture Localization
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  aperture-localization:
+    runs-on: ubuntu-latest
+    timeout-minutes: 170
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Restore R8 LAG300D photon cache
+        uses: actions/cache@v4
+        with:
+          path: ${{ github.workspace }}/.acirm_lat_cache_n2b_lag300d
+          key: acirm-r13m-n2f-r3f-lag300d-readonly-${{ github.run_id }}
+          restore-keys: |
+            acirm-r13m-n2b-lag300d-w685-w771-inputs-r8-
+            acirm-r13m-n2f-r3e-lag300d-w771-v1
+            acirm-r13m-n2f-r3e-lag300d-w685-v1
+
+      - name: Restore R2S LAG650D photon w821 cache
+        uses: actions/cache@v4
+        with:
+          path: ${{ github.workspace }}/.acirm_lat_cache_n2f_lag650d_split/photon_w821
+          key: acirm-r13m-n2f-r3f-lag650d-w821-readonly-${{ github.run_id }}
+          restore-keys: |
+            acirm-r13m-n2f-lag650d-split-photon_w821-v1
+            acirm-r13m-n2f-lag650d-split-photon_w821-
+
+      - name: Restore R2S LAG650D photon w635 cache
+        uses: actions/cache@v4
+        with:
+          path: ${{ github.workspace }}/.acirm_lat_cache_n2f_lag650d_split/photon_w635
+          key: acirm-r13m-n2f-r3f-lag650d-w635-readonly-${{ github.run_id }}
+          restore-keys: |
+            acirm-r13m-n2f-lag650d-split-photon_w635-v1
+            acirm-r13m-n2f-lag650d-split-photon_w635-
+
+      - name: Install tools and Python dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq aria2 curl wget zip unzip
+          python -m pip install --quiet --upgrade pip
+          python -m pip install --quiet numpy astropy
+
+      - name: Create R3F worker part 1
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat > acirm_r13m_n2f_r3f_worker.py <<'PY'
+          
+          import csv, json, math, hashlib, shutil, subprocess, traceback, time, os
+          from pathlib import Path
+          from datetime import datetime, timezone
+          
+          STAGE='ACIRM_R13M_N2F_R3F_CACHE_RESTORE_DIRECT_DOWNLOAD_APERTURE_LOCALIZATION_NO_SCORE'
+          BASE=Path.cwd(); OUT=BASE/f'{STAGE}_OUTPUT'; OUT.mkdir(exist_ok=True)
+          PROGRESS=OUT/'PROGRESS.log'
+          R9C_RA=299.590315; R9C_DEC=35.201606
+          ENERGY_MIN=1000.0; ENERGY_MAX=1000000.0
+          APERTURES=[0.25,0.5,1.0]
+          RADIAL_BINS=[(0,0.25),(0.25,0.5),(0.5,1.0),(1.0,2.0),(2.0,5.0)]
+          CLAIM='NO_SCORE_NOT_PROOF_NOT_DISCOVERY'
+          
+          FILES={
+           'LAG300D_post_w771':{
+            'lag':'LAG300D','phase':'post','week':771,
+            'filename':'lat_photon_weekly_w771_p305_v001.fits',
+            'url':'https://heasarc.gsfc.nasa.gov/FTP/fermi/data/lat/weekly/photon/lat_photon_weekly_w771_p305_v001.fits',
+            'path':'.acirm_lat_cache_n2b_lag300d/lat_photon_weekly_w771_p305_v001.fits',
+            'min_bytes':100000000,
+            'sha256':'6ed24e7064240f251bec06416eb5f9153473d551e03ce7ac270d6ca87255c7bb'},
+           'LAG300D_pre_w685':{
+            'lag':'LAG300D','phase':'pre','week':685,
+            'filename':'lat_photon_weekly_w685_p305_v001.fits',
+            'url':'https://heasarc.gsfc.nasa.gov/FTP/fermi/data/lat/weekly/photon/lat_photon_weekly_w685_p305_v001.fits',
+            'path':'.acirm_lat_cache_n2b_lag300d/lat_photon_weekly_w685_p305_v001.fits',
+            'min_bytes':100000000,
+            'sha256':'56194daac708d24ae23becc7437b4cfa72c0192ecd84f6880c0652ff1793e8af'},
+           'LAG650D_post_w821':{
+            'lag':'LAG650D','phase':'post','week':821,
+            'filename':'lat_photon_weekly_w821_p305_v001.fits',
+            'url':'https://heasarc.gsfc.nasa.gov/FTP/fermi/data/lat/weekly/photon/lat_photon_weekly_w821_p305_v001.fits',
+            'path':'.acirm_lat_cache_n2f_lag650d_split/photon_w821/lat_photon_weekly_w821_p305_v001.fits',
+            'min_bytes':100000000,
+            'sha256':'8d7e12e51bfd8fcf844bd4132edd963f7826cedca8897c00fe6d805c4d119735'},
+           'LAG650D_pre_w635':{
+            'lag':'LAG650D','phase':'pre','week':635,
+            'filename':'lat_photon_weekly_w635_p305_v001.fits',
+            'url':'https://heasarc.gsfc.nasa.gov/FTP/fermi/data/lat/weekly/photon/lat_photon_weekly_w635_p305_v001.fits',
+            'path':'.acirm_lat_cache_n2f_lag650d_split/photon_w635/lat_photon_weekly_w635_p305_v001.fits',
+            'min_bytes':100000000,
+            'sha256':'a9c828a2f8c722ac1a8030cf4d0aaf6c4b3e7cf2a5da9de6a42f0af2b9eec80b'},
+          }
+          
+          # Locked source list from N2E R1. No catalog download is used here.
+          SOURCES=[
+           ('R9C_CYGX1_CENTER','R9C/Cyg X-1 center','target_center',299.590315,35.201606,0.0),
+           ('4FGL J1958.5+3512','Cyg X-1','hmb',299.6343078613281,35.20240020751953,0.03595642763040945),
+           ('4FGL J1950.6+3456','2MASS J19502776+3456224','bcu',297.6642150878906,34.94340133666992,1.5973485808791534),
+           ('4FGL J2004.9+3421','','',301.2484130859375,34.35060119628906,1.6059157889571691),
+           ('4FGL J2004.3+3339','B2 2002+33','unk',301.09600830078125,33.655399322509766,1.9831609576184441),
+           ('4FGL J2005.8+3357','','',301.4739990234375,33.95610046386719,1.9890571175457838),
+           ('4FGL J1948.9+3414','','',297.2261962890625,34.239601135253906,2.1681655108615416),
+           ('4FGL J2009.9+3544','B2 2008+35','bcu',302.48919677734375,35.74599838256836,2.4226443394224186),
+           ('4FGL J1954.4+3252e','CTB 80','SPP',298.6000061035156,32.869998931884766,2.471769439602049),
+           ('4FGL J2002.3+3246','SNR G069.7+01.0','spp',300.5997009277344,32.77880096435547,2.5632321685955604),
+           ('4FGL J1952.9+3252','PSR J1952+3252','PSR',298.247314453125,32.882999420166016,2.5717577827173015),
+           ('4FGL J2013.5+3613','SNR G073.9+00.9','spp',303.3844909667969,36.225399017333984,3.246048161207813),
+           ('4FGL J1959.0+3844','LQAC 299+038','bcu',299.76629638671875,38.73680114746094,3.537987659798902),
+           ('4FGL J1950.2+3822','RX J1950.0+3821','unk',297.56939697265625,38.371700286865234,3.5590918954036876),
+           ('4FGL J1953.5+3841','','',298.3848876953125,38.6880989074707,3.6170398911174417),
+           ('4FGL J2017.3+3525','','',304.3492126464844,35.42259979248047,3.889238843639835),
+           ('4FGL J2015.5+3710','MG2 J201534+3710','FSRQ',303.89239501953125,37.17599868774414,3.993576217978025),
+           ('4FGL J2016.2+3712','VER J2016+372','snr',304.056884765625,37.21310043334961,4.126644299917183),
+           ('4FGL J2017.9+3625','PSR J2017+3625','PSR',304.49090576171875,36.42770004272461,4.158222141614726),
+           ('4FGL J2006.2+3102','PSR J2006+3102','PSR',301.56610107421875,31.044599533081055,4.473921852177352),
+           ('4FGL J1935.4+3547','','',293.86468505859375,35.796199798583984,4.69845561778258),
+           ('4FGL J2021.9+3609','','',305.4862976074219,36.15769958496094,4.882909314033249),
+           ('4FGL J2021.1+3651','PSR J2021+3651','PSR',305.27960205078125,36.85609817504883,4.888469684256179),
+          ]
+          
+          def log(msg):
+              s=f"[{datetime.now(timezone.utc).isoformat()}] {msg}"
+              print(s, flush=True)
+              with PROGRESS.open('a', encoding='utf-8') as f: f.write(s+'\n')
+          
+          def sha256_file(p):
+              h=hashlib.sha256()
+              with open(p,'rb') as f:
+                  for chunk in iter(lambda:f.read(1024*1024), b''):
+                      h.update(chunk)
+              return h.hexdigest()
+          
+          def fits_magic_ok(p):
+              try:
+                  with open(p,'rb') as f: return f.read(80).startswith(b'SIMPLE  =')
+              except Exception: return False
+          
+          def validate(label, item):
+              p=Path(item['path'])
+              meta={'label':label,'lag':item['lag'],'phase':item['phase'],'week':item['week'],'path':str(p),'exists':p.exists(),'size_bytes':0,'fits_magic_ok':False,'sha256':'','sha_match':False,'ready':False}
+              if p.exists():
+                  meta['size_bytes']=p.stat().st_size
+                  meta['fits_magic_ok']=fits_magic_ok(p)
+                  if meta['size_bytes']>=item['min_bytes'] and meta['fits_magic_ok']:
+                      meta['sha256']=sha256_file(p)
+                      meta['sha_match']=(meta['sha256'].lower()==item['sha256'].lower())
+                      meta['ready']=meta['sha_match']
+              return meta
+          
+          def run_cmd(cmd, timeout, logname):
+              try:
+                  p=subprocess.run(cmd, text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=timeout)
+                  txt=p.stdout or ''
+                  (OUT/logname).write_text(txt[-24000:], encoding='utf-8', errors='replace')
+                  return p.returncode, txt[-1200:]
+              except subprocess.TimeoutExpired as e:
+                  txt=e.stdout if isinstance(e.stdout,str) else ''
+                  (OUT/logname).write_text((txt or '')[-24000:]+'\nTIMEOUT\n', encoding='utf-8', errors='replace')
+                  return 124, 'TIMEOUT'
+              except Exception as e:
+                  (OUT/logname).write_text(repr(e), encoding='utf-8')
+                  return 125, repr(e)
+          
+          def ensure_file(label, item):
+              p=Path(item['path']); p.parent.mkdir(parents=True, exist_ok=True)
+              meta=validate(label,item)
+              attempts=[]
+              if meta['ready']:
+                  meta['method']='cache_ready'
+                  return meta, attempts
+              log(f'{label} missing/invalid; direct download fallback')
+              # keep a partial file for curl resume; remove clearly invalid final file
+              if p.exists() and p.stat().st_size < item['min_bytes']:
+                  try: p.unlink()
+                  except Exception: pass
+              commands=[
+                  ('aria2c',['aria2c','--allow-overwrite=true','--auto-file-renaming=false','--continue=true','--max-tries=8','--retry-wait=20','--timeout=180','--connect-timeout=90','--lowest-speed-limit=1K','--user-agent=ACIRM-R13M-N2F-R3F','-x','4','-s','4','-d',str(p.parent),'-o',p.name,item['url']], 7200),
+                  ('curl',['curl','-L','--fail','--connect-timeout','90','--max-time','7200','--retry','10','--retry-delay','20','--retry-max-time','7200','--speed-time','180','--speed-limit','1024','-A','ACIRM-R13M-N2F-R3F','-C','-','-o',str(p),item['url']], 7600),
+                  ('wget',['wget','-c','--tries=5','--timeout=180','--user-agent=ACIRM-R13M-N2F-R3F','-O',str(p),item['url']], 7200),
+              ]
+              for method,cmd,timeout in commands:
+                  code,tail=run_cmd(cmd, timeout, f'{label}_{method}.log')
+                  attempts.append({'label':label,'method':method,'returncode':code,'tail':tail})
+                  meta=validate(label,item)
+                  if meta['ready']:
+                      meta['method']=method
+                      return meta, attempts
+              meta['method']='failed_all_methods'
+              return meta, attempts
+          
+          def write_csv(name, rows, fields):
+              with (OUT/name).open('w', newline='', encoding='utf-8') as f:
+                  w=csv.DictWriter(f, fieldnames=fields); w.writeheader()
+                  for r in rows: w.writerow({k:r.get(k,'') for k in fields})
+          
+          def write_json(name, obj):
+              (OUT/name).write_text(json.dumps(obj, indent=2, sort_keys=True), encoding='utf-8')
+          
+          def angular_deg(ra1, dec1, ra2, dec2):
+              import numpy as np
+              ra1=np.deg2rad(ra1); dec1=np.deg2rad(dec1); ra2=np.deg2rad(ra2); dec2=np.deg2rad(dec2)
+              c=np.sin(dec1)*np.sin(dec2)+np.cos(dec1)*np.cos(dec2)*np.cos(ra1-ra2)
+              return np.rad2deg(np.arccos(np.clip(c,-1,1)))
+          
+          PY
+
+      - name: Create R3F worker part 2 and verify
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat >> acirm_r13m_n2f_r3f_worker.py <<'PY'
+          def count_file(label, item):
+              import numpy as np
+              from astropy.io import fits
+              p=Path(item['path'])
+              log(f'counting photon file {label}')
+              with fits.open(p, memmap=True) as hdul:
+                  data=None
+                  for h in hdul:
+                      if hasattr(h,'columns') and h.columns is not None:
+                          cols=[str(c).upper() for c in h.columns.names]
+                          if all(x in cols for x in ['RA','DEC','ENERGY']):
+                              data=h.data; break
+                  if data is None: raise RuntimeError(f'No RA/DEC/ENERGY table in {p}')
+                  ra=np.asarray(data['RA'], dtype=np.float64)
+                  dec=np.asarray(data['DEC'], dtype=np.float64)
+                  energy=np.asarray(data['ENERGY'], dtype=np.float64)
+                  mask=np.isfinite(ra)&np.isfinite(dec)&np.isfinite(energy)&(energy>=ENERGY_MIN)&(energy<=ENERGY_MAX)
+                  ra=ra[mask]; dec=dec[mask]; energy=energy[mask]
+                  out={'total_selected_energy_count':int(len(ra))}
+                  source_counts=[]
+                  for sid,assoc,cls,sra,sdec,dist in SOURCES:
+                      sep=angular_deg(ra,dec,sra,sdec)
+                      for ap in APERTURES:
+                          source_counts.append({'input_label':label,'lag':item['lag'],'phase':item['phase'],'source_id':sid,'assoc':assoc,'class':cls,'source_ra':sra,'source_dec':sdec,'distance_from_r9c_deg':dist,'aperture_deg':ap,'count':int((sep<=ap).sum())})
+                  sep0=angular_deg(ra,dec,R9C_RA,R9C_DEC)
+                  radial=[]
+                  for lo,hi in RADIAL_BINS:
+                      radial.append({'input_label':label,'lag':item['lag'],'phase':item['phase'],'bin_lo_deg':lo,'bin_hi_deg':hi,'count':int(((sep0>=lo)&(sep0<hi)).sum())})
+                  return out, source_counts, radial
+          
+          def package():
+              zip_path=BASE/f'{STAGE}_RESULTS.zip'; sha_path=BASE/f'{STAGE}_RESULTS.zip.sha256.txt'
+              if zip_path.exists(): zip_path.unlink()
+              if sha_path.exists(): sha_path.unlink()
+              shutil.make_archive(str(zip_path).replace('.zip',''),'zip',root_dir='.',base_dir=OUT.name)
+              sha=sha256_file(zip_path)
+              sha_path.write_text(f'{sha}  {zip_path.name}\n', encoding='utf-8')
+              log(f'ZIP={zip_path} SHA256={sha}')
+          
+          try:
+              log('START N2F R3F cache restore + direct download aperture localization')
+              write_json('LOCKED_THEORY_CONTEXT.json', {
+                  'stage':STAGE,
+                  'purpose':'Locate successful-lag photon concentration after R9C using locked N2E source list; not Fermipy, not exposure-corrected, not attribution proof.',
+                  'successful_lags':['LAG300D','LAG650D'],
+                  'claim_ceiling':CLAIM,
+                  'important_interpretation':'This tests where photons are concentrated for successful lag windows, not whether the physical source is proven.'
+              })
+              manifest=[]; attempts=[]
+              for label,item in FILES.items():
+                  meta, att = ensure_file(label,item)
+                  manifest.append(meta); attempts.extend(att)
+              write_csv('INPUT_PHOTON_MANIFEST.csv', manifest, ['label','lag','phase','week','path','exists','size_bytes','fits_magic_ok','sha256','sha_match','ready','method'])
+              write_csv('DOWNLOAD_ATTEMPTS.csv', attempts, ['label','method','returncode','tail'])
+              missing=[m['label'] for m in manifest if not m.get('ready')]
+              if missing:
+                  final={'stage':STAGE,'decision':'TECHNICAL_STOP_N2F_R3F_REQUIRED_PHOTON_INPUTS_MISSING_NO_SCORE','missing_inputs':missing,'technical_stop':True,'scientific_result':False,'claim_ceiling':CLAIM,'timestamp_utc':datetime.now(timezone.utc).isoformat()}
+                  write_json('FINAL_DECISION.json', final); package(); raise SystemExit(0)
+              import numpy as np
+              from astropy.io import fits
+              all_source_counts=[]; all_radial=[]; input_summaries=[]
+              for label,item in FILES.items():
+                  summary, counts, radial = count_file(label,item)
+                  summary.update({'input_label':label,'lag':item['lag'],'phase':item['phase'],'week':item['week']})
+                  input_summaries.append(summary); all_source_counts.extend(counts); all_radial.extend(radial)
+              write_csv('INPUT_EVENT_COUNTS.csv', input_summaries, ['input_label','lag','phase','week','total_selected_energy_count'])
+              write_csv('APERTURE_COUNTS_LOCKED_N2E_SOURCES.csv', all_source_counts, ['input_label','lag','phase','source_id','assoc','class','source_ra','source_dec','distance_from_r9c_deg','aperture_deg','count'])
+              write_csv('RADIAL_BINS_AROUND_R9C.csv', all_radial, ['input_label','lag','phase','bin_lo_deg','bin_hi_deg','count'])
+              # summarize post-pre by source/aperture per lag
+              by={}
+              for r in all_source_counts:
+                  key=(r['lag'],r['source_id'],r['aperture_deg'])
+                  by.setdefault(key, {'lag':r['lag'],'source_id':r['source_id'],'assoc':r['assoc'],'class':r['class'],'distance_from_r9c_deg':r['distance_from_r9c_deg'],'aperture_deg':r['aperture_deg']})[r['phase']+'_count']=r['count']
+              comp=[]
+              for row in by.values():
+                  post=row.get('post_count',''); pre=row.get('pre_count','')
+                  try:
+                      delta=int(post)-int(pre); ratio=(float(post)/float(pre)) if int(pre)!=0 else ''
+                  except Exception:
+                      delta=''; ratio=''
+                  row['post_minus_pre_count']=delta; row['post_over_pre_count']=ratio
+                  comp.append(row)
+              write_csv('APERTURE_POST_PRE_COMPARISON.csv', comp, ['lag','source_id','assoc','class','distance_from_r9c_deg','aperture_deg','post_count','pre_count','post_minus_pre_count','post_over_pre_count'])
+              ranks=[]
+              for lag in sorted({r['lag'] for r in comp}):
+                  for ap in APERTURES:
+                      rows=[r for r in comp if r['lag']==lag and float(r['aperture_deg'])==float(ap) and isinstance(r.get('post_minus_pre_count'), int)]
+                      rows=sorted(rows, key=lambda x:x['post_minus_pre_count'], reverse=True)
+                      for i,r in enumerate(rows,1):
+                          rr=dict(r); rr['rank_descending']=i; ranks.append(rr)
+              write_csv('APERTURE_SOURCE_RANKING_BY_LAG.csv', ranks, ['lag','aperture_deg','rank_descending','source_id','assoc','class','distance_from_r9c_deg','post_count','pre_count','post_minus_pre_count','post_over_pre_count'])
+              r9c_rows=[r for r in comp if r['source_id'] in ('R9C_CYGX1_CENTER','4FGL J1958.5+3512')]
+              write_csv('R9C_CYGX1_APERTURE_SUMMARY.csv', r9c_rows, ['lag','source_id','assoc','class','distance_from_r9c_deg','aperture_deg','post_count','pre_count','post_minus_pre_count','post_over_pre_count'])
+              # decision is descriptive only
+              decision='N2F_R3F_PHOTON_APERTURE_LOCALIZATION_COMPLETED_NO_SCORE_NOT_ATTRIBUTION'
+              summary={'stage':STAGE,'decision':decision,'technical_stop':False,'scientific_result':True,'claim_ceiling':CLAIM,'aperture_degrees':APERTURES,'source_count':len(SOURCES),'input_files_ready':len(manifest),'note':'Aperture photon counts are not exposure-corrected and do not prove source attribution. They localize where selected photons concentrate for successful lag windows.'}
+              write_json('SUMMARY.json', summary)
+              write_json('FINAL_DECISION.json', summary)
+              package()
+          except SystemExit:
+              raise
+          except Exception:
+              (OUT/'EXCEPTION_TRACEBACK.txt').write_text(traceback.format_exc(), encoding='utf-8')
+              final={'stage':STAGE,'decision':'TECHNICAL_STOP_N2F_R3F_EXCEPTION_NO_SCORE','technical_stop':True,'scientific_result':False,'claim_ceiling':CLAIM,'error':traceback.format_exc()[-3000:]}
+              write_json('FINAL_DECISION.json', final); package()
+          PY
+          python -m py_compile acirm_r13m_n2f_r3f_worker.py
+          wc -c acirm_r13m_n2f_r3f_worker.py
+
+      - name: Run R3F aperture localization
+        shell: bash
+        run: |
+          set -euo pipefail
+          python acirm_r13m_n2f_r3f_worker.py
+
+      - name: Show final decision
+        if: always()
+        shell: bash
+        run: |
+          set +e
+          cat ACIRM_R13M_N2F_R3F_CACHE_RESTORE_DIRECT_DOWNLOAD_APERTURE_LOCALIZATION_NO_SCORE_OUTPUT/FINAL_DECISION.json || true
+          echo ""
+          tail -n 120 ACIRM_R13M_N2F_R3F_CACHE_RESTORE_DIRECT_DOWNLOAD_APERTURE_LOCALIZATION_NO_SCORE_OUTPUT/PROGRESS.log || true
+
+      - name: Upload R3F result artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ACIRM_R13M_N2F_R3F_CACHE_RESTORE_DIRECT_DOWNLOAD_APERTURE_LOCALIZATION_RESULTS
+          path: |
+            ACIRM_R13M_N2F_R3F_CACHE_RESTORE_DIRECT_DOWNLOAD_APERTURE_LOCALIZATION_NO_SCORE_RESULTS.zip
+            ACIRM_R13M_N2F_R3F_CACHE_RESTORE_DIRECT_DOWNLOAD_APERTURE_LOCALIZATION_NO_SCORE_RESULTS.zip.sha256.txt
+            ACIRM_R13M_N2F_R3F_CACHE_RESTORE_DIRECT_DOWNLOAD_APERTURE_LOCALIZATION_NO_SCORE_OUTPUT/**
+          retention-days: 14
