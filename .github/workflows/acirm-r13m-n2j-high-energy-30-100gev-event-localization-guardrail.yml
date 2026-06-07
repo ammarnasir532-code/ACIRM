@@ -1,0 +1,270 @@
+
+name: ACIRM R13M N2J High Energy 30-100 GeV Event Localization Guardrail
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  n2j-high-energy-event-localization:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Restore photon caches
+        uses: actions/cache@v4
+        with:
+          path: |
+            ${{ github.workspace }}/.acirm_lat_cache_n2f_lag650d_split
+            ${{ github.workspace }}/.acirm_lat_cache_n2h
+            ${{ github.workspace }}/.acirm_lat_cache_n2i
+            ${{ github.workspace }}/.acirm_lat_cache_n2j
+          key: acirm-r13m-n2j-high-energy-photon-inputs-${{ github.run_id }}
+          restore-keys: |
+            acirm-r13m-n2i-energy-band-photon-inputs-
+            acirm-r13m-n2h-r1-field-normalized-photon-inputs-
+            acirm-r13m-n2f-lag650d-split-photon-w821-
+            acirm-r13m-n2f-lag650d-split-photon-w635-
+
+      - name: Install lightweight Python tools
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m pip install --upgrade pip -q
+          python -m pip install -q numpy astropy
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq aria2 curl zip unzip
+
+      - name: Create N2J worker
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat > n2j_worker.py <<'PY'
+          import csv, json, math, shutil, subprocess, time, hashlib, traceback
+          from pathlib import Path
+          import numpy as np
+          from astropy.io import fits
+
+          STAGE = "ACIRM_R13M_N2J_HIGH_ENERGY_30_100_GEV_EVENT_LOCALIZATION_GUARDRAIL_NO_SCORE"
+          OUT = Path(f"{STAGE}_OUTPUT"); OUT.mkdir(exist_ok=True)
+          CLAIM = "NO_SCORE_NOT_PROOF_NOT_DISCOVERY"
+          R9C_RA = 299.590315
+          R9C_DEC = 35.201606
+          EMIN = 30000.0
+          EMAX = 100000.0
+          RING_LO = 2.0
+          RING_HI = 5.0
+          PROGRESS = OUT / "PROGRESS.log"
+
+          INPUTS = [
+              {"label":"LAG650D_post_w821", "phase":"post", "week":821, "url":"https://heasarc.gsfc.nasa.gov/FTP/fermi/data/lat/weekly/photon/lat_photon_weekly_w821_p305_v001.fits", "paths":[".acirm_lat_cache_n2f_lag650d_split/photon_w821/lat_photon_weekly_w821_p305_v001.fits", ".acirm_lat_cache_n2h/lat_photon_weekly_w821_p305_v001.fits", ".acirm_lat_cache_n2i/lat_photon_weekly_w821_p305_v001.fits", ".acirm_lat_cache_n2j/lat_photon_weekly_w821_p305_v001.fits"]},
+              {"label":"LAG650D_pre_w635", "phase":"pre", "week":635, "url":"https://heasarc.gsfc.nasa.gov/FTP/fermi/data/lat/weekly/photon/lat_photon_weekly_w635_p305_v001.fits", "paths":[".acirm_lat_cache_n2f_lag650d_split/photon_w635/lat_photon_weekly_w635_p305_v001.fits", ".acirm_lat_cache_n2h/lat_photon_weekly_w635_p305_v001.fits", ".acirm_lat_cache_n2i/lat_photon_weekly_w635_p305_v001.fits", ".acirm_lat_cache_n2j/lat_photon_weekly_w635_p305_v001.fits"]},
+          ]
+
+          LOCKED_SOURCES = [
+            {"source_id":"R9C_CENTER", "assoc":"R9C/Cyg X-1 nominal center", "ra":R9C_RA, "dec":R9C_DEC, "dist_from_r9c_deg":0.0, "role":"r9c_center"},
+            {"source_id":"4FGL J1958.5+3512", "assoc":"Cyg X-1", "ra":299.6339, "dec":35.2046, "dist_from_r9c_deg":0.035956, "role":"nearest_catalog_source"},
+            {"source_id":"4FGL J1950.6+3456", "assoc":"2MASS J19502776+3456224", "ra":297.660, "dec":34.939, "dist_from_r9c_deg":1.597349, "role":"nearby_catalog_source"},
+            {"source_id":"4FGL J2004.9+3421", "assoc":"", "ra":301.236, "dec":34.360, "dist_from_r9c_deg":1.605916, "role":"nearby_catalog_source"},
+            {"source_id":"4FGL J2004.3+3339", "assoc":"B2 2002+33", "ra":301.081, "dec":33.655, "dist_from_r9c_deg":1.983161, "role":"nearby_catalog_source"},
+            {"source_id":"4FGL J2005.8+3357", "assoc":"", "ra":301.459, "dec":33.963, "dist_from_r9c_deg":1.989057, "role":"nearby_catalog_source"},
+            {"source_id":"4FGL J1948.9+3414", "assoc":"", "ra":297.2261962890625, "dec":34.239601135253906, "dist_from_r9c_deg":2.1681655108615416, "role":"locked_2_5_ring_source"},
+            {"source_id":"4FGL J2009.9+3544", "assoc":"B2 2008+35", "ra":302.4891967773437, "dec":35.74599838256836, "dist_from_r9c_deg":2.422644339422418, "role":"locked_2_5_ring_source"},
+            {"source_id":"4FGL J1954.4+3252e", "assoc":"CTB 80", "ra":298.6000061035156, "dec":32.869998931884766, "dist_from_r9c_deg":2.471769439602049, "role":"locked_2_5_ring_source"},
+            {"source_id":"4FGL J2002.3+3246", "assoc":"SNR G069.7+01.0", "ra":300.5997009277344, "dec":32.77880096435547, "dist_from_r9c_deg":2.5632321685955604, "role":"locked_2_5_ring_source"},
+            {"source_id":"4FGL J1952.9+3252", "assoc":"PSR J1952+3252", "ra":298.247314453125, "dec":32.882999420166016, "dist_from_r9c_deg":2.571757782717301, "role":"locked_2_5_ring_source"},
+            {"source_id":"4FGL J2013.5+3613", "assoc":"SNR G073.9+00.9", "ra":303.3844909667969, "dec":36.225399017333984, "dist_from_r9c_deg":3.246048161207813, "role":"top4_cluster_candidate"},
+            {"source_id":"4FGL J1959.0+3844", "assoc":"LQAC 299+038", "ra":299.76629638671875, "dec":38.73680114746094, "dist_from_r9c_deg":3.537987659798902, "role":"locked_2_5_ring_source"},
+            {"source_id":"4FGL J1950.2+3822", "assoc":"RX J1950.0+3821", "ra":297.56939697265625, "dec":38.371700286865234, "dist_from_r9c_deg":3.559091895403688, "role":"locked_2_5_ring_source"},
+            {"source_id":"4FGL J1953.5+3841", "assoc":"", "ra":298.3848876953125, "dec":38.6880989074707, "dist_from_r9c_deg":3.6170398911174417, "role":"locked_2_5_ring_source"},
+            {"source_id":"4FGL J2017.3+3525", "assoc":"", "ra":304.3492126464844, "dec":35.42259979248047, "dist_from_r9c_deg":3.889238843639835, "role":"locked_2_5_ring_source"},
+            {"source_id":"4FGL J2015.5+3710", "assoc":"MG2 J201534+3710", "ra":303.89239501953125, "dec":37.17599868774414, "dist_from_r9c_deg":3.993576217978025, "role":"top4_cluster_candidate"},
+            {"source_id":"4FGL J2016.2+3712", "assoc":"VER J2016+372", "ra":304.056884765625, "dec":37.21310043334961, "dist_from_r9c_deg":4.126644299917183, "role":"top4_cluster_candidate"},
+            {"source_id":"4FGL J2017.9+3625", "assoc":"PSR J2017+3625", "ra":304.49090576171875, "dec":36.42770004272461, "dist_from_r9c_deg":4.158222141614726, "role":"top4_cluster_candidate"},
+            {"source_id":"4FGL J2006.2+3102", "assoc":"PSR J2006+3102", "ra":301.56610107421875, "dec":31.04459953308105, "dist_from_r9c_deg":4.473921852177352, "role":"locked_2_5_ring_source"},
+            {"source_id":"4FGL J1935.4+3547", "assoc":"", "ra":293.8646850585937, "dec":35.796199798583984, "dist_from_r9c_deg":4.69845561778258, "role":"locked_2_5_ring_source"},
+            {"source_id":"4FGL J2021.9+3609", "assoc":"", "ra":305.4862976074219, "dec":36.15769958496094, "dist_from_r9c_deg":4.882909314033249, "role":"locked_2_5_ring_source"},
+            {"source_id":"4FGL J2021.1+3651", "assoc":"PSR J2021+3651", "ra":305.27960205078125, "dec":36.85609817504883, "dist_from_r9c_deg":4.888469684256179, "role":"locked_2_5_ring_source"},
+          ]
+          TOP4_IDS = {"4FGL J2015.5+3710","4FGL J2016.2+3712","4FGL J2017.9+3625","4FGL J2013.5+3613"}
+
+          def log(msg):
+              s=f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] {msg}"
+              print(s, flush=True)
+              with PROGRESS.open('a', encoding='utf-8') as f: f.write(s+'\n')
+          def write_json(name,obj): (OUT/name).write_text(json.dumps(obj, indent=2, sort_keys=True), encoding='utf-8')
+          def write_csv(name, rows, fields):
+              with (OUT/name).open('w', newline='', encoding='utf-8') as f:
+                  w=csv.DictWriter(f, fieldnames=fields); w.writeheader()
+                  for r in rows: w.writerow({k:r.get(k,'') for k in fields})
+          def sha256_file(p):
+              h=hashlib.sha256()
+              with open(p,'rb') as f:
+                  for b in iter(lambda:f.read(1024*1024), b''): h.update(b)
+              return h.hexdigest()
+          def fits_ok(p):
+              try:
+                  with open(p,'rb') as f: return f.read(6)==b'SIMPLE'
+              except Exception: return False
+          def run(cmd, timeout=None):
+              return subprocess.run(cmd, text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=timeout)
+          def angsep_deg(ra1,dec1,ra2,dec2):
+              ra1=np.deg2rad(ra1); dec1=np.deg2rad(dec1); ra2=np.deg2rad(ra2); dec2=np.deg2rad(dec2)
+              c=np.sin(dec1)*np.sin(dec2)+np.cos(dec1)*np.cos(dec2)*np.cos(ra1-ra2)
+              return np.rad2deg(np.arccos(np.clip(c,-1,1)))
+          def ensure_file(item):
+              for raw in item['paths']:
+                  p=Path(raw)
+                  if p.exists() and p.stat().st_size>1024 and fits_ok(p): return p,'cache'
+              dest=Path(item['paths'][-1]); dest.parent.mkdir(parents=True, exist_ok=True)
+              log('download '+item['label'])
+              p=run(['aria2c','-x','4','-s','4','-c','--timeout=180','--connect-timeout=90','--max-tries=8','--retry-wait=20','-d',str(dest.parent),'-o',dest.name,item['url']], timeout=3600)
+              (OUT/(item['label']+'_aria2.log')).write_text((p.stdout or '')[-12000:], encoding='utf-8', errors='replace')
+              if p.returncode==0 and dest.exists() and fits_ok(dest): return dest,'aria2c'
+              p2=run(['curl','-L','--fail','--connect-timeout','90','--max-time','3600','--retry','4','--retry-delay','20','-o',str(dest),item['url']], timeout=3700)
+              (OUT/(item['label']+'_curl.log')).write_text((p2.stdout or '')[-12000:], encoding='utf-8', errors='replace')
+              if p2.returncode==0 and dest.exists() and fits_ok(dest): return dest,'curl'
+              return dest,'missing'
+
+          def load_selected_events(path, phase, week):
+              with fits.open(path, memmap=True) as hdul:
+                  d=hdul['EVENTS'].data
+                  ra=np.asarray(d['RA'], dtype=float)
+                  dec=np.asarray(d['DEC'], dtype=float)
+                  e=np.asarray(d['ENERGY'], dtype=float)
+                  t=np.asarray(d['TIME'], dtype=float)
+                  good=np.isfinite(ra)&np.isfinite(dec)&np.isfinite(e)&np.isfinite(t)&(e>=EMIN)&(e<EMAX)
+                  dist=angsep_deg(ra, dec, R9C_RA, R9C_DEC)
+                  sel=good&(dist>=RING_LO)&(dist<RING_HI)
+                  idx=np.nonzero(sel)[0]
+                  rows=[]
+                  tsel=t[sel]
+                  t0=float(np.nanmin(t)) if np.isfinite(t).any() else None
+                  for j,i in enumerate(idx):
+                      evra=float(ra[i]); evdec=float(dec[i]); energy=float(e[i]); met=float(t[i]); dr=float(dist[i])
+                      nearest=None; nd=999.0
+                      for s in LOCKED_SOURCES:
+                          ds=float(angsep_deg(evra, evdec, s['ra'], s['dec']))
+                          if ds<nd:
+                              nd=ds; nearest=s
+                      rows.append({
+                          'phase':phase,'week':week,'event_order_in_selection':j+1,'source_file_row_index':int(i),
+                          'time_met':met,'time_day_offset_from_file_min':(met-t0)/86400.0 if t0 is not None else '',
+                          'energy_mev':energy,'energy_gev':energy/1000.0,'ra_deg':evra,'dec_deg':evdec,
+                          'dist_from_r9c_deg':dr,'nearest_locked_source_id':nearest['source_id'] if nearest else '',
+                          'nearest_locked_source_assoc':nearest['assoc'] if nearest else '',
+                          'nearest_locked_source_role':nearest['role'] if nearest else '',
+                          'nearest_locked_source_dist_deg':nd if nearest else '',
+                          'within_025_deg_of_nearest': bool(nd<=0.25),
+                          'within_05_deg_of_nearest': bool(nd<=0.5),
+                          'within_10_deg_of_nearest': bool(nd<=1.0),
+                          'nearest_is_top4_cluster_candidate': bool(nearest and nearest['source_id'] in TOP4_IDS),
+                      })
+                  return rows, {'phase':phase,'week':week,'file_total_30_100gev_count':int(good.sum()),'ring_2_5_30_100gev_count':int(sel.sum()),'file_time_min_met':float(np.nanmin(t)),'file_time_max_met':float(np.nanmax(t))}
+
+          def package():
+              zipname=f'{STAGE}_RESULTS.zip'
+              shutil.make_archive(zipname[:-4], 'zip', root_dir='.', base_dir=str(OUT))
+              sha=hashlib.sha256(Path(zipname).read_bytes()).hexdigest()
+              Path(zipname+'.sha256.txt').write_text(f'{sha}  {zipname}\n', encoding='utf-8')
+              log('ZIP '+zipname+' SHA256 '+sha)
+
+          def main():
+              log('START '+STAGE)
+              write_json('LOCKED_CONTEXT.json', {'stage':STAGE,'claim_ceiling':CLAIM,'purpose':'Localize the four/post-only high-energy 30-100 GeV events in the 2-5 deg ring at LAG650D. Energy source origin remains unconstrained by theory.','energy_band_mev':[EMIN,EMAX],'ring_deg':[RING_LO,RING_HI],'locked_sources_n':len(LOCKED_SOURCES)})
+              manifest=[]; paths={}
+              for item in INPUTS:
+                  path, method = ensure_file(item)
+                  row={**{k:item[k] for k in ['label','phase','week']}, 'path':str(path), 'method':method, 'exists':path.exists(), 'size_bytes':path.stat().st_size if path.exists() else 0, 'fits_magic_ok':fits_ok(path), 'sha256':sha256_file(path) if path.exists() and fits_ok(path) else ''}
+                  row['ready']=bool(row['exists'] and row['fits_magic_ok'])
+                  manifest.append(row)
+                  if row['ready']: paths[item['phase']]=path
+              write_csv('INPUT_PHOTON_MANIFEST.csv', manifest, ['label','phase','week','path','method','exists','size_bytes','fits_magic_ok','sha256','ready'])
+              if len(paths)!=2:
+                  write_json('FINAL_DECISION.json', {'stage':STAGE,'decision':'TECHNICAL_STOP_N2J_REQUIRED_LAG650_PHOTON_INPUTS_MISSING_NO_SCORE','technical_stop':True,'scientific_result':False,'ready_files':len(paths),'claim_ceiling':CLAIM})
+                  package(); return
+              event_rows=[]; summaries=[]
+              for item in INPUTS:
+                  rows, summ=load_selected_events(paths[item['phase']], item['phase'], item['week'])
+                  event_rows.extend(rows); summaries.append(summ)
+              write_csv('N2J_30_100_GEV_RING_2_5_EVENTS.csv', event_rows, ['phase','week','event_order_in_selection','source_file_row_index','time_met','time_day_offset_from_file_min','energy_mev','energy_gev','ra_deg','dec_deg','dist_from_r9c_deg','nearest_locked_source_id','nearest_locked_source_assoc','nearest_locked_source_role','nearest_locked_source_dist_deg','within_025_deg_of_nearest','within_05_deg_of_nearest','within_10_deg_of_nearest','nearest_is_top4_cluster_candidate'])
+              write_csv('N2J_EVENT_FILE_SUMMARY.csv', summaries, ['phase','week','file_total_30_100gev_count','ring_2_5_30_100gev_count','file_time_min_met','file_time_max_met'])
+
+              # Nearest-source aggregation by phase.
+              agg=[]
+              for phase in ['post','pre']:
+                  ev=[r for r in event_rows if r['phase']==phase]
+                  for sid in sorted({r['nearest_locked_source_id'] for r in ev}):
+                      ss=[r for r in ev if r['nearest_locked_source_id']==sid]
+                      if not ss: continue
+                      agg.append({'phase':phase,'nearest_locked_source_id':sid,'assoc':ss[0]['nearest_locked_source_assoc'],'role':ss[0]['nearest_locked_source_role'],'event_n':len(ss),'within_025_n':sum(bool(r['within_025_deg_of_nearest']) for r in ss),'within_05_n':sum(bool(r['within_05_deg_of_nearest']) for r in ss),'within_10_n':sum(bool(r['within_10_deg_of_nearest']) for r in ss),'mean_dist_to_nearest_deg':float(np.mean([r['nearest_locked_source_dist_deg'] for r in ss])),'mean_energy_gev':float(np.mean([r['energy_gev'] for r in ss]))})
+              write_csv('N2J_NEAREST_SOURCE_AGGREGATION.csv', agg, ['phase','nearest_locked_source_id','assoc','role','event_n','within_025_n','within_05_n','within_10_n','mean_dist_to_nearest_deg','mean_energy_gev'])
+
+              # Time clustering diagnostics.
+              time_rows=[]
+              for phase in ['post','pre']:
+                  ev=sorted([r for r in event_rows if r['phase']==phase], key=lambda r:r['time_met'])
+                  if ev:
+                      times=np.array([r['time_met'] for r in ev], dtype=float)
+                      gaps=np.diff(times)/86400.0 if len(times)>1 else np.array([])
+                      time_rows.append({'phase':phase,'event_n':len(ev),'time_span_days':float((times.max()-times.min())/86400.0) if len(times)>1 else 0.0,'min_gap_days':float(gaps.min()) if gaps.size else '', 'median_gap_days':float(np.median(gaps)) if gaps.size else '', 'max_gap_days':float(gaps.max()) if gaps.size else '', 'first_event_day_offset':ev[0]['time_day_offset_from_file_min'],'last_event_day_offset':ev[-1]['time_day_offset_from_file_min']})
+                  else:
+                      time_rows.append({'phase':phase,'event_n':0,'time_span_days':'','min_gap_days':'','median_gap_days':'','max_gap_days':'','first_event_day_offset':'','last_event_day_offset':''})
+              write_csv('N2J_EVENT_TIME_CLUSTERING.csv', time_rows, ['phase','event_n','time_span_days','min_gap_days','median_gap_days','max_gap_days','first_event_day_offset','last_event_day_offset'])
+
+              post_n=sum(1 for r in event_rows if r['phase']=='post')
+              pre_n=sum(1 for r in event_rows if r['phase']=='pre')
+              post_top4=sum(1 for r in event_rows if r['phase']=='post' and r['nearest_is_top4_cluster_candidate'])
+              post_near_any_1=sum(1 for r in event_rows if r['phase']=='post' and r['within_10_deg_of_nearest'])
+              post_near_any_05=sum(1 for r in event_rows if r['phase']=='post' and r['within_05_deg_of_nearest'])
+              if post_n>pre_n and post_n>0:
+                  if post_top4==post_n:
+                      decision='N2J_30_100_GEV_EVENTS_LOCALIZE_TO_TOP4_CLUSTER_CANDIDATES_NO_SCORE'
+                  elif post_near_any_1==post_n:
+                      decision='N2J_30_100_GEV_EVENTS_NEAR_LOCKED_RING_SOURCES_NOT_R9C_POINT_NO_SCORE'
+                  else:
+                      decision='N2J_30_100_GEV_POST_EVENTS_FIELD_DISTRIBUTED_RING_LOCALIZATION_NO_SCORE'
+              else:
+                  decision='N2J_NO_POST_EXCESS_30_100_GEV_RING_EVENTS_NO_SCORE'
+              summary={'stage':STAGE,'decision':decision,'technical_stop':False,'scientific_result':True,'claim_ceiling':CLAIM,'post_ring_2_5_30_100_event_n':post_n,'pre_ring_2_5_30_100_event_n':pre_n,'post_minus_pre_event_n':post_n-pre_n,'post_events_nearest_top4_n':post_top4,'post_events_within_1deg_of_locked_source_n':post_near_any_1,'post_events_within_0p5deg_of_locked_source_n':post_near_any_05,'interpretation':'Event-level guardrail only. Small-number 30-100 GeV photons must not be overclaimed. Energy origin remains unconstrained; this tests where high-energy photons appear under the R9C resonance window.'}
+              write_json('SUMMARY.json', summary); write_json('FINAL_DECISION.json', summary); package()
+
+          if __name__=='__main__':
+              try:
+                  main()
+              except Exception:
+                  (OUT/'EXCEPTION_TRACEBACK.txt').write_text(traceback.format_exc(), encoding='utf-8')
+                  write_json('FINAL_DECISION.json', {'stage':STAGE,'decision':'TECHNICAL_STOP_N2J_EXCEPTION_NO_SCORE','technical_stop':True,'scientific_result':False,'error':traceback.format_exc()[-2000:],'claim_ceiling':CLAIM})
+                  package()
+          PY
+          python -m py_compile n2j_worker.py
+
+      - name: Run N2J high-energy event localization guardrail
+        shell: bash
+        run: |
+          set -euo pipefail
+          python n2j_worker.py
+
+      - name: Show final decision
+        if: always()
+        shell: bash
+        run: |
+          set +e
+          cat ACIRM_R13M_N2J_HIGH_ENERGY_30_100_GEV_EVENT_LOCALIZATION_GUARDRAIL_NO_SCORE_OUTPUT/FINAL_DECISION.json || true
+          echo ""
+          tail -n 120 ACIRM_R13M_N2J_HIGH_ENERGY_30_100_GEV_EVENT_LOCALIZATION_GUARDRAIL_NO_SCORE_OUTPUT/PROGRESS.log || true
+
+      - name: Upload N2J artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ACIRM_R13M_N2J_HIGH_ENERGY_30_100_GEV_EVENT_LOCALIZATION_GUARDRAIL_RESULTS
+          path: |
+            ACIRM_R13M_N2J_HIGH_ENERGY_30_100_GEV_EVENT_LOCALIZATION_GUARDRAIL_NO_SCORE_RESULTS.zip
+            ACIRM_R13M_N2J_HIGH_ENERGY_30_100_GEV_EVENT_LOCALIZATION_GUARDRAIL_NO_SCORE_RESULTS.zip.sha256.txt
+            ACIRM_R13M_N2J_HIGH_ENERGY_30_100_GEV_EVENT_LOCALIZATION_GUARDRAIL_NO_SCORE_OUTPUT/**
+          retention-days: 14
