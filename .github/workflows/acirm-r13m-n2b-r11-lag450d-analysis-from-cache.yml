@@ -1,0 +1,568 @@
+name: ACIRM R13M N2B R11 LAG450D Analysis From Cache
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  acirm-r13m-n2b-r11-lag450d-analysis-from-cache:
+    runs-on: ubuntu-latest
+    timeout-minutes: 355
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Restore micromamba Fermipy environment
+        uses: actions/cache@v4
+        with:
+          path: |
+            ${{ github.workspace }}/.micromamba
+            ${{ github.workspace }}/acirm_fermipy_env
+          key: acirm-fermi-py311-fermitools251-fermipy-r13m-n2b-r9-env-v1
+          restore-keys: |
+            acirm-fermi-py311-fermitools251-fermipy-r13m-n2b-batch1-env-v1
+            acirm-fermi-py311-fermitools251-fermipy-r13m-n1-env-r7-verified-urls
+            acirm-fermi-py311-fermitools251-fermipy-r13m-n1-env-r5-split-worker
+
+      - name: Restore R10 LAG450D LAT cache
+        uses: actions/cache@v4
+        with:
+          path: ${{ github.workspace }}/.acirm_lat_cache_n2b_lag450d
+          key: acirm-r13m-n2b-lag450d-w664-w792-inputs-r11-${{ github.run_id }}
+          restore-keys: |
+            acirm-r13m-n2b-lag450d-w664-w792-inputs-r10-
+
+      - name: Install system packages
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq zip unzip curl wget aria2
+
+      - name: Install or reuse micromamba and Fermipy environment
+        shell: bash
+        run: |
+          set -euo pipefail
+          WORK="${{ github.workspace }}"
+          mkdir -p "$WORK/.micromamba/bin"
+          export MAMBA_ROOT_PREFIX="$WORK/.micromamba"
+          if [ ! -x "$WORK/.micromamba/bin/micromamba" ]; then
+            curl -Ls https://micro.mamba.pm/api/micromamba/linux-64/latest | tar -xvj -C "$WORK/.micromamba" bin/micromamba
+          fi
+          MM="$WORK/.micromamba/bin/micromamba"
+          ENV="$WORK/acirm_fermipy_env"
+          if [ ! -x "$ENV/bin/python" ]; then
+            "$MM" create -y -p "$ENV" -c conda-forge -c fermi \
+              python=3.11 fermitools=2.5.1 fermipy pyyaml astropy numpy scipy pip \
+            || (
+              echo "Primary conda install failed; trying fallback: fermitools conda + fermipy pip"
+              rm -rf "$ENV"
+              "$MM" create -y -p "$ENV" -c conda-forge -c fermi \
+                python=3.11 fermitools=2.5.1 pyyaml astropy numpy scipy pip
+              "$MM" run -p "$ENV" python -m pip install --no-cache-dir fermipy
+            )
+          else
+            echo "Reusing cached environment."
+          fi
+          "$MM" run -p "$ENV" python - <<'PY'
+          import sys, numpy, astropy, fermipy
+          from fermipy.gtanalysis import GTAnalysis
+          print("PYTHON", sys.version)
+          print("NUMPY", numpy.__version__)
+          print("FERMIPY", getattr(fermipy, "__version__", "unknown"))
+          PY
+          for tool in gtselect gtmktime gtltcube gtexpcube2 gtbin gtsrcmaps gtlike; do
+            "$MM" run -p "$ENV" which "$tool"
+          done
+
+      - name: Create embedded ACIRM R11 worker file part 1 of 3
+        shell: bash
+        run: |
+          set -euo pipefail
+          WORK="${{ github.workspace }}"
+          cat > "$WORK/acirm_r13m_n2b_r11_worker.py" <<'PY'
+          # ACIRM R13M N2B R11: LAG450D analysis from R10 cache only.
+          # No score / no proof / no discovery.
+          import os, sys, csv, json, math, shutil, hashlib, datetime, subprocess, traceback, re
+          from pathlib import Path
+          
+          STAGE = "ACIRM_R13M_N2B_R11_LAG450D_ANALYSIS_FROM_CACHE_NO_SCORE"
+          BASE = Path.cwd()
+          OUT = BASE / f"{STAGE}_OUTPUT"
+          CACHE = BASE / ".acirm_lat_cache_n2b_lag450d"
+          ANALYSIS = BASE / f"{STAGE}_ANALYSIS"
+          OUT.mkdir(parents=True, exist_ok=True)
+          ANALYSIS.mkdir(parents=True, exist_ok=True)
+          
+          CFG = {
+              "lag_label": "LAG_450D_W64",
+              "post_week": 792,
+              "pre_week": 664,
+              "emin_mev": 1000.0,
+              "emax_mev": 1000000.0,
+              "zmax_deg": 90.0,
+              "evclass": 128,
+              "evtype": 3,
+              "irfs": "P8R3_SOURCE_V3",
+              "roi_radius_deg": 5.0,
+              "roiwidth_deg": 10.0,
+              "binsz_deg": 0.25,
+              "binsperdec": 4,
+              "src_roiwidth_deg": 15.0,
+              "claim_ceiling": "official Fermipy/Fermitools multi-lag batch diagnostic only; no score, no proof, no discovery",
+              "theory_policy": "N2B Batch2 tests a shorter lag guardrail at approximately 450 days, using the same R9C and no-gate controls as N1."
+          }
+          
+          REGIONS = [
+              ("R9C_CYGX1", "r9c_gate_target", 299.590315, 35.201606),
+              ("NOGATE_RA030", "no_gate_sky_control", 329.590315, 35.201606),
+              ("NOGATE_RA060", "no_gate_sky_control", 359.590315, 35.201606),
+              ("NOGATE_RA090", "no_gate_sky_control", 29.590315, 35.201606),
+              ("NOGATE_RA120", "no_gate_sky_control", 59.590315, 35.201606),
+              ("NOGATE_RA180", "no_gate_sky_control", 119.590315, 35.201606),
+              ("NOGATE_RA240", "no_gate_sky_control", 179.590315, 35.201606),
+              ("NOGATE_RA300", "no_gate_sky_control", 239.590315, 35.201606),
+              ("NOGATE_NORTH", "no_gate_sky_control", 299.590315, 70.201606),
+              ("NOGATE_SOUTH", "no_gate_sky_control", 299.590315, 0.201606),
+          ]
+          TARGETS = [
+              {"direction": "post", "sample_point": "lag450d_post_w792", "week": 792},
+              {"direction": "pre", "sample_point": "lag450d_pre_w664", "week": 664},
+          ]
+          REQUIRED_CACHE_FILES = {
+              "photon_w792": CACHE / "lat_photon_weekly_w792_p305_v001.fits",
+              "spacecraft_w792": CACHE / "lat_spacecraft_weekly_w792_p310_v001.fits",
+              "photon_w664": CACHE / "lat_photon_weekly_w664_p305_v001.fits",
+              "spacecraft_w664": CACHE / "lat_spacecraft_weekly_w664_p310_v001.fits",
+              "catalog_gll_psc_v35": CACHE / "gll_psc_v35.fit",
+          }
+          
+          def run(cmd, timeout=None):
+              p = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=timeout)
+              return p.returncode, p.stdout
+          def log(msg):
+              print(str(msg), flush=True)
+              with (OUT / "PROGRESS.log").open("a", encoding="utf-8") as f:
+                  f.write(str(msg) + "\n")
+          def write_json(name, obj):
+              (OUT / name).write_text(json.dumps(obj, indent=2, ensure_ascii=False), encoding="utf-8")
+          def write_csv(name, rows, cols):
+              with (OUT / name).open("w", newline="", encoding="utf-8") as f:
+                  w = csv.DictWriter(f, fieldnames=cols)
+                  w.writeheader()
+                  for r in rows:
+                      w.writerow({c: r.get(c, "") for c in cols})
+          def sha256_file(path):
+              h = hashlib.sha256()
+              with open(path, "rb") as f:
+                  for b in iter(lambda: f.read(1024 * 1024), b""):
+                      h.update(b)
+              return h.hexdigest()
+          def package_outputs():
+              zip_path = BASE / f"{STAGE}_RESULTS.zip"
+              sha_path = BASE / f"{STAGE}_RESULTS.zip.sha256.txt"
+              if zip_path.exists(): zip_path.unlink()
+              if sha_path.exists(): sha_path.unlink()
+              shutil.make_archive(str(zip_path).replace(".zip", ""), "zip", root_dir=str(OUT.parent), base_dir=OUT.name)
+              sha_path.write_text(sha256_file(zip_path) + "  " + zip_path.name + "\n", encoding="utf-8")
+              log(f"PACKAGED {zip_path.name} SHA256={sha_path.read_text().split()[0]}")
+          def final_decision(decision, next_stage, extra=None):
+              obj = {"stage": STAGE, "decision": decision, "next_stage": next_stage, "claim_ceiling": CFG["claim_ceiling"], "theory_policy": CFG["theory_policy"], "timestamp_utc": datetime.datetime.now(datetime.UTC).isoformat()}
+              if extra: obj.update(extra)
+              write_json("FINAL_DECISION.json", obj)
+              log("FINAL_DECISION: " + decision)
+          def safe_name(s):
+              return re.sub(r"[^A-Za-z0-9_]+", "_", str(s))
+          def fits_magic_ok(path):
+              try:
+                  with open(path, "rb") as f:
+                      return f.read(6) == b"SIMPLE"
+              except Exception:
+                  return False
+          def find_local_diffuse_file(filename):
+              roots = []
+              for v in ["FERMI_DIR", "FERMITOOLS_DIR", "CONDA_PREFIX"]:
+                  p = os.environ.get(v)
+                  if p: roots.append(Path(p))
+              roots += [BASE, Path.home()]
+              seen = set(); candidates = []
+              for root in roots:
+                  try: root = root.resolve()
+                  except Exception: continue
+                  if str(root) in seen or not root.exists(): continue
+                  seen.add(str(root))
+                  try:
+                      for x in root.rglob(filename):
+                          if x.is_file() and x.stat().st_size > 0: candidates.append(x)
+                  except Exception: pass
+              if candidates:
+                  candidates = sorted(candidates, key=lambda x: x.stat().st_size, reverse=True)
+                  return candidates[0], [str(c) for c in candidates[:20]]
+              return None, []
+          def validate_event_file(path):
+              from astropy.io import fits
+              try:
+                  with fits.open(path, memmap=True) as hdul:
+                      for h in hdul:
+                          if hasattr(h, "columns") and h.columns is not None:
+                              cols = [str(c).upper() for c in h.columns.names]
+                              if all(x in cols for x in ["TIME", "ENERGY", "RA", "DEC"]): return True
+              except Exception: return False
+              return False
+          def time_bounds(path):
+              import numpy as np
+              from astropy.io import fits
+              with fits.open(path, memmap=True) as hdul:
+                  for h in hdul:
+                      if hasattr(h, "columns") and h.columns is not None:
+                          cols = [str(c).upper() for c in h.columns.names]
+                          if "TIME" in cols:
+                              t = np.asarray(h.data["TIME"], dtype=float)
+                              t = t[np.isfinite(t)]
+                              if t.size: return float(np.min(t)), float(np.max(t))
+              return None, None
+          def json_safe(x):
+              try:
+                  import numpy as np
+                  if isinstance(x, (np.integer,)): return int(x)
+                  if isinstance(x, (np.floating,)): return float(x)
+                  if isinstance(x, (np.ndarray,)): return x.tolist()
+              except Exception: pass
+              try: json.dumps(x); return x
+              except Exception: return str(x)
+          def get_source_names_from_obj(obj):
+              names = []
+              for attr in ["sourceNames", "srcNames"]:
+                  try:
+                      v = getattr(obj, attr); vv = v() if callable(v) else v
+                      for n in list(vv): names.append(str(n))
+                  except Exception: pass
+              try:
+                  m = getattr(obj, "model")
+                  for attr in ["srcNames", "sourceNames"]:
+                      try:
+                          vv = getattr(m, attr); vv = vv() if callable(vv) else vv
+                          for n in list(vv): names.append(str(n))
+                      except Exception: pass
+              except Exception: pass
+              out=[]; seen=set()
+              for n in names:
+                  if n and n not in seen: seen.add(n); out.append(n)
+              return out
+          def get_components(like):
+              comps=[]
+              for attr in ["components", "_components"]:
+                  try:
+                      v=getattr(like, attr); vv=v() if callable(v) else v
+                      for c in list(vv): comps.append(c)
+                  except Exception: pass
+              return comps if comps else [like]
+          PY
+
+      - name: Create embedded ACIRM R11 worker file part 2 of 3
+        shell: bash
+        run: |
+          set -euo pipefail
+          WORK="${{ github.workspace }}"
+          cat >> "$WORK/acirm_r13m_n2b_r11_worker.py" <<'PY'
+          def get_nobs_robust(like):
+              errors=[]
+              for attr in ["total_nobs", "totalNobs", "Nobs"]:
+                  try:
+                      v=getattr(like, attr); vv=v() if callable(v) else v
+                      return float(vv), f"top.{attr}", errors
+                  except Exception as e: errors.append(f"top.{attr}:{repr(e)[:120]}")
+              comps=get_components(like); total=0.0; used=0
+              for ci, comp in enumerate(comps):
+                  for attr in ["total_nobs", "totalNobs", "Nobs"]:
+                      try:
+                          v=getattr(comp, attr); vv=v() if callable(v) else v
+                          total += float(vv); used += 1; break
+                      except Exception as e: errors.append(f"comp{ci}.{attr}:{repr(e)[:120]}")
+              if used: return total, "sum_components_nobs", errors
+              return "", "failed", errors
+          def get_npred_robust(like, roi_source_names=None):
+              errors=[]; attempts=[]
+              for attr in ["total_npred", "totalNpred", "Npred"]:
+                  try:
+                      v=getattr(like, attr); vv=v() if callable(v) else v
+                      val=float(vv)
+                      if val > 0: return val, f"top.{attr}", attempts, errors
+                  except Exception as e: errors.append(f"top.{attr}:{repr(e)[:120]}")
+              candidate_names=get_source_names_from_obj(like)
+              if roi_source_names: candidate_names.extend([str(x) for x in roi_source_names])
+              tmp=[]; seen=set()
+              for n in candidate_names:
+                  if n and n not in seen: seen.add(n); tmp.append(n)
+              candidate_names=tmp
+              for method in ["NpredValue", "npredValue"]:
+                  total=0.0; used=0
+                  for src in candidate_names:
+                      try:
+                          fn=getattr(like, method); v=float(fn(src))
+                          if math.isfinite(v): total += v; used += 1
+                      except Exception as e: errors.append(f"top.{method}({src}):{repr(e)[:90]}")
+                  attempts.append({"method": f"top.{method}", "used_sources": used, "source_count": len(candidate_names), "total": total})
+                  if used and total > 0: return total, f"top.{method}_sum_sources", attempts, errors
+              comps=get_components(like); grand=0.0; grand_used=0; comp_details=[]
+              for ci, comp in enumerate(comps):
+                  comp_names=get_source_names_from_obj(comp)
+                  if not comp_names and roi_source_names: comp_names=[str(x) for x in roi_source_names]
+                  tmp=[]; seen=set()
+                  for n in comp_names:
+                      if n and n not in seen: seen.add(n); tmp.append(n)
+                  comp_names=tmp; comp_total=0.0; comp_used=0
+                  for method in ["NpredValue", "npredValue"]:
+                      for src in comp_names:
+                          try:
+                              fn=getattr(comp, method); v=float(fn(src))
+                              if math.isfinite(v): comp_total += v; comp_used += 1
+                          except Exception as e: errors.append(f"comp{ci}.{method}({src}):{repr(e)[:90]}")
+                  comp_details.append({"component_index": ci, "used_sources": comp_used, "source_count": len(comp_names), "component_total": comp_total})
+                  if comp_used and comp_total > 0: grand += comp_total; grand_used += comp_used
+              attempts.append({"method": "sum_components_NpredValue", "used_sources": grand_used, "component_details": comp_details, "total": grand})
+              if grand_used and grand > 0: return grand, "sum_components_NpredValue", attempts, errors
+              return "", "failed", attempts, errors
+          def get_roi_source_names(gta):
+              names=[]
+              try:
+                  for s in gta.roi.sources:
+                      try: names.append(str(s.name))
+                      except Exception: pass
+              except Exception: pass
+              return names
+          def get_loglike(like):
+              try: return float(like())
+              except Exception: pass
+              try: return float(like.logLike.value())
+              except Exception: return ""
+          def run_fermipy_one(label, region_tuple, target, photon, spacecraft, galdiff, isodiff, catalog):
+              import yaml
+              from fermipy.gtanalysis import GTAnalysis
+              rid, role, ra, dec = region_tuple
+              workdir = ANALYSIS / label; workdir.mkdir(parents=True, exist_ok=True)
+              tmin, tmax = time_bounds(photon)
+              if tmin is None or tmax is None:
+                  return {"label": label, "ok": False, "error": "NO_TIME_BOUNDS", "region_id": rid, "direction": target["direction"]}
+              config = {
+                  "data": {"evfile": str(Path(photon).resolve()), "scfile": str(Path(spacecraft).resolve())},
+                  "fileio": {"outdir": str(workdir.resolve()), "usescratch": False},
+                  "binning": {"roiwidth": CFG["roiwidth_deg"], "binsz": CFG["binsz_deg"], "binsperdec": CFG["binsperdec"], "coordsys": "CEL", "proj": "AIT"},
+                  "selection": {"emin": CFG["emin_mev"], "emax": CFG["emax_mev"], "zmax": CFG["zmax_deg"], "evclass": CFG["evclass"], "evtype": CFG["evtype"], "ra": float(ra), "dec": float(dec), "radius": CFG["roi_radius_deg"], "tmin": float(tmin), "tmax": float(tmax)},
+                  "gtlike": {"edisp": True, "irfs": CFG["irfs"], "edisp_disable": ["isodiff", "galdiff"]},
+                  "model": {"src_roiwidth": CFG["src_roiwidth_deg"], "galdiff": str(Path(galdiff).resolve()), "isodiff": str(Path(isodiff).resolve()), "catalogs": [str(Path(catalog).resolve())]},
+                  "optimizer": {"optimizer": "MINUIT", "tol": 0.001, "max_iter": 50},
+              }
+              cfg_path = workdir / "config.yaml"
+              cfg_path.write_text(yaml.safe_dump(config, sort_keys=False), encoding="utf-8")
+              shutil.copy2(cfg_path, OUT / f"{label}_config.yaml")
+              out={"label": label, "region_id": rid, "region_role": role, "direction": target["direction"], "sample_point": target["sample_point"], "week": target["week"], "ra": ra, "dec": dec, "tmin": tmin, "tmax": tmax, "ok": False, "setup_ok": False, "optimize_ok": False, "fit_ok": False, "nobs": "", "nobs_method": "", "npred": "", "npred_method": "", "model_residual_nobs_minus_npred": "", "loglike": "", "fit_quality": "", "fit_status": "", "source_names_count": "", "npred_errors_tail": ""}
+              try:
+                  gta=GTAnalysis(str(cfg_path), logging={"verbosity": 2})
+                  gta.setup(); out["setup_ok"]=True
+                  try:
+                      opt=gta.optimize(); out["optimize_ok"]=True; out["optimize_result"]=json_safe(opt)
+                  except Exception as e: out["optimize_error"]=repr(e)[:700]
+                  try:
+                      fit=gta.fit(); out["fit_ok"]=True; out["fit_result"]=json_safe(fit)
+                      if isinstance(fit, dict):
+                          out["fit_quality"]=fit.get("fit_quality", ""); out["fit_status"]=fit.get("fit_status", "")
+                  except Exception as e: out["fit_error"]=repr(e)[:700]
+                  roi_names=get_roi_source_names(gta); out["source_names_count"]=len(roi_names)
+                  nobs, nobs_method, _=get_nobs_robust(gta.like)
+                  npred, npred_method, npred_attempts, npred_errors=get_npred_robust(gta.like, roi_source_names=roi_names)
+                  out["nobs"]=nobs; out["nobs_method"]=nobs_method; out["npred"]=npred; out["npred_method"]=npred_method
+                  out["npred_attempts"]=json_safe(npred_attempts); out["npred_errors_tail"]="|".join(npred_errors[-12:])
+                  try:
+                      if nobs != "" and npred != "": out["model_residual_nobs_minus_npred"] = float(nobs) - float(npred)
+                  except Exception as e: out["residual_error"]=repr(e)[:500]
+                  out["loglike"]=get_loglike(gta.like)
+                  out["ok"]=bool(out["setup_ok"] and (out["fit_ok"] or out["optimize_ok"]))
+                  return out
+              except Exception:
+                  out["error"] = traceback.format_exc()[-4000:]
+                  return out
+          PY
+
+      - name: Create embedded ACIRM R11 worker file part 3 of 3
+        shell: bash
+        run: |
+          set -euo pipefail
+          WORK="${{ github.workspace }}"
+          cat >> "$WORK/acirm_r13m_n2b_r11_worker.py" <<'PY'
+          try:
+              log("START " + STAGE)
+              write_json("LOCKED_CONTEXT.json", {"stage": STAGE, "cfg": CFG, "regions": REGIONS, "targets": TARGETS, "required_cache_files": {k: str(v) for k, v in REQUIRED_CACHE_FILES.items()}})
+              import numpy as np
+              from astropy.io import fits
+              import yaml, fermipy
+              from fermipy.gtanalysis import GTAnalysis
+              write_json("IMPORT_STATUS.json", {"numpy": np.__version__, "fermipy": getattr(fermipy, "__version__", "unknown"), "astropy_fits": "OK"})
+              cache_rows=[]; missing=[]
+              for label, path in REQUIRED_CACHE_FILES.items():
+                  row={"label": label, "path": str(path), "exists": path.exists(), "size_bytes": path.stat().st_size if path.exists() else 0, "fits_magic_ok": fits_magic_ok(path) if path.exists() else False, "sha256": sha256_file(path) if path.exists() else ""}
+                  cache_rows.append(row)
+                  if not (row["exists"] and row["size_bytes"] > 0 and row["fits_magic_ok"]): missing.append(label)
+              write_csv("CACHE_MANIFEST.csv", cache_rows, ["label", "path", "exists", "size_bytes", "fits_magic_ok", "sha256"])
+              if missing:
+                  final_decision("TECHNICAL_STOP_N2B_R11_REQUIRED_CACHE_FILES_MISSING_NO_SCORE", "RERUN_R10_DOWNLOAD_CACHE_BUILDER_OR_CHECK_CACHE_KEY", {"missing_cache_files": missing, "cache_manifest": cache_rows})
+                  package_outputs(); raise SystemExit(0)
+              tool_rows=[]
+              for tool in ["gtselect", "gtmktime", "gtltcube", "gtexpcube2", "gtbin", "gtsrcmaps", "gtlike"]:
+                  code, tout = run(["bash", "-lc", f"which {tool}"], timeout=60)
+                  tool_rows.append({"tool": tool, "ok": code == 0, "path": tout.strip(), "exit_code": code})
+              write_csv("TOOLCHECK.csv", tool_rows, ["tool", "ok", "path", "exit_code"])
+              if not all(r["ok"] for r in tool_rows):
+                  final_decision("TECHNICAL_STOP_FERMITOOLS_TOOLCHECK_FAILED_NO_SCORE", "REPAIR_FERMITOOLS_ENVIRONMENT", {"toolcheck": tool_rows})
+                  package_outputs(); raise SystemExit(0)
+              galdiff_path, galdiff_candidates = find_local_diffuse_file("gll_iem_v07.fits")
+              isodiff_path, isodiff_candidates = find_local_diffuse_file("iso_P8R3_SOURCE_V3_v1.txt")
+              diffuse_status = {"galdiff_found": bool(galdiff_path), "galdiff_path": str(galdiff_path) if galdiff_path else "", "galdiff_candidates": galdiff_candidates, "isodiff_found": bool(isodiff_path), "isodiff_path": str(isodiff_path) if isodiff_path else "", "isodiff_candidates": isodiff_candidates}
+              write_json("LOCAL_DIFFUSE_DISCOVERY.json", diffuse_status)
+              if not galdiff_path or not isodiff_path:
+                  final_decision("TECHNICAL_STOP_LOCAL_DIFFUSE_MODELS_NOT_FOUND_NO_SCORE", "INSPECT_FERMITOOLS_REFDATA_OR_MANUAL_UPLOAD_DIFFUSE_MODELS", {"diffuse_status": diffuse_status})
+                  package_outputs(); raise SystemExit(0)
+              validations=[]
+              for label in ["photon_w792", "photon_w664"]:
+                  p=REQUIRED_CACHE_FILES[label]
+                  validations.append({"label": label, "valid_event_file": validate_event_file(p), "path": str(p)})
+              write_csv("VALIDATIONS.csv", validations, ["label", "valid_event_file", "path"])
+              if not all(v["valid_event_file"] for v in validations):
+                  final_decision("TECHNICAL_STOP_N2B_R11_PHOTON_CACHE_VALIDATION_FAILED_NO_SCORE", "RERUN_R10_DOWNLOAD_CACHE_BUILDER", {"validations": validations})
+                  package_outputs(); raise SystemExit(0)
+              files_by_week={792: (REQUIRED_CACHE_FILES["photon_w792"], REQUIRED_CACHE_FILES["spacecraft_w792"]), 664: (REQUIRED_CACHE_FILES["photon_w664"], REQUIRED_CACHE_FILES["spacecraft_w664"])}
+              catalog=REQUIRED_CACHE_FILES["catalog_gll_psc_v35"]
+              result_rows=[]; total_runs=len(REGIONS)*len(TARGETS); k=0
+              for region in REGIONS:
+                  for target in TARGETS:
+                      k += 1; w=int(target["week"])
+                      photon, spacecraft = files_by_week[w]
+                      label=safe_name(f"{region[0]}_{target['direction']}_w{w}")
+                      log(f"Running Fermipy analysis {k}/{total_runs}: {label}")
+                      res=run_fermipy_one(label, region, target, photon, spacecraft, galdiff_path, isodiff_path, catalog)
+                      result_rows.append(res)
+                      (OUT / f"{label}_result.json").write_text(json.dumps(res, indent=2, ensure_ascii=False), encoding="utf-8")
+                      log(f"Finished {label}: setup={res.get('setup_ok')} opt={res.get('optimize_ok')} fit={res.get('fit_ok')} npred={res.get('npred')} residual={res.get('model_residual_nobs_minus_npred')}")
+              result_cols=["label", "region_id", "region_role", "direction", "sample_point", "week", "ra", "dec", "tmin", "tmax", "ok", "setup_ok", "optimize_ok", "fit_ok", "nobs", "nobs_method", "npred", "npred_method", "model_residual_nobs_minus_npred", "loglike", "fit_quality", "fit_status", "source_names_count", "npred_errors_tail", "error", "fit_error", "optimize_error", "residual_error"]
+              write_csv("OFFICIAL_FERMIPY_N2B_R11_RESULTS.csv", result_rows, result_cols)
+              by={(r.get("region_id"), r.get("direction")): r for r in result_rows}
+              comp_rows=[]
+              for rid, role, ra, dec in REGIONS:
+                  post=by.get((rid, "post"), {}); pre=by.get((rid, "pre"), {})
+                  for metric in ["model_residual_nobs_minus_npred", "loglike", "nobs", "npred"]:
+                      pv=post.get(metric, ""); rv=pre.get(metric, ""); diff=""; ratio=""
+                      try:
+                          if pv != "" and rv != "":
+                              diff=float(pv)-float(rv); ratio=float(pv)/float(rv) if float(rv) != 0 else ""
+                      except Exception: pass
+                      comp_rows.append({"metric": metric, "region_id": rid, "region_role": role, "post_value": pv, "pre_value": rv, "post_minus_pre": diff, "post_over_pre": ratio})
+              write_csv("OFFICIAL_FERMIPY_N2B_R11_POST_PRE_COMPARISON.csv", comp_rows, ["metric", "region_id", "region_role", "post_value", "pre_value", "post_minus_pre", "post_over_pre"])
+              residual_rows=[r for r in comp_rows if r["metric"] == "model_residual_nobs_minus_npred"]
+              target=[r for r in residual_rows if r["region_id"] == "R9C_CYGX1"]
+              controls=[r for r in residual_rows if r["region_role"] == "no_gate_sky_control"]
+              target_diff=target[0].get("post_minus_pre", "") if target else ""
+              control_vals=[]; control_table=[]
+              for r in controls:
+                  v=r.get("post_minus_pre", ""); okv=False
+                  try:
+                      if v != "": control_vals.append(float(v)); okv=True
+                  except Exception: pass
+                  control_table.append({"region_id": r["region_id"], "post_minus_pre_model_residual": v, "valid": okv})
+              rank_rows=[]
+              for r in residual_rows:
+                  v=r.get("post_minus_pre", "")
+                  try: vf=float(v)
+                  except Exception: vf=None
+                  rank_rows.append({"region_id": r["region_id"], "region_role": r["region_role"], "post_minus_pre_model_residual": v, "numeric_value": vf})
+              rank_rows_valid=sorted([r for r in rank_rows if r["numeric_value"] is not None], key=lambda x: x["numeric_value"], reverse=True)
+              for i, r in enumerate(rank_rows_valid, start=1): r["rank_descending"] = i
+              write_csv("OFFICIAL_FERMIPY_N2B_R11_RESIDUAL_RANKING.csv", rank_rows_valid, ["rank_descending", "region_id", "region_role", "post_minus_pre_model_residual", "numeric_value"])
+              usable = target_diff != "" and len(control_vals) == 9 and len(result_rows) == total_runs
+              if usable:
+                  target_float=float(target_diff); control_max=max(control_vals); control_mean=sum(control_vals)/len(control_vals)
+                  cs=sorted(control_vals); n=len(cs); control_median=cs[n//2] if n % 2 else 0.5*(cs[n//2-1]+cs[n//2])
+                  controls_ge_target=sum(1 for v in control_vals if v >= target_float); target_exceeds_all=target_float > control_max
+                  target_rank=next((r["rank_descending"] for r in rank_rows_valid if r["region_id"] == "R9C_CYGX1"), "")
+              else:
+                  control_max=""; control_mean=""; control_median=""; controls_ge_target=""; target_exceeds_all=False; target_rank=""
+              summary={"stage": STAGE, "lag_label": CFG["lag_label"], "post_week": CFG["post_week"], "pre_week": CFG["pre_week"], "result_rows": len(result_rows), "expected_result_rows": total_runs, "all_setup_ok": all(bool(r.get("setup_ok")) for r in result_rows), "all_fit_or_optimize_ok": all(bool(r.get("fit_ok") or r.get("optimize_ok")) for r in result_rows), "all_npred_extracted": all(r.get("npred", "") != "" for r in result_rows), "usable_model_residual_comparison": usable, "primary_metric": "model_residual_nobs_minus_npred", "r9c_model_residual_post_minus_pre": target_diff, "no_gate_control_n_valid": len(control_vals), "no_gate_control_mean": control_mean, "no_gate_control_median": control_median, "no_gate_control_max": control_max, "controls_ge_r9c": controls_ge_target, "r9c_exceeds_all_no_gate_controls": target_exceeds_all, "r9c_rank_descending": target_rank, "control_table": control_table, "cache_manifest": cache_rows, "diffuse_status": diffuse_status, "claim_ceiling": CFG["claim_ceiling"], "interpretation_note": "N2B R11 LAG450D analysis from R10 cache. Diagnostic only; no proof/discovery."}
+              write_json("SUMMARY.json", summary)
+              if not usable:
+                  final_decision("TECHNICAL_STOP_N2B_R11_MODEL_RESIDUAL_COMPARISON_INCOMPLETE_NO_SCORE", "INSPECT_N2B_R11_LOGS_OR_REPAIR_FAILED_ROWS", {"summary": summary})
+              elif target_exceeds_all:
+                  final_decision("OFFICIAL_FERMIPY_N2B_R11_LAG450D_R9C_RESIDUAL_EXCEEDS_ALL_NO_GATE_CONTROLS_NO_SCORE", "ACIRM_R13M_N2B_NEXT_BATCH_OR_N2C_SYNTHESIS_AFTER_ALL_BATCHES", {"summary": summary})
+              else:
+                  final_decision("OFFICIAL_FERMIPY_N2B_R11_LAG450D_R9C_RESIDUAL_NOT_ABOVE_ALL_NO_GATE_CONTROLS_NO_SCORE", "ACIRM_R13M_N2C_MULTI_LAG_ADJUDICATION_OR_CONTINUE_BATCHES", {"summary": summary})
+              package_outputs()
+          except SystemExit:
+              raise
+          except Exception:
+              (OUT / "EXCEPTION_TRACEBACK.txt").write_text(traceback.format_exc(), encoding="utf-8")
+              final_decision("TECHNICAL_STOP_EXCEPTION_DURING_N2B_R11_WORKER_NO_SCORE", "REPAIR_FROM_TRACEBACK", {"error": traceback.format_exc()[-2000:]})
+              package_outputs()
+          try:
+              for p in ANALYSIS.rglob("*"):
+                  if p.is_file() and p.suffix.lower() in [".fits", ".fit", ".fz", ".gz", ".npy", ".npz"]:
+                      p.unlink()
+          except Exception: pass
+          PY
+
+      - name: Verify embedded ACIRM R11 worker file
+        shell: bash
+        run: |
+          set -euo pipefail
+          WORK="${{ github.workspace }}"
+          python -m py_compile "$WORK/acirm_r13m_n2b_r11_worker.py"
+          if grep -n '"ltcube"' "$WORK/acirm_r13m_n2b_r11_worker.py"; then
+            echo "ERROR: forbidden explicit ltcube config literal found."
+            exit 12
+          fi
+          grep -n "NOGATE_RA030" "$WORK/acirm_r13m_n2b_r11_worker.py" | head -1
+          grep -n "792" "$WORK/acirm_r13m_n2b_r11_worker.py" | head -3
+          wc -c "$WORK/acirm_r13m_n2b_r11_worker.py"
+          ls -lh "$WORK/acirm_r13m_n2b_r11_worker.py"
+
+      - name: Run ACIRM R13M N2B R11 LAG450D analysis from R10 cache
+        shell: bash
+        run: |
+          set -euo pipefail
+          WORK="${{ github.workspace }}"
+          export MAMBA_ROOT_PREFIX="$WORK/.micromamba"
+          MM="$WORK/.micromamba/bin/micromamba"
+          ENV="$WORK/acirm_fermipy_env"
+          "$MM" run -p "$ENV" python "$WORK/acirm_r13m_n2b_r11_worker.py"
+
+      - name: Ensure result ZIP exists after any technical stop
+        if: always()
+        shell: bash
+        run: |
+          set +e
+          STAGE=ACIRM_R13M_N2B_R11_LAG450D_ANALYSIS_FROM_CACHE_NO_SCORE
+          OUT=${STAGE}_OUTPUT
+          ZIP=${STAGE}_RESULTS.zip
+          if [ -d "$OUT" ] && [ ! -f "$ZIP" ]; then
+            python -c "import pathlib,shutil,hashlib; stage='ACIRM_R13M_N2B_R11_LAG450D_ANALYSIS_FROM_CACHE_NO_SCORE'; out=pathlib.Path(stage+'_OUTPUT'); z=pathlib.Path(stage+'_RESULTS.zip'); z.unlink() if z.exists() else None; shutil.make_archive(str(z).replace('.zip',''),'zip',root_dir='.',base_dir=str(out)); sha=hashlib.sha256(z.read_bytes()).hexdigest(); pathlib.Path(str(z)+'.sha256.txt').write_text(f'{sha}  {z.name}\n',encoding='utf-8'); print('ZIP',z,'SHA256',sha)"
+          fi
+
+      - name: Show final decision if available
+        if: always()
+        shell: bash
+        run: |
+          set +e
+          cat ACIRM_R13M_N2B_R11_LAG450D_ANALYSIS_FROM_CACHE_NO_SCORE_OUTPUT/FINAL_DECISION.json || true
+          echo ""
+          tail -n 160 ACIRM_R13M_N2B_R11_LAG450D_ANALYSIS_FROM_CACHE_NO_SCORE_OUTPUT/PROGRESS.log || true
+
+      - name: Upload ACIRM R11 result artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ACIRM_R13M_N2B_R11_LAG450D_ANALYSIS_FROM_CACHE_RESULTS
+          path: |
+            ACIRM_R13M_N2B_R11_LAG450D_ANALYSIS_FROM_CACHE_NO_SCORE_RESULTS.zip
+            ACIRM_R13M_N2B_R11_LAG450D_ANALYSIS_FROM_CACHE_NO_SCORE_RESULTS.zip.sha256.txt
+            ACIRM_R13M_N2B_R11_LAG450D_ANALYSIS_FROM_CACHE_NO_SCORE_OUTPUT/**
+          retention-days: 14
