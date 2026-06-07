@@ -1,0 +1,443 @@
+name: ACIRM R13M N2J R1 Split Photon Download Then Event Localization
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  download-photon-w821:
+    runs-on: ubuntu-latest
+    timeout-minutes: 95
+    steps:
+      - name: Install download tools
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq aria2 curl zip
+
+      - name: Download and verify photon_w821 only
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import csv, json, hashlib, subprocess, time
+          from pathlib import Path
+          STAGE='ACIRM_R13M_N2J_R1_PHOTON_W821_DOWNLOAD'
+          OUT=Path(STAGE+'_OUTPUT'); OUT.mkdir(exist_ok=True)
+          D=Path('photon_w821'); D.mkdir(exist_ok=True)
+          url='https://heasarc.gsfc.nasa.gov/FTP/fermi/data/lat/weekly/photon/lat_photon_weekly_w821_p305_v001.fits'
+          dest=D/'lat_photon_weekly_w821_p305_v001.fits'
+          def fits_ok(p):
+              try:
+                  return p.exists() and p.stat().st_size > 1024 and open(p,'rb').read(6)==b'SIMPLE'
+              except Exception:
+                  return False
+          def sha256_file(p):
+              h=hashlib.sha256()
+              with open(p,'rb') as f:
+                  for b in iter(lambda:f.read(1024*1024), b''):
+                      h.update(b)
+              return h.hexdigest()
+          def run(cmd, timeout):
+              return subprocess.run(cmd, text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=timeout)
+          attempts=[]
+          if not fits_ok(dest):
+              cmd=['aria2c','-x','8','-s','8','-c','--timeout=180','--connect-timeout=90','--max-tries=8','--retry-wait=20','--lowest-speed-limit=1K','-d',str(D),'-o',dest.name,url]
+              p=run(cmd, 5400)
+              (OUT/'aria2.log').write_text((p.stdout or '')[-20000:], encoding='utf-8', errors='replace')
+              attempts.append({'method':'aria2c','returncode':p.returncode,'fits_ok_after':fits_ok(dest)})
+          if not fits_ok(dest):
+              cmd=['curl','-L','--fail','--connect-timeout','90','--max-time','5400','--retry','6','--retry-delay','20','--speed-time','180','--speed-limit','1024','-C','-','-o',str(dest),url]
+              p=run(cmd, 5600)
+              (OUT/'curl.log').write_text((p.stdout or '')[-20000:], encoding='utf-8', errors='replace')
+              attempts.append({'method':'curl','returncode':p.returncode,'fits_ok_after':fits_ok(dest)})
+          status={
+              'stage':STAGE,
+              'label':'photon_w821',
+              'url':url,
+              'path':str(dest),
+              'exists':dest.exists(),
+              'size_bytes':dest.stat().st_size if dest.exists() else 0,
+              'fits_magic_ok':fits_ok(dest),
+              'sha256':sha256_file(dest) if fits_ok(dest) else '',
+              'attempts':attempts,
+              'scientific_result':False,
+              'claim_ceiling':'NO_SCORE_NOT_PROOF_NOT_DISCOVERY'
+          }
+          status['decision']='PHOTON_W821_READY_NO_SCORE' if status['fits_magic_ok'] else 'TECHNICAL_STOP_PHOTON_W821_DOWNLOAD_FAILED_NO_SCORE'
+          (OUT/'DOWNLOAD_STATUS.json').write_text(json.dumps(status,indent=2,sort_keys=True), encoding='utf-8')
+          with (OUT/'DOWNLOAD_STATUS.csv').open('w', newline='', encoding='utf-8') as f:
+              w=csv.DictWriter(f, fieldnames=['label','exists','size_bytes','fits_magic_ok','sha256','decision'])
+              w.writeheader(); w.writerow({k:status.get(k,'') for k in w.fieldnames})
+          print(json.dumps(status, indent=2))
+          PY
+
+      - name: Upload photon_w821 artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ACIRM_R13M_N2J_R1_PHOTON_W821_DOWNLOAD_REPORT
+          path: |
+            photon_w821/**
+            ACIRM_R13M_N2J_R1_PHOTON_W821_DOWNLOAD_OUTPUT/**
+          retention-days: 7
+
+  download-photon-w635:
+    runs-on: ubuntu-latest
+    timeout-minutes: 110
+    steps:
+      - name: Install download tools
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq aria2 curl zip
+
+      - name: Download and verify photon_w635 only
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import csv, json, hashlib, subprocess
+          from pathlib import Path
+          STAGE='ACIRM_R13M_N2J_R1_PHOTON_W635_DOWNLOAD'
+          OUT=Path(STAGE+'_OUTPUT'); OUT.mkdir(exist_ok=True)
+          D=Path('photon_w635'); D.mkdir(exist_ok=True)
+          url='https://heasarc.gsfc.nasa.gov/FTP/fermi/data/lat/weekly/photon/lat_photon_weekly_w635_p305_v001.fits'
+          dest=D/'lat_photon_weekly_w635_p305_v001.fits'
+          def fits_ok(p):
+              try:
+                  return p.exists() and p.stat().st_size > 1024 and open(p,'rb').read(6)==b'SIMPLE'
+              except Exception:
+                  return False
+          def sha256_file(p):
+              h=hashlib.sha256()
+              with open(p,'rb') as f:
+                  for b in iter(lambda:f.read(1024*1024), b''):
+                      h.update(b)
+              return h.hexdigest()
+          def run(cmd, timeout):
+              return subprocess.run(cmd, text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=timeout)
+          attempts=[]
+          if not fits_ok(dest):
+              cmd=['aria2c','-x','8','-s','8','-c','--timeout=180','--connect-timeout=90','--max-tries=8','--retry-wait=20','--lowest-speed-limit=1K','-d',str(D),'-o',dest.name,url]
+              p=run(cmd, 6000)
+              (OUT/'aria2.log').write_text((p.stdout or '')[-20000:], encoding='utf-8', errors='replace')
+              attempts.append({'method':'aria2c','returncode':p.returncode,'fits_ok_after':fits_ok(dest)})
+          if not fits_ok(dest):
+              cmd=['curl','-L','--fail','--connect-timeout','90','--max-time','6000','--retry','6','--retry-delay','20','--speed-time','180','--speed-limit','1024','-C','-','-o',str(dest),url]
+              p=run(cmd, 6200)
+              (OUT/'curl.log').write_text((p.stdout or '')[-20000:], encoding='utf-8', errors='replace')
+              attempts.append({'method':'curl','returncode':p.returncode,'fits_ok_after':fits_ok(dest)})
+          status={
+              'stage':STAGE,
+              'label':'photon_w635',
+              'url':url,
+              'path':str(dest),
+              'exists':dest.exists(),
+              'size_bytes':dest.stat().st_size if dest.exists() else 0,
+              'fits_magic_ok':fits_ok(dest),
+              'sha256':sha256_file(dest) if fits_ok(dest) else '',
+              'attempts':attempts,
+              'scientific_result':False,
+              'claim_ceiling':'NO_SCORE_NOT_PROOF_NOT_DISCOVERY'
+          }
+          status['decision']='PHOTON_W635_READY_NO_SCORE' if status['fits_magic_ok'] else 'TECHNICAL_STOP_PHOTON_W635_DOWNLOAD_FAILED_NO_SCORE'
+          (OUT/'DOWNLOAD_STATUS.json').write_text(json.dumps(status,indent=2,sort_keys=True), encoding='utf-8')
+          with (OUT/'DOWNLOAD_STATUS.csv').open('w', newline='', encoding='utf-8') as f:
+              w=csv.DictWriter(f, fieldnames=['label','exists','size_bytes','fits_magic_ok','sha256','decision'])
+              w.writeheader(); w.writerow({k:status.get(k,'') for k in w.fieldnames})
+          print(json.dumps(status, indent=2))
+          PY
+
+      - name: Upload photon_w635 artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ACIRM_R13M_N2J_R1_PHOTON_W635_DOWNLOAD_REPORT
+          path: |
+            photon_w635/**
+            ACIRM_R13M_N2J_R1_PHOTON_W635_DOWNLOAD_OUTPUT/**
+          retention-days: 7
+
+  event-localization:
+    needs: [download-photon-w821, download-photon-w635]
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Download photon artifacts from this workflow
+        uses: actions/download-artifact@v4
+        with:
+          pattern: ACIRM_R13M_N2J_R1_PHOTON_W*_DOWNLOAD_REPORT
+          path: photon_inputs
+          merge-multiple: false
+
+      - name: Install Python dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m pip install --upgrade pip -q
+          python -m pip install -q numpy astropy
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq zip
+
+      - name: Run high-energy 30-100 GeV event localization
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat > n2j_r1_event_localization.py <<'PY'
+          import csv, json, math, shutil, hashlib, traceback, time
+          from pathlib import Path
+          import numpy as np
+          from astropy.io import fits
+
+          STAGE='ACIRM_R13M_N2J_R1_SPLIT_PHOTON_DOWNLOAD_THEN_EVENT_LOCALIZATION_NO_SCORE'
+          OUT=Path(STAGE+'_OUTPUT'); OUT.mkdir(exist_ok=True)
+          CLAIM='NO_SCORE_NOT_PROOF_NOT_DISCOVERY'
+          R9C_RA=299.590315
+          R9C_DEC=35.201606
+          EMIN=30000.0
+          EMAX=100000.0
+          RING_LO=2.0
+          RING_HI=5.0
+          PROGRESS=OUT/'PROGRESS.log'
+
+          LOCKED_SOURCES=[
+            {'source_id':'R9C_CENTER','assoc':'R9C/Cyg X-1 nominal center','ra':R9C_RA,'dec':R9C_DEC,'dist_from_r9c_deg':0.0,'role':'r9c_center'},
+            {'source_id':'4FGL J1958.5+3512','assoc':'Cyg X-1','ra':299.6339,'dec':35.2046,'dist_from_r9c_deg':0.035956,'role':'nearest_catalog_source'},
+            {'source_id':'4FGL J1950.6+3456','assoc':'2MASS J19502776+3456224','ra':297.660,'dec':34.939,'dist_from_r9c_deg':1.597349,'role':'nearby_catalog_source'},
+            {'source_id':'4FGL J2004.9+3421','assoc':'','ra':301.236,'dec':34.360,'dist_from_r9c_deg':1.605916,'role':'nearby_catalog_source'},
+            {'source_id':'4FGL J2004.3+3339','assoc':'B2 2002+33','ra':301.081,'dec':33.655,'dist_from_r9c_deg':1.983161,'role':'nearby_catalog_source'},
+            {'source_id':'4FGL J2005.8+3357','assoc':'','ra':301.459,'dec':33.963,'dist_from_r9c_deg':1.989057,'role':'nearby_catalog_source'},
+            {'source_id':'4FGL J1948.9+3414','assoc':'','ra':297.2261962890625,'dec':34.239601135253906,'dist_from_r9c_deg':2.1681655108615416,'role':'locked_2_5_ring_source'},
+            {'source_id':'4FGL J2009.9+3544','assoc':'B2 2008+35','ra':302.4891967773437,'dec':35.74599838256836,'dist_from_r9c_deg':2.422644339422418,'role':'locked_2_5_ring_source'},
+            {'source_id':'4FGL J1954.4+3252e','assoc':'CTB 80','ra':298.6000061035156,'dec':32.869998931884766,'dist_from_r9c_deg':2.471769439602049,'role':'locked_2_5_ring_source'},
+            {'source_id':'4FGL J2002.3+3246','assoc':'SNR G069.7+01.0','ra':300.5997009277344,'dec':32.77880096435547,'dist_from_r9c_deg':2.5632321685955604,'role':'locked_2_5_ring_source'},
+            {'source_id':'4FGL J1952.9+3252','assoc':'PSR J1952+3252','ra':298.247314453125,'dec':32.882999420166016,'dist_from_r9c_deg':2.571757782717301,'role':'locked_2_5_ring_source'},
+            {'source_id':'4FGL J2013.5+3613','assoc':'SNR G073.9+00.9','ra':303.3844909667969,'dec':36.225399017333984,'dist_from_r9c_deg':3.246048161207813,'role':'top4_cluster_candidate'},
+            {'source_id':'4FGL J1959.0+3844','assoc':'LQAC 299+038','ra':299.76629638671875,'dec':38.73680114746094,'dist_from_r9c_deg':3.537987659798902,'role':'locked_2_5_ring_source'},
+            {'source_id':'4FGL J1950.2+3822','assoc':'RX J1950.0+3821','ra':297.56939697265625,'dec':38.371700286865234,'dist_from_r9c_deg':3.559091895403688,'role':'locked_2_5_ring_source'},
+            {'source_id':'4FGL J1953.5+3841','assoc':'','ra':298.3848876953125,'dec':38.6880989074707,'dist_from_r9c_deg':3.6170398911174417,'role':'locked_2_5_ring_source'},
+            {'source_id':'4FGL J2017.3+3525','assoc':'','ra':304.3492126464844,'dec':35.42259979248047,'dist_from_r9c_deg':3.889238843639835,'role':'locked_2_5_ring_source'},
+            {'source_id':'4FGL J2015.5+3710','assoc':'MG2 J201534+3710','ra':303.89239501953125,'dec':37.17599868774414,'dist_from_r9c_deg':3.993576217978025,'role':'top4_cluster_candidate'},
+            {'source_id':'4FGL J2016.2+3712','assoc':'VER J2016+372','ra':304.056884765625,'dec':37.21310043334961,'dist_from_r9c_deg':4.126644299917183,'role':'top4_cluster_candidate'},
+            {'source_id':'4FGL J2017.9+3625','assoc':'PSR J2017+3625','ra':304.49090576171875,'dec':36.42770004272461,'dist_from_r9c_deg':4.158222141614726,'role':'top4_cluster_candidate'},
+            {'source_id':'4FGL J2006.2+3102','assoc':'PSR J2006+3102','ra':301.56610107421875,'dec':31.04459953308105,'dist_from_r9c_deg':4.473921852177352,'role':'locked_2_5_ring_source'},
+            {'source_id':'4FGL J1935.4+3547','assoc':'','ra':293.8646850585937,'dec':35.796199798583984,'dist_from_r9c_deg':4.69845561778258,'role':'locked_2_5_ring_source'},
+            {'source_id':'4FGL J2021.9+3609','assoc':'','ra':305.4862976074219,'dec':36.15769958496094,'dist_from_r9c_deg':4.882909314033249,'role':'locked_2_5_ring_source'},
+            {'source_id':'4FGL J2021.1+3651','assoc':'PSR J2021+3651','ra':305.27960205078125,'dec':36.85609817504883,'dist_from_r9c_deg':4.888469684256179,'role':'locked_2_5_ring_source'},
+          ]
+          TOP4_IDS={'4FGL J2015.5+3710','4FGL J2016.2+3712','4FGL J2017.9+3625','4FGL J2013.5+3613'}
+
+          def log(msg):
+              s=f'[{time.strftime("%Y-%m-%d %H:%M:%S")}] {msg}'
+              print(s, flush=True)
+              with PROGRESS.open('a', encoding='utf-8') as f: f.write(s+'\n')
+          def write_json(name,obj): (OUT/name).write_text(json.dumps(obj, indent=2, sort_keys=True), encoding='utf-8')
+          def write_csv(name, rows, fields):
+              with (OUT/name).open('w', newline='', encoding='utf-8') as f:
+                  w=csv.DictWriter(f, fieldnames=fields); w.writeheader()
+                  for r in rows: w.writerow({k:r.get(k,'') for k in fields})
+          def sha256_file(p):
+              h=hashlib.sha256()
+              with open(p,'rb') as f:
+                  for b in iter(lambda:f.read(1024*1024), b''):
+                      h.update(b)
+              return h.hexdigest()
+          def fits_ok(p):
+              try: return p.exists() and p.stat().st_size>1024 and open(p,'rb').read(6)==b'SIMPLE'
+              except Exception: return False
+          def angsep_deg(ra1, dec1, ra2, dec2):
+              ra1=np.deg2rad(ra1); dec1=np.deg2rad(dec1); ra2=np.deg2rad(ra2); dec2=np.deg2rad(dec2)
+              c=np.sin(dec1)*np.sin(dec2)+np.cos(dec1)*np.cos(dec2)*np.cos(ra1-ra2)
+              return np.rad2deg(np.arccos(np.clip(c,-1,1)))
+          def locate_file(filename):
+              hits=[p for p in Path('photon_inputs').rglob(filename) if fits_ok(p)]
+              return sorted(hits, key=lambda p: len(str(p)))[0] if hits else None
+
+          def load_selected_events(path, phase, week):
+              with fits.open(path, memmap=True) as hdul:
+                  d=hdul['EVENTS'].data
+                  ra=np.asarray(d['RA'], dtype=float)
+                  dec=np.asarray(d['DEC'], dtype=float)
+                  e=np.asarray(d['ENERGY'], dtype=float)
+                  t=np.asarray(d['TIME'], dtype=float)
+                  dist=angsep_deg(ra, dec, R9C_RA, R9C_DEC)
+                  good=np.isfinite(ra)&np.isfinite(dec)&np.isfinite(e)&np.isfinite(t)&(e>=EMIN)&(e<EMAX)
+                  sel=good&(dist>=RING_LO)&(dist<RING_HI)
+                  idx=np.nonzero(sel)[0]
+                  t0=float(np.nanmin(t)) if np.isfinite(t).any() else None
+                  rows=[]
+                  for j,i in enumerate(idx):
+                      evra=float(ra[i]); evdec=float(dec[i]); energy=float(e[i]); met=float(t[i]); dr=float(dist[i])
+                      nearest=None; nd=999.0
+                      for s in LOCKED_SOURCES:
+                          ds=float(angsep_deg(evra, evdec, s['ra'], s['dec']))
+                          if ds < nd:
+                              nd=ds; nearest=s
+                      rows.append({
+                          'phase':phase, 'week':week, 'event_order_in_selection':j+1, 'source_file_row_index':int(i),
+                          'time_met':met, 'time_day_offset_from_file_min':(met-t0)/86400.0 if t0 is not None else '',
+                          'energy_mev':energy, 'energy_gev':energy/1000.0, 'ra_deg':evra, 'dec_deg':evdec,
+                          'dist_from_r9c_deg':dr,
+                          'nearest_locked_source_id':nearest['source_id'] if nearest else '',
+                          'nearest_locked_source_assoc':nearest['assoc'] if nearest else '',
+                          'nearest_locked_source_role':nearest['role'] if nearest else '',
+                          'nearest_locked_source_dist_deg':nd if nearest else '',
+                          'within_025_deg_of_nearest': bool(nd<=0.25),
+                          'within_05_deg_of_nearest': bool(nd<=0.5),
+                          'within_10_deg_of_nearest': bool(nd<=1.0),
+                          'nearest_is_top4_cluster_candidate': bool(nearest and nearest['source_id'] in TOP4_IDS),
+                      })
+                  return rows, {
+                      'phase':phase, 'week':week,
+                      'file_total_30_100gev_count':int(good.sum()),
+                      'ring_2_5_30_100gev_count':int(sel.sum()),
+                      'file_time_min_met':float(np.nanmin(t)), 'file_time_max_met':float(np.nanmax(t))
+                  }
+
+          def package():
+              zipname=f'{STAGE}_RESULTS.zip'
+              if Path(zipname).exists(): Path(zipname).unlink()
+              shutil.make_archive(zipname[:-4], 'zip', root_dir='.', base_dir=str(OUT))
+              sha=hashlib.sha256(Path(zipname).read_bytes()).hexdigest()
+              Path(zipname+'.sha256.txt').write_text(f'{sha}  {zipname}\n', encoding='utf-8')
+              log('ZIP '+zipname+' SHA256 '+sha)
+
+          def main():
+              log('START '+STAGE)
+              write_json('LOCKED_CONTEXT.json', {
+                  'stage':STAGE,
+                  'claim_ceiling':CLAIM,
+                  'purpose':'Split-download same-workflow localization of 30-100 GeV events in the 2-5 deg ring at LAG650D. Energy origin remains unconstrained by ACIRM.',
+                  'energy_band_mev':[EMIN, EMAX], 'ring_deg':[RING_LO, RING_HI],
+                  'pre_week':635, 'post_week':821, 'locked_sources_n':len(LOCKED_SOURCES)
+              })
+              paths={
+                  'post': locate_file('lat_photon_weekly_w821_p305_v001.fits'),
+                  'pre': locate_file('lat_photon_weekly_w635_p305_v001.fits'),
+              }
+              manifest=[]
+              for phase, p in paths.items():
+                  manifest.append({
+                      'phase':phase, 'path':str(p) if p else '', 'exists':bool(p and p.exists()),
+                      'size_bytes':p.stat().st_size if p and p.exists() else 0,
+                      'fits_magic_ok':fits_ok(p) if p else False,
+                      'sha256':sha256_file(p) if p and fits_ok(p) else ''
+                  })
+              write_csv('INPUT_PHOTON_MANIFEST.csv', manifest, ['phase','path','exists','size_bytes','fits_magic_ok','sha256'])
+              if not all(paths.values()):
+                  write_json('FINAL_DECISION.json', {
+                      'stage':STAGE, 'decision':'TECHNICAL_STOP_N2J_R1_REQUIRED_SPLIT_PHOTON_ARTIFACTS_MISSING_NO_SCORE',
+                      'technical_stop':True, 'scientific_result':False, 'ready_files':sum(1 for v in paths.values() if v),
+                      'claim_ceiling':CLAIM
+                  })
+                  package(); return
+              event_rows=[]; summaries=[]
+              for phase, week in [('post',821), ('pre',635)]:
+                  rows, summ = load_selected_events(paths[phase], phase, week)
+                  event_rows.extend(rows); summaries.append(summ)
+              write_csv('N2J_R1_30_100_GEV_RING_2_5_EVENTS.csv', event_rows, [
+                  'phase','week','event_order_in_selection','source_file_row_index','time_met','time_day_offset_from_file_min',
+                  'energy_mev','energy_gev','ra_deg','dec_deg','dist_from_r9c_deg','nearest_locked_source_id',
+                  'nearest_locked_source_assoc','nearest_locked_source_role','nearest_locked_source_dist_deg',
+                  'within_025_deg_of_nearest','within_05_deg_of_nearest','within_10_deg_of_nearest',
+                  'nearest_is_top4_cluster_candidate'
+              ])
+              write_csv('N2J_R1_EVENT_FILE_SUMMARY.csv', summaries, ['phase','week','file_total_30_100gev_count','ring_2_5_30_100gev_count','file_time_min_met','file_time_max_met'])
+
+              agg=[]
+              for phase in ['post','pre']:
+                  ev=[r for r in event_rows if r['phase']==phase]
+                  for sid in sorted({r['nearest_locked_source_id'] for r in ev}):
+                      ss=[r for r in ev if r['nearest_locked_source_id']==sid]
+                      if ss:
+                          agg.append({
+                              'phase':phase,'nearest_locked_source_id':sid,'assoc':ss[0]['nearest_locked_source_assoc'],
+                              'role':ss[0]['nearest_locked_source_role'],'event_n':len(ss),
+                              'within_025_n':sum(bool(r['within_025_deg_of_nearest']) for r in ss),
+                              'within_05_n':sum(bool(r['within_05_deg_of_nearest']) for r in ss),
+                              'within_10_n':sum(bool(r['within_10_deg_of_nearest']) for r in ss),
+                              'mean_dist_to_nearest_deg':float(np.mean([float(r['nearest_locked_source_dist_deg']) for r in ss])),
+                              'mean_dist_from_r9c_deg':float(np.mean([float(r['dist_from_r9c_deg']) for r in ss])),
+                              'mean_energy_gev':float(np.mean([float(r['energy_gev']) for r in ss]))
+                          })
+              write_csv('N2J_R1_NEAREST_SOURCE_AGGREGATION.csv', agg, ['phase','nearest_locked_source_id','assoc','role','event_n','within_025_n','within_05_n','within_10_n','mean_dist_to_nearest_deg','mean_dist_from_r9c_deg','mean_energy_gev'])
+
+              time_rows=[]
+              for phase in ['post','pre']:
+                  ev=sorted([r for r in event_rows if r['phase']==phase], key=lambda r: float(r['time_met']))
+                  if ev:
+                      times=np.array([float(r['time_met']) for r in ev])
+                      gaps=np.diff(times)/86400.0 if len(times)>1 else np.array([])
+                      time_rows.append({'phase':phase,'event_n':len(ev),'time_span_days':float((times.max()-times.min())/86400.0) if len(times)>1 else 0.0,'min_gap_days':float(gaps.min()) if gaps.size else '', 'median_gap_days':float(np.median(gaps)) if gaps.size else '', 'max_gap_days':float(gaps.max()) if gaps.size else '', 'first_event_day_offset':ev[0]['time_day_offset_from_file_min'],'last_event_day_offset':ev[-1]['time_day_offset_from_file_min']})
+                  else:
+                      time_rows.append({'phase':phase,'event_n':0,'time_span_days':'','min_gap_days':'','median_gap_days':'','max_gap_days':'','first_event_day_offset':'','last_event_day_offset':''})
+              write_csv('N2J_R1_EVENT_TIME_CLUSTERING.csv', time_rows, ['phase','event_n','time_span_days','min_gap_days','median_gap_days','max_gap_days','first_event_day_offset','last_event_day_offset'])
+
+              post_n=sum(1 for r in event_rows if r['phase']=='post')
+              pre_n=sum(1 for r in event_rows if r['phase']=='pre')
+              post_top4=sum(1 for r in event_rows if r['phase']=='post' and r['nearest_is_top4_cluster_candidate'])
+              post_within_1=sum(1 for r in event_rows if r['phase']=='post' and r['within_10_deg_of_nearest'])
+              post_within_05=sum(1 for r in event_rows if r['phase']=='post' and r['within_05_deg_of_nearest'])
+              if post_n > pre_n and post_n > 0:
+                  if post_top4 == post_n:
+                      decision='N2J_R1_30_100_GEV_EVENTS_LOCALIZE_TO_TOP4_CLUSTER_CANDIDATES_NO_SCORE'
+                  elif post_within_1 == post_n:
+                      decision='N2J_R1_30_100_GEV_EVENTS_NEAR_LOCKED_RING_SOURCES_NOT_R9C_POINT_NO_SCORE'
+                  else:
+                      decision='N2J_R1_30_100_GEV_POST_EVENTS_FIELD_DISTRIBUTED_RING_LOCALIZATION_NO_SCORE'
+              else:
+                  decision='N2J_R1_NO_POST_EXCESS_30_100_GEV_RING_EVENTS_NO_SCORE'
+              summary={
+                  'stage':STAGE, 'decision':decision, 'technical_stop':False, 'scientific_result':True,
+                  'claim_ceiling':CLAIM,
+                  'post_ring_2_5_30_100_event_n':post_n,
+                  'pre_ring_2_5_30_100_event_n':pre_n,
+                  'post_minus_pre_event_n':post_n-pre_n,
+                  'post_events_nearest_top4_n':post_top4,
+                  'post_events_within_1deg_of_locked_source_n':post_within_1,
+                  'post_events_within_0p5deg_of_locked_source_n':post_within_05,
+                  'interpretation':'Small-number high-energy event localization guardrail. Energy origin remains unconstrained by ACIRM; this tests where 30-100 GeV photons appear under the 650d resonance window.'
+              }
+              write_json('SUMMARY.json', summary)
+              write_json('FINAL_DECISION.json', summary)
+              package()
+
+          if __name__ == '__main__':
+              try:
+                  main()
+              except Exception:
+                  (OUT/'EXCEPTION_TRACEBACK.txt').write_text(traceback.format_exc(), encoding='utf-8')
+                  write_json('FINAL_DECISION.json', {'stage':STAGE,'decision':'TECHNICAL_STOP_N2J_R1_EXCEPTION_NO_SCORE','technical_stop':True,'scientific_result':False,'error':traceback.format_exc()[-2000:],'claim_ceiling':CLAIM})
+                  package()
+          PY
+          python -m py_compile n2j_r1_event_localization.py
+          python n2j_r1_event_localization.py
+
+      - name: Show final decision
+        if: always()
+        shell: bash
+        run: |
+          set +e
+          cat ACIRM_R13M_N2J_R1_SPLIT_PHOTON_DOWNLOAD_THEN_EVENT_LOCALIZATION_NO_SCORE_OUTPUT/FINAL_DECISION.json || true
+          echo ""
+          tail -n 120 ACIRM_R13M_N2J_R1_SPLIT_PHOTON_DOWNLOAD_THEN_EVENT_LOCALIZATION_NO_SCORE_OUTPUT/PROGRESS.log || true
+
+      - name: Upload final N2J R1 artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ACIRM_R13M_N2J_R1_SPLIT_PHOTON_DOWNLOAD_THEN_EVENT_LOCALIZATION_RESULTS
+          path: |
+            ACIRM_R13M_N2J_R1_SPLIT_PHOTON_DOWNLOAD_THEN_EVENT_LOCALIZATION_NO_SCORE_RESULTS.zip
+            ACIRM_R13M_N2J_R1_SPLIT_PHOTON_DOWNLOAD_THEN_EVENT_LOCALIZATION_NO_SCORE_RESULTS.zip.sha256.txt
+            ACIRM_R13M_N2J_R1_SPLIT_PHOTON_DOWNLOAD_THEN_EVENT_LOCALIZATION_NO_SCORE_OUTPUT/**
+          retention-days: 14
