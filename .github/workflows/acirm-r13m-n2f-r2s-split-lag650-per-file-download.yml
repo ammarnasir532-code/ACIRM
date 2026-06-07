@@ -1,0 +1,342 @@
+name: ACIRM R13M N2F R2S Split LAG650D Per File Download
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  split-download:
+    name: Download ${{ matrix.target_label }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    continue-on-error: true
+    strategy:
+      fail-fast: false
+      matrix:
+        target_label:
+          - photon_w821
+          - spacecraft_w821
+          - photon_w635
+          - spacecraft_w635
+          - catalog_gll_psc_v35
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Restore per-file LAT cache
+        id: cache-lat-file
+        uses: actions/cache@v4
+        with:
+          path: .acirm_lat_cache_n2f_lag650d_split/${{ matrix.target_label }}
+          key: acirm-r13m-n2f-lag650d-split-${{ matrix.target_label }}-v1
+
+      - name: Install lightweight download tools
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq aria2 curl wget zip unzip
+
+      - name: Download and validate one required LAG650D file
+        shell: bash
+        env:
+          TARGET_LABEL: ${{ matrix.target_label }}
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import csv, json, hashlib, shutil, subprocess, sys, time, traceback
+          from pathlib import Path
+          from datetime import datetime, timezone
+
+          STAGE = "ACIRM_R13M_N2F_R2S_SPLIT_LAG650D_PER_FILE_DOWNLOAD_NO_SCORE"
+          LABEL = __import__('os').environ.get('TARGET_LABEL', '').strip()
+          OUT = Path(f"{STAGE}_{LABEL}_OUTPUT")
+          OUT.mkdir(parents=True, exist_ok=True)
+          BASE_CACHE = Path('.acirm_lat_cache_n2f_lag650d_split')
+          CACHE = BASE_CACHE / LABEL
+          CACHE.mkdir(parents=True, exist_ok=True)
+          PROGRESS = OUT / 'PROGRESS.log'
+
+          TARGETS = {
+              'photon_w821': {
+                  'filename': 'lat_photon_weekly_w821_p305_v001.fits',
+                  'urls': ['https://heasarc.gsfc.nasa.gov/FTP/fermi/data/lat/weekly/photon/lat_photon_weekly_w821_p305_v001.fits'],
+                  'min_bytes': 100_000_000,
+              },
+              'spacecraft_w821': {
+                  'filename': 'lat_spacecraft_weekly_w821_p310_v001.fits',
+                  'urls': ['https://heasarc.gsfc.nasa.gov/FTP/fermi/data/lat/weekly/spacecraft/lat_spacecraft_weekly_w821_p310_v001.fits'],
+                  'min_bytes': 1_000_000,
+              },
+              'photon_w635': {
+                  'filename': 'lat_photon_weekly_w635_p305_v001.fits',
+                  'urls': ['https://heasarc.gsfc.nasa.gov/FTP/fermi/data/lat/weekly/photon/lat_photon_weekly_w635_p305_v001.fits'],
+                  'min_bytes': 100_000_000,
+              },
+              'spacecraft_w635': {
+                  'filename': 'lat_spacecraft_weekly_w635_p310_v001.fits',
+                  'urls': ['https://heasarc.gsfc.nasa.gov/FTP/fermi/data/lat/weekly/spacecraft/lat_spacecraft_weekly_w635_p310_v001.fits'],
+                  'min_bytes': 1_000_000,
+              },
+              'catalog_gll_psc_v35': {
+                  'filename': 'gll_psc_v35.fit',
+                  'urls': [
+                      'https://fermi.gsfc.nasa.gov/ssc/data/access/lat/14yr_catalog/gll_psc_v35.fit',
+                      'https://heasarc.gsfc.nasa.gov/FTP/fermi/data/lat/catalogs/4FGL/gll_psc_v35.fit',
+                  ],
+                  'min_bytes': 1_000_000,
+              },
+          }
+
+          def log(msg):
+              s = f"[{datetime.now(timezone.utc).isoformat()}] {msg}"
+              print(s, flush=True)
+              with PROGRESS.open('a', encoding='utf-8') as f:
+                  f.write(s + '\n')
+
+          def write_json(name, obj):
+              (OUT / name).write_text(json.dumps(obj, indent=2, sort_keys=True), encoding='utf-8')
+
+          def write_csv(name, rows, fields):
+              with (OUT / name).open('w', newline='', encoding='utf-8') as f:
+                  w = csv.DictWriter(f, fieldnames=fields)
+                  w.writeheader()
+                  for r in rows:
+                      w.writerow({k: r.get(k, '') for k in fields})
+
+          def sha256_file(path):
+              h = hashlib.sha256()
+              with open(path, 'rb') as f:
+                  for chunk in iter(lambda: f.read(1024 * 1024), b''):
+                      h.update(chunk)
+              return h.hexdigest()
+
+          def fits_magic_ok(path):
+              try:
+                  with open(path, 'rb') as f:
+                      head = f.read(80)
+                  return head.startswith(b'SIMPLE  =')
+              except Exception:
+                  return False
+
+          def validate(path, min_bytes):
+              path = Path(path)
+              if not path.exists():
+                  return False, {'exists': False, 'size_bytes': 0, 'fits_magic_ok': False, 'sha256': ''}
+              size = path.stat().st_size
+              magic = fits_magic_ok(path)
+              ok = bool(size >= min_bytes and magic)
+              return ok, {'exists': True, 'size_bytes': size, 'fits_magic_ok': magic, 'sha256': sha256_file(path) if ok else ''}
+
+          def run_cmd(cmd, timeout, logname):
+              log('RUN ' + ' '.join(cmd[:4]) + ' ...')
+              try:
+                  p = subprocess.run(cmd, text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=timeout)
+                  out = p.stdout or ''
+                  (OUT / logname).write_text(out[-20000:], encoding='utf-8', errors='replace')
+                  return p.returncode, out[-1200:]
+              except subprocess.TimeoutExpired as e:
+                  tail = (e.stdout or '') if isinstance(e.stdout, str) else ''
+                  (OUT / logname).write_text((tail or '')[-20000:] + '\nTIMEOUT\n', encoding='utf-8', errors='replace')
+                  return 124, 'TIMEOUT'
+              except Exception as e:
+                  (OUT / logname).write_text(repr(e), encoding='utf-8')
+                  return 125, repr(e)
+
+          def download_url(url, dest, label):
+              attempts = []
+              # aria2c first
+              cmd = [
+                  'aria2c', '--allow-overwrite=true', '--auto-file-renaming=false',
+                  '--continue=true', '--max-tries=8', '--retry-wait=15', '--timeout=90',
+                  '--connect-timeout=45', '--lowest-speed-limit=1K',
+                  '--user-agent=ACIRM-R13M-N2F-R2S', '-x', '4', '-s', '4',
+                  '-d', str(dest.parent), '-o', dest.name, url
+              ]
+              code, tail = run_cmd(cmd, timeout=3600, logname=f'{label}_aria2.log')
+              attempts.append({'method': 'aria2c', 'url': url, 'returncode': code, 'tail': tail})
+              if code == 0 and dest.exists() and dest.stat().st_size > 0:
+                  return True, attempts
+              # curl resume
+              part = dest.with_suffix(dest.suffix + '.part')
+              if dest.exists() and not part.exists():
+                  try:
+                      dest.rename(part)
+                  except Exception:
+                      pass
+              cmd = [
+                  'curl', '-L', '--fail', '--connect-timeout', '60', '--max-time', '3600',
+                  '--retry', '8', '--retry-delay', '15', '--retry-max-time', '3600',
+                  '--speed-time', '180', '--speed-limit', '1024', '-A', 'ACIRM-R13M-N2F-R2S',
+                  '-C', '-', '-o', str(part), url
+              ]
+              code, tail = run_cmd(cmd, timeout=3900, logname=f'{label}_curl.log')
+              attempts.append({'method': 'curl', 'url': url, 'returncode': code, 'tail': tail})
+              if code == 0 and part.exists() and part.stat().st_size > 0:
+                  try:
+                      if dest.exists():
+                          dest.unlink()
+                      part.rename(dest)
+                  except Exception:
+                      pass
+                  return True, attempts
+              # wget last
+              cmd = ['wget', '-c', '--tries=5', '--timeout=90', '--user-agent=ACIRM-R13M-N2F-R2S', '-O', str(dest), url]
+              code, tail = run_cmd(cmd, timeout=3600, logname=f'{label}_wget.log')
+              attempts.append({'method': 'wget', 'url': url, 'returncode': code, 'tail': tail})
+              return bool(code == 0 and dest.exists() and dest.stat().st_size > 0), attempts
+
+          def package_and_exit(exit_code):
+              zipname = f'{STAGE}_{LABEL}_RESULTS.zip'
+              if Path(zipname).exists():
+                  Path(zipname).unlink()
+              shutil.make_archive(zipname[:-4], 'zip', root_dir='.', base_dir=str(OUT))
+              sha = sha256_file(zipname)
+              Path(zipname + '.sha256.txt').write_text(f'{sha}  {zipname}\n', encoding='utf-8')
+              log(f'ZIP={zipname} SHA256={sha}')
+              sys.exit(exit_code)
+
+          try:
+              log(f'START split downloader label={LABEL}')
+              if LABEL not in TARGETS:
+                  write_json('FINAL_DECISION.json', {'stage': STAGE, 'target_label': LABEL, 'decision': 'TECHNICAL_STOP_INVALID_TARGET_LABEL_NO_SCORE', 'technical_stop': True, 'scientific_result': False})
+                  package_and_exit(2)
+              t = TARGETS[LABEL]
+              dest = CACHE / t['filename']
+              ok, meta = validate(dest, t['min_bytes'])
+              if ok:
+                  decision = 'N2F_R2S_SINGLE_FILE_ALREADY_CACHED_READY_NO_SCORE'
+                  write_json('FINAL_DECISION.json', {'stage': STAGE, 'target_label': LABEL, 'decision': decision, 'technical_stop': False, 'scientific_result': False, 'cache_path': str(dest), **meta})
+                  write_csv('DOWNLOAD_ATTEMPTS.csv', [], ['method','url','returncode','tail'])
+                  package_and_exit(0)
+
+              all_attempts = []
+              for url in t['urls']:
+                  dl_ok, attempts = download_url(url, dest, LABEL)
+                  all_attempts.extend(attempts)
+                  ok, meta = validate(dest, t['min_bytes'])
+                  if dl_ok and ok:
+                      decision = 'N2F_R2S_SINGLE_FILE_DOWNLOAD_CACHED_READY_NO_SCORE'
+                      write_json('FINAL_DECISION.json', {'stage': STAGE, 'target_label': LABEL, 'decision': decision, 'technical_stop': False, 'scientific_result': False, 'cache_path': str(dest), 'source_url': url, **meta})
+                      write_csv('DOWNLOAD_ATTEMPTS.csv', all_attempts, ['method','url','returncode','tail'])
+                      package_and_exit(0)
+              # failed
+              if dest.exists():
+                  try:
+                      dest.unlink()
+                  except Exception:
+                      pass
+              decision = 'TECHNICAL_STOP_N2F_R2S_SINGLE_FILE_DOWNLOAD_FAILED_NO_SCORE'
+              write_json('FINAL_DECISION.json', {'stage': STAGE, 'target_label': LABEL, 'decision': decision, 'technical_stop': True, 'scientific_result': False, 'cache_path': str(dest), 'validation': meta, 'attempts_tail': all_attempts[-6:]})
+              write_csv('DOWNLOAD_ATTEMPTS.csv', all_attempts, ['method','url','returncode','tail'])
+              package_and_exit(2)
+          except SystemExit:
+              raise
+          except Exception:
+              write_json('FINAL_DECISION.json', {'stage': STAGE, 'target_label': LABEL, 'decision': 'TECHNICAL_STOP_N2F_R2S_EXCEPTION_NO_SCORE', 'technical_stop': True, 'scientific_result': False, 'traceback_tail': traceback.format_exc()[-4000:]})
+              package_and_exit(2)
+          PY
+
+      - name: Upload per-file report artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ACIRM_R13M_N2F_R2S_SPLIT_LAG650D_${{ matrix.target_label }}_REPORT
+          path: |
+            ACIRM_R13M_N2F_R2S_SPLIT_LAG650D_PER_FILE_DOWNLOAD_NO_SCORE_${{ matrix.target_label }}_RESULTS.zip
+            ACIRM_R13M_N2F_R2S_SPLIT_LAG650D_PER_FILE_DOWNLOAD_NO_SCORE_${{ matrix.target_label }}_RESULTS.zip.sha256.txt
+          retention-days: 14
+
+  summarize:
+    name: Summarize split download reports
+    runs-on: ubuntu-latest
+    needs: split-download
+    if: always()
+    steps:
+      - name: Download all per-file report artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: ACIRM_R13M_N2F_R2S_SPLIT_LAG650D_*_REPORT
+          merge-multiple: true
+          path: split_reports
+
+      - name: Build aggregate summary zip
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import csv, json, zipfile, hashlib, shutil
+          from pathlib import Path
+          from datetime import datetime, timezone
+          STAGE = 'ACIRM_R13M_N2F_R2S_SPLIT_LAG650D_PER_FILE_DOWNLOAD_AGGREGATE_NO_SCORE'
+          OUT = Path(f'{STAGE}_OUTPUT')
+          OUT.mkdir(exist_ok=True)
+          required = ['photon_w821','spacecraft_w821','photon_w635','spacecraft_w635','catalog_gll_psc_v35']
+          rows = []
+          for z in sorted(Path('split_reports').glob('*.zip')):
+              row = {'artifact_zip': z.name}
+              try:
+                  with zipfile.ZipFile(z) as zz:
+                      names = zz.namelist()
+                      fd = next((n for n in names if n.endswith('FINAL_DECISION.json')), None)
+                      if fd:
+                          obj = json.loads(zz.read(fd).decode('utf-8'))
+                          row.update({
+                              'target_label': obj.get('target_label',''),
+                              'decision': obj.get('decision',''),
+                              'technical_stop': obj.get('technical_stop',''),
+                              'size_bytes': obj.get('size_bytes',''),
+                              'fits_magic_ok': obj.get('fits_magic_ok',''),
+                              'cache_path': obj.get('cache_path',''),
+                              'file_sha256': obj.get('sha256',''),
+                          })
+                      else:
+                          row.update({'target_label':'','decision':'NO_FINAL_DECISION_JSON','technical_stop':True})
+              except Exception as e:
+                  row.update({'target_label':'','decision':'REPORT_ZIP_READ_FAILED','technical_stop':True, 'error':repr(e)})
+              rows.append(row)
+          by = {r.get('target_label'): r for r in rows if r.get('target_label')}
+          all_ready = all((lab in by and 'READY' in str(by[lab].get('decision','')) and str(by[lab].get('technical_stop','False')) in ('False','false','0','')) for lab in required)
+          final = {
+              'stage': STAGE,
+              'decision': 'N2F_R2S_ALL_LAG650D_SPLIT_FILES_CACHED_READY_FOR_N2F_R3_NO_SCORE' if all_ready else 'TECHNICAL_STOP_N2F_R2S_NOT_ALL_SPLIT_FILES_CACHED_NO_SCORE',
+              'scientific_result': False,
+              'technical_stop': not all_ready,
+              'required_labels': required,
+              'available_labels': sorted(by.keys()),
+              'missing_or_failed_labels': [lab for lab in required if not (lab in by and 'READY' in str(by[lab].get('decision','')) and str(by[lab].get('technical_stop','False')) in ('False','false','0',''))],
+              'timestamp_utc': datetime.now(timezone.utc).isoformat(),
+              'claim_ceiling': 'NO_SCORE_NOT_PROOF_NOT_DISCOVERY',
+          }
+          (OUT/'FINAL_DECISION.json').write_text(json.dumps(final, indent=2, sort_keys=True), encoding='utf-8')
+          with (OUT/'SPLIT_DOWNLOAD_SUMMARY.csv').open('w', newline='', encoding='utf-8') as f:
+              fields = ['target_label','decision','technical_stop','size_bytes','fits_magic_ok','cache_path','file_sha256','artifact_zip','error']
+              w = csv.DictWriter(f, fieldnames=fields)
+              w.writeheader()
+              for r in rows:
+                  w.writerow({k:r.get(k,'') for k in fields})
+          # include original report zips as small nested artifacts only
+          repdir = OUT/'per_file_report_zips'
+          repdir.mkdir(exist_ok=True)
+          for z in Path('split_reports').glob('*.zip'):
+              shutil.copy2(z, repdir/z.name)
+          zipname = 'ACIRM_R13M_N2F_R2S_SPLIT_LAG650D_PER_FILE_DOWNLOAD_RESULTS.zip'
+          shutil.make_archive(zipname[:-4], 'zip', root_dir='.', base_dir=str(OUT))
+          sha = hashlib.sha256(Path(zipname).read_bytes()).hexdigest()
+          Path(zipname + '.sha256.txt').write_text(f'{sha}  {zipname}\n', encoding='utf-8')
+          print(json.dumps(final, indent=2))
+          print('ZIP', zipname, 'SHA256', sha)
+          PY
+
+      - name: Upload aggregate split download artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ACIRM_R13M_N2F_R2S_SPLIT_LAG650D_PER_FILE_DOWNLOAD_RESULTS
+          path: |
+            ACIRM_R13M_N2F_R2S_SPLIT_LAG650D_PER_FILE_DOWNLOAD_RESULTS.zip
+            ACIRM_R13M_N2F_R2S_SPLIT_LAG650D_PER_FILE_DOWNLOAD_RESULTS.zip.sha256.txt
+          retention-days: 14
