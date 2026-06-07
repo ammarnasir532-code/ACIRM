@@ -1,0 +1,293 @@
+name: ACIRM R13M N2I Energy Band Split Field Guardrail
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  n2i-energy-band-split:
+    runs-on: ubuntu-latest
+    timeout-minutes: 150
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Restore photon caches
+        uses: actions/cache@v4
+        with:
+          path: |
+            ${{ github.workspace }}/.acirm_lat_cache_n2b_lag300d
+            ${{ github.workspace }}/.acirm_lat_cache_n2f_lag650d_split
+            ${{ github.workspace }}/.acirm_lat_cache_n2h
+            ${{ github.workspace }}/.acirm_lat_cache_n2i
+          key: acirm-r13m-n2i-energy-band-photon-inputs-${{ github.run_id }}
+          restore-keys: |
+            acirm-r13m-n2h-r1-field-normalized-photon-inputs-
+            acirm-r13m-n2f-lag650d-split-photon-w821-
+            acirm-r13m-n2f-lag650d-split-photon-w635-
+            acirm-r13m-n2b-lag300d-w685-w771-inputs-r8-
+
+      - name: Install lightweight Python tools
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m pip install --upgrade pip -q
+          python -m pip install -q numpy astropy
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq aria2 curl zip unzip
+
+      - name: Create N2I worker part 1
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat > n2i_worker.py <<'PY'
+          import csv, json, math, os, shutil, subprocess, time, hashlib, traceback
+          from pathlib import Path
+          import numpy as np
+          from astropy.io import fits
+
+          STAGE = "ACIRM_R13M_N2I_ENERGY_BAND_SPLIT_FIELD_GUARDRAIL_NO_SCORE"
+          OUT = Path(f"{STAGE}_OUTPUT"); OUT.mkdir(exist_ok=True)
+          CLAIM = "NO_SCORE_NOT_PROOF_NOT_DISCOVERY"
+          R9C_RA = 299.590315
+          R9C_DEC = 35.201606
+          EMIN = 1000.0
+          EMAX = 1000000.0
+          PROGRESS = OUT / "PROGRESS.log"
+
+          INPUTS = [
+              {"label":"LAG300D_post_w771","lag":"LAG300D","phase":"post","week":771,"url":"https://heasarc.gsfc.nasa.gov/FTP/fermi/data/lat/weekly/photon/lat_photon_weekly_w771_p305_v001.fits","paths":[".acirm_lat_cache_n2b_lag300d/lat_photon_weekly_w771_p305_v001.fits", ".acirm_lat_cache_n2h/lat_photon_weekly_w771_p305_v001.fits", ".acirm_lat_cache_n2i/lat_photon_weekly_w771_p305_v001.fits"]},
+              {"label":"LAG300D_pre_w685","lag":"LAG300D","phase":"pre","week":685,"url":"https://heasarc.gsfc.nasa.gov/FTP/fermi/data/lat/weekly/photon/lat_photon_weekly_w685_p305_v001.fits","paths":[".acirm_lat_cache_n2b_lag300d/lat_photon_weekly_w685_p305_v001.fits", ".acirm_lat_cache_n2h/lat_photon_weekly_w685_p305_v001.fits", ".acirm_lat_cache_n2i/lat_photon_weekly_w685_p305_v001.fits"]},
+              {"label":"LAG650D_post_w821","lag":"LAG650D","phase":"post","week":821,"url":"https://heasarc.gsfc.nasa.gov/FTP/fermi/data/lat/weekly/photon/lat_photon_weekly_w821_p305_v001.fits","paths":[".acirm_lat_cache_n2f_lag650d_split/photon_w821/lat_photon_weekly_w821_p305_v001.fits", ".acirm_lat_cache_n2h/lat_photon_weekly_w821_p305_v001.fits", ".acirm_lat_cache_n2i/lat_photon_weekly_w821_p305_v001.fits"]},
+              {"label":"LAG650D_pre_w635","lag":"LAG650D","phase":"pre","week":635,"url":"https://heasarc.gsfc.nasa.gov/FTP/fermi/data/lat/weekly/photon/lat_photon_weekly_w635_p305_v001.fits","paths":[".acirm_lat_cache_n2f_lag650d_split/photon_w635/lat_photon_weekly_w635_p305_v001.fits", ".acirm_lat_cache_n2h/lat_photon_weekly_w635_p305_v001.fits", ".acirm_lat_cache_n2i/lat_photon_weekly_w635_p305_v001.fits"]},
+          ]
+
+          ENERGY_BANDS = [
+              {"band":"E01_1_3_GeV", "emin":1000.0, "emax":3000.0},
+              {"band":"E02_3_10_GeV", "emin":3000.0, "emax":10000.0},
+              {"band":"E03_10_30_GeV", "emin":10000.0, "emax":30000.0},
+              {"band":"E04_30_100_GeV", "emin":30000.0, "emax":100000.0},
+              {"band":"E05_100_1000_GeV", "emin":100000.0, "emax":1000000.0},
+              {"band":"EALL_1_1000_GeV", "emin":1000.0, "emax":1000000.0},
+          ]
+
+          RADIAL_BINS = [(0,0.5),(0.5,1),(1,2),(2,5),(5,10)]
+
+          SOURCES_2_TO_5 = [
+            {"source_id":"4FGL J1948.9+3414","assoc":"","ra":297.2261962890625,"dec":34.239601135253906,"dist":2.1681655108615416},
+            {"source_id":"4FGL J2009.9+3544","assoc":"B2 2008+35","ra":302.4891967773437,"dec":35.74599838256836,"dist":2.422644339422418},
+            {"source_id":"4FGL J1954.4+3252e","assoc":"CTB 80","ra":298.6000061035156,"dec":32.869998931884766,"dist":2.471769439602049},
+            {"source_id":"4FGL J2002.3+3246","assoc":"SNR G069.7+01.0","ra":300.5997009277344,"dec":32.77880096435547,"dist":2.5632321685955604},
+            {"source_id":"4FGL J1952.9+3252","assoc":"PSR J1952+3252","ra":298.247314453125,"dec":32.882999420166016,"dist":2.571757782717301},
+            {"source_id":"4FGL J2013.5+3613","assoc":"SNR G073.9+00.9","ra":303.3844909667969,"dec":36.225399017333984,"dist":3.246048161207813},
+            {"source_id":"4FGL J1959.0+3844","assoc":"LQAC 299+038","ra":299.76629638671875,"dec":38.73680114746094,"dist":3.537987659798902},
+            {"source_id":"4FGL J1950.2+3822","assoc":"RX J1950.0+3821","ra":297.56939697265625,"dec":38.371700286865234,"dist":3.559091895403688},
+            {"source_id":"4FGL J1953.5+3841","assoc":"","ra":298.3848876953125,"dec":38.6880989074707,"dist":3.6170398911174417},
+            {"source_id":"4FGL J2017.3+3525","assoc":"","ra":304.3492126464844,"dec":35.42259979248047,"dist":3.889238843639835},
+            {"source_id":"4FGL J2015.5+3710","assoc":"MG2 J201534+3710","ra":303.89239501953125,"dec":37.17599868774414,"dist":3.993576217978025},
+            {"source_id":"4FGL J2016.2+3712","assoc":"VER J2016+372","ra":304.056884765625,"dec":37.21310043334961,"dist":4.126644299917183},
+            {"source_id":"4FGL J2017.9+3625","assoc":"PSR J2017+3625","ra":304.49090576171875,"dec":36.42770004272461,"dist":4.158222141614726},
+            {"source_id":"4FGL J2006.2+3102","assoc":"PSR J2006+3102","ra":301.56610107421875,"dec":31.04459953308105,"dist":4.473921852177352},
+            {"source_id":"4FGL J1935.4+3547","assoc":"","ra":293.8646850585937,"dec":35.796199798583984,"dist":4.69845561778258},
+            {"source_id":"4FGL J2021.9+3609","assoc":"","ra":305.4862976074219,"dec":36.15769958496094,"dist":4.882909314033249},
+            {"source_id":"4FGL J2021.1+3651","assoc":"PSR J2021+3651","ra":305.27960205078125,"dec":36.85609817504883,"dist":4.888469684256179},
+          ]
+          TOP4_IDS = {"4FGL J2015.5+3710","4FGL J2016.2+3712","4FGL J2017.9+3625","4FGL J2013.5+3613"}
+          TOP4 = [s for s in SOURCES_2_TO_5 if s['source_id'] in TOP4_IDS]
+
+          def log(msg):
+              s=f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] {msg}"
+              print(s, flush=True)
+              with PROGRESS.open('a', encoding='utf-8') as f: f.write(s+'\n')
+          def write_json(name,obj): (OUT/name).write_text(json.dumps(obj, indent=2, sort_keys=True), encoding='utf-8')
+          def write_csv(name, rows, fields):
+              with (OUT/name).open('w', newline='', encoding='utf-8') as f:
+                  w=csv.DictWriter(f, fieldnames=fields); w.writeheader()
+                  for r in rows: w.writerow({k:r.get(k,'') for k in fields})
+          def sha256_file(p):
+              h=hashlib.sha256()
+              with open(p,'rb') as f:
+                  for b in iter(lambda:f.read(1024*1024), b''): h.update(b)
+              return h.hexdigest()
+          def fits_ok(p):
+              try:
+                  with open(p,'rb') as f: return f.read(6)==b'SIMPLE'
+              except Exception: return False
+          def run(cmd, timeout=None):
+              return subprocess.run(cmd, text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=timeout)
+          def angsep_deg(ra1,dec1,ra2,dec2):
+              ra1=np.deg2rad(ra1); dec1=np.deg2rad(dec1); ra2=np.deg2rad(ra2); dec2=np.deg2rad(dec2)
+              c=np.sin(dec1)*np.sin(dec2)+np.cos(dec1)*np.cos(dec2)*np.cos(ra1-ra2)
+              return np.rad2deg(np.arccos(np.clip(c,-1,1)))
+          def ensure_file(item):
+              for raw in item['paths']:
+                  p=Path(raw)
+                  if p.exists() and p.stat().st_size>1024 and fits_ok(p): return p,'cache'
+              dest=Path(item['paths'][-1]); dest.parent.mkdir(parents=True, exist_ok=True)
+              log('download '+item['label'])
+              p=run(['aria2c','-x','4','-s','4','-c','--timeout=180','--connect-timeout=90','--max-tries=8','--retry-wait=20','-d',str(dest.parent),'-o',dest.name,item['url']], timeout=3600)
+              (OUT/(item['label']+'_aria2.log')).write_text((p.stdout or '')[-12000:], encoding='utf-8', errors='replace')
+              if p.returncode==0 and dest.exists() and fits_ok(dest): return dest,'aria2c'
+              p2=run(['curl','-L','--fail','--connect-timeout','90','--max-time','3600','--retry','4','--retry-delay','20','-o',str(dest),item['url']], timeout=3700)
+              (OUT/(item['label']+'_curl.log')).write_text((p2.stdout or '')[-12000:], encoding='utf-8', errors='replace')
+              if p2.returncode==0 and dest.exists() and fits_ok(dest): return dest,'curl'
+              return dest,'missing'
+          PY
+
+      - name: Create N2I worker part 2
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat >> n2i_worker.py <<'PY'
+          def load_events(path):
+              with fits.open(path, memmap=True) as hdul:
+                  d=hdul['EVENTS'].data
+                  ra=np.asarray(d['RA'], dtype=float)
+                  dec=np.asarray(d['DEC'], dtype=float)
+                  e=np.asarray(d['ENERGY'], dtype=float)
+                  m=np.isfinite(ra)&np.isfinite(dec)&np.isfinite(e)&(e>=EMIN)&(e<=EMAX)
+                  return ra[m], dec[m], e[m]
+
+          def source_mask(ra, dec, sources, radius):
+              mask=np.zeros(len(ra), dtype=bool)
+              for s in sources:
+                  mask |= (angsep_deg(ra, dec, s['ra'], s['dec']) <= radius)
+              return mask
+
+          def count_with_masks(ra, dec, e, band, radial_lo, radial_hi, mask_sources=None, mask_radius=1.0):
+              sep=angsep_deg(ra, dec, R9C_RA, R9C_DEC)
+              m=(sep>=radial_lo)&(sep<radial_hi)&(e>=band['emin'])&(e<band['emax'])
+              if mask_sources:
+                  m = m & (~source_mask(ra, dec, mask_sources, mask_radius))
+              return int(m.sum())
+
+          def main():
+              log('START '+STAGE)
+              write_json('LOCKED_THEORY_CONTEXT.json', {
+                  'stage': STAGE,
+                  'claim_ceiling': CLAIM,
+                  'energy_source_policy': 'ACIRM does not constrain where the energy originates. This guardrail asks which Fermi energy bands carry the field/ring response when resonant/gate conditions are met and energy is available/coupled.',
+                  'prior_results_used': 'N2B/N2H: 650d is peak residual lag; 650d ring 2-5 deg survives field normalization and top4/all-source masks.',
+                  'technical_scope': 'Photon energy-band split, field-normalized. Not Fermipy likelihood, not spacecraft exposure-corrected attribution.'
+              })
+              manifest=[]; loaded={}
+              for item in INPUTS:
+                  path, method = ensure_file(item)
+                  row={**{k:item[k] for k in ['label','lag','phase','week']}, 'path':str(path), 'method':method, 'exists':path.exists(), 'size_bytes':path.stat().st_size if path.exists() else 0, 'fits_magic_ok':fits_ok(path), 'sha256':sha256_file(path) if path.exists() and fits_ok(path) else ''}
+                  row['ready']=bool(row['exists'] and row['fits_magic_ok'])
+                  manifest.append(row)
+                  if row['ready']:
+                      ra,dec,e=load_events(path)
+                      loaded[item['label']]={'ra':ra,'dec':dec,'e':e,'lag':item['lag'],'phase':item['phase'],'week':item['week'],'n_total':len(ra)}
+              write_csv('INPUT_PHOTON_MANIFEST.csv', manifest, ['label','lag','phase','week','path','method','exists','size_bytes','fits_magic_ok','sha256','ready'])
+              if len(loaded)!=4:
+                  write_json('FINAL_DECISION.json', {'stage':STAGE,'decision':'TECHNICAL_STOP_N2I_REQUIRED_PHOTON_INPUTS_MISSING_NO_SCORE','technical_stop':True,'scientific_result':False,'ready_files':len(loaded),'claim_ceiling':CLAIM})
+                  package(); return
+
+              totals=[]
+              for label,d in loaded.items():
+                  for band in ENERGY_BANDS:
+                      band_total=int(((d['e']>=band['emin'])&(d['e']<band['emax'])).sum())
+                      totals.append({'input_label':label,'lag':d['lag'],'phase':d['phase'],'week':d['week'],'band':band['band'],'emin_mev':band['emin'],'emax_mev':band['emax'],'band_total_count':band_total,'file_total_count':d['n_total'],'band_fraction_of_file':band_total/d['n_total'] if d['n_total'] else ''})
+              write_csv('ENERGY_BAND_FILE_TOTALS.csv', totals, ['input_label','lag','phase','week','band','emin_mev','emax_mev','band_total_count','file_total_count','band_fraction_of_file'])
+              total_map={(r['input_label'],r['band']):r for r in totals}
+
+              rows=[]
+              for label,d in loaded.items():
+                  for band in ENERGY_BANDS:
+                      bt=total_map[(label,band['band'])]['band_total_count']
+                      for lo,hi in RADIAL_BINS:
+                          c=count_with_masks(d['ra'],d['dec'],d['e'],band,lo,hi,None,1.0)
+                          rows.append({'input_label':label,'lag':d['lag'],'phase':d['phase'],'week':d['week'],'band':band['band'],'emin_mev':band['emin'],'emax_mev':band['emax'],'radial_lo_deg':lo,'radial_hi_deg':hi,'count':c,'band_total_count':bt,'file_total_count':d['n_total'],'count_per_100k_band':100000*c/bt if bt else '', 'count_per_100k_file':100000*c/d['n_total'] if d['n_total'] else ''})
+              write_csv('ENERGY_BAND_RADIAL_COUNTS.csv', rows, ['input_label','lag','phase','week','band','emin_mev','emax_mev','radial_lo_deg','radial_hi_deg','count','band_total_count','file_total_count','count_per_100k_band','count_per_100k_file'])
+
+              comp=[]
+              by={(r['lag'],r['phase'],r['band'],r['radial_lo_deg'],r['radial_hi_deg']):r for r in rows}
+              for lag in ['LAG300D','LAG650D']:
+                  for band in [b['band'] for b in ENERGY_BANDS]:
+                      for lo,hi in RADIAL_BINS:
+                          post=by.get((lag,'post',band,lo,hi)); pre=by.get((lag,'pre',band,lo,hi))
+                          if post and pre:
+                              comp.append({'lag':lag,'band':band,'radial_lo_deg':lo,'radial_hi_deg':hi,'post_count':post['count'],'pre_count':pre['count'],'post_minus_pre_count':post['count']-pre['count'],'post_per_100k_band':post['count_per_100k_band'],'pre_per_100k_band':pre['count_per_100k_band'],'post_minus_pre_per_100k_band':post['count_per_100k_band']-pre['count_per_100k_band'] if post['count_per_100k_band']!='' and pre['count_per_100k_band']!='' else '', 'post_per_100k_file':post['count_per_100k_file'],'pre_per_100k_file':pre['count_per_100k_file'],'post_minus_pre_per_100k_file':post['count_per_100k_file']-pre['count_per_100k_file']})
+              write_csv('ENERGY_BAND_RADIAL_POST_PRE.csv', comp, ['lag','band','radial_lo_deg','radial_hi_deg','post_count','pre_count','post_minus_pre_count','post_per_100k_band','pre_per_100k_band','post_minus_pre_per_100k_band','post_per_100k_file','pre_per_100k_file','post_minus_pre_per_100k_file'])
+
+              # Masked 2-5 deg energy split: top4 and all locked non-Cyg sources.
+              mask_rows=[]
+              groups=[('NO_MASK',[]),('TOP4_650D_CLUSTER_CANDIDATES',TOP4),('ALL_LOCKED_2_TO_5_DEG_NON_CYG',SOURCES_2_TO_5)]
+              for label,d in loaded.items():
+                  for band in ENERGY_BANDS:
+                      bt=total_map[(label,band['band'])]['band_total_count']
+                      for group_name, sources in groups:
+                          c=count_with_masks(d['ra'],d['dec'],d['e'],band,2.0,5.0,sources,1.0)
+                          mask_rows.append({'input_label':label,'lag':d['lag'],'phase':d['phase'],'week':d['week'],'band':band['band'],'mask_group':group_name,'mask_radius_deg':1.0 if sources else 0.0,'masked_source_n':len(sources),'ring_2_5_count_after_mask':c,'band_total_count':bt,'file_total_count':d['n_total'],'after_mask_per_100k_band':100000*c/bt if bt else '', 'after_mask_per_100k_file':100000*c/d['n_total'] if d['n_total'] else ''})
+              write_csv('ENERGY_BAND_MASKED_RING_COUNTS.csv', mask_rows, ['input_label','lag','phase','week','band','mask_group','mask_radius_deg','masked_source_n','ring_2_5_count_after_mask','band_total_count','file_total_count','after_mask_per_100k_band','after_mask_per_100k_file'])
+              mcomp=[]
+              mb={(r['lag'],r['phase'],r['band'],r['mask_group']):r for r in mask_rows}
+              for lag in ['LAG300D','LAG650D']:
+                  for band in [b['band'] for b in ENERGY_BANDS]:
+                      for group_name,_ in groups:
+                          post=mb.get((lag,'post',band,group_name)); pre=mb.get((lag,'pre',band,group_name))
+                          if post and pre:
+                              mcomp.append({'lag':lag,'band':band,'mask_group':group_name,'post_count':post['ring_2_5_count_after_mask'],'pre_count':pre['ring_2_5_count_after_mask'],'post_minus_pre_count':post['ring_2_5_count_after_mask']-pre['ring_2_5_count_after_mask'],'post_per_100k_band':post['after_mask_per_100k_band'],'pre_per_100k_band':pre['after_mask_per_100k_band'],'post_minus_pre_per_100k_band':post['after_mask_per_100k_band']-pre['after_mask_per_100k_band'] if post['after_mask_per_100k_band']!='' and pre['after_mask_per_100k_band']!='' else '', 'post_per_100k_file':post['after_mask_per_100k_file'],'pre_per_100k_file':pre['after_mask_per_100k_file'],'post_minus_pre_per_100k_file':post['after_mask_per_100k_file']-pre['after_mask_per_100k_file']})
+              write_csv('ENERGY_BAND_MASKED_RING_POST_PRE.csv', mcomp, ['lag','band','mask_group','post_count','pre_count','post_minus_pre_count','post_per_100k_band','pre_per_100k_band','post_minus_pre_per_100k_band','post_per_100k_file','pre_per_100k_file','post_minus_pre_per_100k_file'])
+
+              # Decision and compact summary: focus on LAG650D 2-5 deg no-mask bands except EALL.
+              focus=[r for r in comp if r['lag']=='LAG650D' and r['radial_lo_deg']==2.0 and r['radial_hi_deg']==5.0 and r['band']!='EALL_1_1000_GeV']
+              focus_sorted=sorted(focus, key=lambda r: (r['post_minus_pre_per_100k_band'] if r['post_minus_pre_per_100k_band']!='' else -999999), reverse=True)
+              dominant=focus_sorted[0] if focus_sorted else {}
+              positive_bands=[r['band'] for r in focus if r.get('post_minus_pre_per_100k_band','')!='' and r['post_minus_pre_per_100k_band']>0]
+              all650=[r for r in comp if r['lag']=='LAG650D' and r['radial_lo_deg']==2.0 and r['radial_hi_deg']==5.0 and r['band']=='EALL_1_1000_GeV'][0]
+              top4_all=[r for r in mcomp if r['lag']=='LAG650D' and r['band']=='EALL_1_1000_GeV' and r['mask_group']=='TOP4_650D_CLUSTER_CANDIDATES'][0]
+              allmask_all=[r for r in mcomp if r['lag']=='LAG650D' and r['band']=='EALL_1_1000_GeV' and r['mask_group']=='ALL_LOCKED_2_TO_5_DEG_NON_CYG'][0]
+              if all650['post_minus_pre_per_100k_band']>0 and len(positive_bands)>=2:
+                  decision='N2I_ENERGY_BAND_SPLIT_650D_RING_EXCESS_MULTI_BAND_FIELD_RESPONSE_NO_SCORE'
+              elif all650['post_minus_pre_per_100k_band']>0 and len(positive_bands)==1:
+                  decision='N2I_ENERGY_BAND_SPLIT_650D_RING_EXCESS_SINGLE_BAND_DOMINANT_NO_SCORE'
+              else:
+                  decision='N2I_NO_ENERGY_BAND_650D_RING_EXCESS_NO_SCORE'
+              summary={'stage':STAGE,'decision':decision,'technical_stop':False,'scientific_result':True,'claim_ceiling':CLAIM,'dominant_lag650_ring_2_5_band':dominant.get('band',''),'dominant_lag650_post_minus_pre_per_100k_band':dominant.get('post_minus_pre_per_100k_band',''),'positive_lag650_ring_2_5_bands':positive_bands,'lag650_all_energy_ring_2_5_post_minus_pre_per_100k_band':all650['post_minus_pre_per_100k_band'],'lag650_all_energy_top4_mask_post_minus_pre_per_100k_band':top4_all['post_minus_pre_per_100k_band'],'lag650_all_energy_all_2_5_mask_post_minus_pre_per_100k_band':allmask_all['post_minus_pre_per_100k_band'],'note':'Photon energy-band split guardrail. Energy origin remains unconstrained; not spacecraft/exposure-corrected.'}
+              write_json('SUMMARY.json', summary); write_json('FINAL_DECISION.json', summary); package()
+
+          def package():
+              zipname=f'{STAGE}_RESULTS.zip'
+              shutil.make_archive(zipname[:-4], 'zip', root_dir='.', base_dir=str(OUT))
+              sha=hashlib.sha256(Path(zipname).read_bytes()).hexdigest()
+              Path(zipname+'.sha256.txt').write_text(f'{sha}  {zipname}\n', encoding='utf-8')
+              log('ZIP '+zipname+' SHA256 '+sha)
+          if __name__=='__main__':
+              try:
+                  main()
+              except Exception:
+                  (OUT/'EXCEPTION_TRACEBACK.txt').write_text(traceback.format_exc(), encoding='utf-8')
+                  write_json('FINAL_DECISION.json', {'stage':STAGE,'decision':'TECHNICAL_STOP_N2I_EXCEPTION_NO_SCORE','technical_stop':True,'scientific_result':False,'claim_ceiling':CLAIM,'error':traceback.format_exc()[-3000:]})
+                  package()
+          PY
+          python -m py_compile n2i_worker.py
+
+      - name: Run N2I energy-band split field guardrail
+        shell: bash
+        run: |
+          set -euo pipefail
+          python n2i_worker.py
+
+      - name: Show final decision
+        if: always()
+        shell: bash
+        run: |
+          set +e
+          cat ACIRM_R13M_N2I_ENERGY_BAND_SPLIT_FIELD_GUARDRAIL_NO_SCORE_OUTPUT/FINAL_DECISION.json || true
+          echo ""
+          tail -n 80 ACIRM_R13M_N2I_ENERGY_BAND_SPLIT_FIELD_GUARDRAIL_NO_SCORE_OUTPUT/PROGRESS.log || true
+
+      - name: Upload N2I artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ACIRM_R13M_N2I_ENERGY_BAND_SPLIT_FIELD_GUARDRAIL_RESULTS
+          path: |
+            ACIRM_R13M_N2I_ENERGY_BAND_SPLIT_FIELD_GUARDRAIL_NO_SCORE_RESULTS.zip
+            ACIRM_R13M_N2I_ENERGY_BAND_SPLIT_FIELD_GUARDRAIL_NO_SCORE_RESULTS.zip.sha256.txt
+            ACIRM_R13M_N2I_ENERGY_BAND_SPLIT_FIELD_GUARDRAIL_NO_SCORE_OUTPUT/**
+          retention-days: 14
