@@ -1,0 +1,425 @@
+name: ACIRM R13M N2E R1 Catalog Cache Or Redownload Preflight
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  acirm-r13m-n2e-r1-catalog-preflight:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Restore lag300 catalog cache
+        uses: actions/cache@v4
+        with:
+          path: ${{ github.workspace }}/.acirm_lat_cache_n2b_lag300d
+          key: acirm-r13m-n2e-r1-restore-lag300-${{ github.run_id }}
+          restore-keys: |
+            acirm-r13m-n2b-lag300d-w685-w771-inputs-r8-
+
+      - name: Restore lag450 catalog cache
+        uses: actions/cache@v4
+        with:
+          path: ${{ github.workspace }}/.acirm_lat_cache_n2b_lag450d
+          key: acirm-r13m-n2e-r1-restore-lag450-${{ github.run_id }}
+          restore-keys: |
+            acirm-r13m-n2b-lag450d-w664-w792-inputs-r10-
+
+      - name: Restore lag850 catalog cache
+        uses: actions/cache@v4
+        with:
+          path: ${{ github.workspace }}/.acirm_lat_cache_n2b_lag850d
+          key: acirm-r13m-n2e-r1-restore-lag850-${{ github.run_id }}
+          restore-keys: |
+            acirm-r13m-n2b-lag850d-w607-w849-inputs-r12-
+
+      - name: Restore lag1000 catalog cache
+        uses: actions/cache@v4
+        with:
+          path: ${{ github.workspace }}/.acirm_lat_cache_n2b_lag1000d
+          key: acirm-r13m-n2e-r1-restore-lag1000-${{ github.run_id }}
+          restore-keys: |
+            acirm-r13m-n2b-lag1000d-w585-w871-inputs-r14-
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install lightweight Python dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m pip install --upgrade pip
+          python -m pip install --no-cache-dir astropy numpy
+
+      - name: Run ACIRM R13M N2E R1 catalog cache-or-redownload preflight
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import csv, json, math, hashlib, shutil, subprocess, time, traceback
+          from pathlib import Path
+          from datetime import datetime, timezone
+
+          import numpy as np
+          from astropy.table import Table
+
+          STAGE = "ACIRM_R13M_N2E_R1_CATALOG_CACHE_OR_REDOWNLOAD_PREFLIGHT_NO_SCORE"
+          OUT = Path(f"{STAGE}_OUTPUT")
+          OUT.mkdir(exist_ok=True)
+          DATA = Path(f"{STAGE}_DATA")
+          DATA.mkdir(exist_ok=True)
+          PROGRESS = OUT / "PROGRESS.log"
+
+          R9C = {"region_id": "R9C_CYGX1", "ra_deg": 299.590315, "dec_deg": 35.201606}
+          SUCCESSFUL_LAGS = [
+              {"lag_label": "LAG_300D_W43", "lag_days_approx": 300, "post_week": 771, "pre_week": 685, "r9c_post_minus_pre_residual": 5.561814, "r9c_rank_descending": 1, "status": "rank1_success"},
+              {"lag_label": "LAG_650D_W93", "lag_days_approx": 650, "post_week": 821, "pre_week": 635, "r9c_post_minus_pre_residual": 21.718969, "r9c_rank_descending": 1, "status": "rank1_peak_success"},
+          ]
+          NON_SUPPORT_LAGS = [
+              {"lag_label": "LAG_450D_W64", "lag_days_approx": 450, "r9c_post_minus_pre_residual": 0.338125, "r9c_rank_descending": 3, "status": "not_rank1"},
+              {"lag_label": "LAG_850D_W121", "lag_days_approx": 850, "r9c_post_minus_pre_residual": -1.367253, "r9c_rank_descending": 8, "status": "not_rank1"},
+              {"lag_label": "LAG_1000D_W143", "lag_days_approx": 1000, "r9c_post_minus_pre_residual": -3.458740, "r9c_rank_descending": 10, "status": "not_rank1"},
+          ]
+          CATALOG_URLS = [
+              "https://fermi.gsfc.nasa.gov/ssc/data/access/lat/14yr_catalog/gll_psc_v35.fit",
+              "https://heasarc.gsfc.nasa.gov/FTP/fermi/data/lat/catalogs/4FGL/gll_psc_v35.fit",
+          ]
+          CACHE_DIRS = [
+              Path(".acirm_lat_cache_n2b_lag300d"),
+              Path(".acirm_lat_cache_n2b_lag450d"),
+              Path(".acirm_lat_cache_n2b_lag850d"),
+              Path(".acirm_lat_cache_n2b_lag1000d"),
+              Path("ACIRM_R13M_N2B_R8_LAG300D_DOWNLOAD_CACHE_BUILDER_NO_SCORE_DATA"),
+              Path("ACIRM_R13M_N2B_R10_LAG450D_DOWNLOAD_CACHE_BUILDER_NO_SCORE_DATA"),
+              Path("ACIRM_R13M_N2B_R12_LAG850D_DOWNLOAD_CACHE_BUILDER_NO_SCORE_DATA"),
+              Path("ACIRM_R13M_N2B_R14_LAG1000D_DOWNLOAD_CACHE_BUILDER_NO_SCORE_DATA"),
+          ]
+
+          def log(msg):
+              s = f"[{datetime.now(timezone.utc).isoformat()}] {msg}"
+              print(s, flush=True)
+              with PROGRESS.open("a", encoding="utf-8") as f:
+                  f.write(s + "\n")
+
+          def write_json(name, obj):
+              (OUT / name).write_text(json.dumps(obj, indent=2, ensure_ascii=False, sort_keys=True), encoding="utf-8")
+
+          def write_csv(name, rows, cols):
+              with (OUT / name).open("w", newline="", encoding="utf-8") as f:
+                  w = csv.DictWriter(f, fieldnames=cols)
+                  w.writeheader()
+                  for r in rows:
+                      w.writerow({c: r.get(c, "") for c in cols})
+
+          def sha256_file(path):
+              h = hashlib.sha256()
+              with open(path, "rb") as f:
+                  for b in iter(lambda: f.read(1024 * 1024), b""):
+                      h.update(b)
+              return h.hexdigest()
+
+          def run(cmd, timeout=300):
+              p = subprocess.run(cmd, text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=timeout)
+              return p.returncode, p.stdout
+
+          def fits_magic_ok(path):
+              try:
+                  return path.exists() and path.stat().st_size > 1024 and path.read_bytes()[:6] == b"SIMPLE"
+              except Exception:
+                  return False
+
+          def locate_cached_catalog():
+              rows = []
+              candidates = []
+              for root in CACHE_DIRS:
+                  if root.exists():
+                      for p in root.rglob("gll_psc_v35.fit"):
+                          candidates.append(p)
+                      for p in root.rglob("gll_psc_v35.fits"):
+                          candidates.append(p)
+              seen = set()
+              for p in candidates:
+                  if str(p.resolve()) in seen:
+                      continue
+                  seen.add(str(p.resolve()))
+                  ok = fits_magic_ok(p)
+                  rows.append({
+                      "source": "cache_search",
+                      "path": str(p),
+                      "ok": ok,
+                      "size_bytes": p.stat().st_size if p.exists() else 0,
+                      "sha256": sha256_file(p) if ok else "",
+                  })
+                  if ok:
+                      return p, rows
+              return None, rows
+
+          def download_catalog():
+              rows = []
+              dest = DATA / "gll_psc_v35.fit"
+              for idx, url in enumerate(CATALOG_URLS, 1):
+                  label = f"catalog_source{idx}"
+                  log(f"Downloading catalog attempt {idx}: {url}")
+                  cmd = ["curl", "-L", "--fail", "--connect-timeout", "90", "--max-time", "900", "--retry", "8", "--retry-delay", "20", "-A", "ACIRM-R13M-N2E-R1", "-o", str(dest), url]
+                  code, out = run(cmd, timeout=1000)
+                  (OUT / f"DOWNLOAD_{label}.log").write_text(out[-8000:], encoding="utf-8", errors="replace")
+                  ok = bool(code == 0 and fits_magic_ok(dest))
+                  row = {"source": "download", "label": label, "url": url, "path": str(dest), "ok": ok, "returncode": code, "size_bytes": dest.stat().st_size if dest.exists() else 0, "sha256": sha256_file(dest) if ok else "", "method": "curl", "error_tail": out[-400:] if not ok else ""}
+                  rows.append(row)
+                  if ok:
+                      return dest, rows
+              return None, rows
+
+          def norm_colmap(table):
+              return {c.lower(): c for c in table.colnames}
+
+          def find_col(table, names):
+              cmap = norm_colmap(table)
+              for n in names:
+                  if n.lower() in cmap:
+                      return cmap[n.lower()]
+              return None
+
+          def val_to_str(v):
+              if isinstance(v, bytes):
+                  return v.decode("utf-8", "replace").strip()
+              try:
+                  if np.ma.is_masked(v):
+                      return ""
+              except Exception:
+                  pass
+              return str(v).strip()
+
+          def val_to_float(v):
+              try:
+                  if np.ma.is_masked(v):
+                      return None
+                  x = float(v)
+                  if math.isfinite(x):
+                      return x
+              except Exception:
+                  pass
+              return None
+
+          def sep_deg(ra1, dec1, ra2, dec2):
+              r1, d1, r2, d2 = map(math.radians, [ra1, dec1, ra2, dec2])
+              cosang = math.sin(d1)*math.sin(d2) + math.cos(d1)*math.cos(d2)*math.cos(r1-r2)
+              cosang = max(-1.0, min(1.0, cosang))
+              return math.degrees(math.acos(cosang))
+
+          def finite_or_blank(x):
+              return "" if x is None else x
+
+          def package_outputs():
+              for p in DATA.rglob("*"):
+                  try:
+                      if p.is_file() and p.suffix.lower() in [".fit", ".fits", ".gz", ".fz"]:
+                          p.unlink()
+                  except Exception:
+                      pass
+              zipname = f"{STAGE}_RESULTS.zip"
+              if Path(zipname).exists():
+                  Path(zipname).unlink()
+              shutil.make_archive(zipname[:-4], "zip", root_dir=".", base_dir=str(OUT))
+              sha = sha256_file(zipname)
+              Path(zipname + ".sha256.txt").write_text(f"{sha}  {zipname}\n", encoding="utf-8")
+              log(f"ZIP={zipname} SHA256={sha}")
+
+          try:
+              log("START N2E R1 catalog cache-or-redownload preflight. Catalog-only. No Fermipy. No score.")
+              write_json("LOCKED_CONTEXT.json", {
+                  "stage": STAGE,
+                  "purpose": "Source-attribution/localization preflight after N2D using cached catalog first, then download fallback.",
+                  "r9c_region": R9C,
+                  "successful_lags_locked": SUCCESSFUL_LAGS,
+                  "non_support_lags_locked": NON_SUPPORT_LAGS,
+                  "claim_ceiling": "NO_SCORE_NOT_PROOF_NOT_DISCOVERY_DIAGNOSTIC_ONLY",
+                  "forbidden": [
+                      "Do not claim source attribution from catalog proximity alone.",
+                      "Do not claim proof/discovery/evidence.",
+                      "Do not retune lags or controls after N2D.",
+                      "Do not treat R9C excess as point-source localized until source-resolved/residual-map/TS diagnostics are run."
+                  ]
+              })
+              write_csv("LAG_CONTEXT.csv", SUCCESSFUL_LAGS + NON_SUPPORT_LAGS, ["lag_label", "lag_days_approx", "post_week", "pre_week", "r9c_post_minus_pre_residual", "r9c_rank_descending", "status"])
+
+              cached_catalog, cache_rows = locate_cached_catalog()
+              write_csv("CATALOG_CACHE_SEARCH.csv", cache_rows, ["source", "path", "ok", "size_bytes", "sha256"])
+              download_rows = []
+              catalog_path = cached_catalog
+              catalog_source_mode = "cache" if cached_catalog else "download"
+              if catalog_path is None:
+                  catalog_path, download_rows = download_catalog()
+              write_csv("CATALOG_DOWNLOADS.csv", download_rows, ["source", "label", "url", "path", "ok", "returncode", "size_bytes", "sha256", "method", "error_tail"])
+              if catalog_path is None:
+                  final = {
+                      "stage": STAGE,
+                      "decision": "TECHNICAL_STOP_N2E_R1_CATALOG_NOT_FOUND_OR_DOWNLOAD_FAILED_NO_SCORE",
+                      "scientific_result": False,
+                      "technical_stop": True,
+                      "claim_ceiling": "NO_SCORE_NOT_PROOF_NOT_DISCOVERY",
+                      "next_stage": "UPLOAD_OR_RESTORE_GLL_PSC_V35_CATALOG_NO_SCORE",
+                      "cache_rows": cache_rows,
+                      "download_rows": download_rows,
+                      "timestamp_utc": datetime.now(timezone.utc).isoformat(),
+                  }
+                  write_json("FINAL_DECISION.json", final)
+                  package_outputs()
+                  raise SystemExit(0)
+
+              log(f"Reading catalog from {catalog_source_mode}: {catalog_path}")
+              table = Table.read(catalog_path, format="fits")
+              columns = list(table.colnames)
+              write_json("CATALOG_COLUMNS.json", {"n_columns": len(columns), "columns": columns[:500]})
+
+              name_col = find_col(table, ["Source_Name", "source_name", "Source_Name_4FGL", "ASSOC1"])
+              ra_col = find_col(table, ["RAJ2000", "RA", "RA_Counterpart"])
+              dec_col = find_col(table, ["DEJ2000", "DEC", "Dec", "DEC_Counterpart"])
+              class_col = find_col(table, ["CLASS1", "Class1", "CLASS", "Source_Class"])
+              assoc_col = find_col(table, ["ASSOC1", "Assoc1", "ASSOC2", "ASSOC_FGL"])
+              signif_col = find_col(table, ["Signif_Avg", "Signif", "Sqrt_TS", "TS"])
+              flux_col = find_col(table, ["Flux1000", "Flux100", "Energy_Flux100", "Flux_Density"])
+              var_col = find_col(table, ["Variability_Index", "Variability2_Index", "Frac_Variability"])
+
+              required_ok = bool(name_col and ra_col and dec_col)
+              mapping = {"name_col": name_col, "ra_col": ra_col, "dec_col": dec_col, "class_col": class_col, "assoc_col": assoc_col, "signif_col": signif_col, "flux_col": flux_col, "variability_col": var_col, "required_ok": required_ok, "n_rows": len(table), "catalog_source_mode": catalog_source_mode, "catalog_path_used": str(catalog_path)}
+              write_json("CATALOG_COLUMN_MAPPING.json", mapping)
+              if not required_ok:
+                  final = {
+                      "stage": STAGE,
+                      "decision": "TECHNICAL_STOP_N2E_R1_CATALOG_REQUIRED_COLUMNS_MISSING_NO_SCORE",
+                      "scientific_result": False,
+                      "technical_stop": True,
+                      "mapping": mapping,
+                      "claim_ceiling": "NO_SCORE_NOT_PROOF_NOT_DISCOVERY",
+                      "next_stage": "INSPECT_CATALOG_COLUMNS_NO_SCORE",
+                      "timestamp_utc": datetime.now(timezone.utc).isoformat(),
+                  }
+                  write_json("FINAL_DECISION.json", final)
+                  package_outputs()
+                  raise SystemExit(0)
+
+              source_rows = []
+              for row in table:
+                  ra = val_to_float(row[ra_col]); dec = val_to_float(row[dec_col])
+                  if ra is None or dec is None:
+                      continue
+                  s = sep_deg(R9C["ra_deg"], R9C["dec_deg"], ra, dec)
+                  if s <= 15.0:
+                      source_rows.append({
+                          "source_name": val_to_str(row[name_col]),
+                          "assoc": val_to_str(row[assoc_col]) if assoc_col else "",
+                          "class": val_to_str(row[class_col]) if class_col else "",
+                          "ra_deg": ra,
+                          "dec_deg": dec,
+                          "sep_from_r9c_deg": s,
+                          "inside_1deg": s <= 1.0,
+                          "inside_2deg": s <= 2.0,
+                          "inside_5deg_analysis_roi": s <= 5.0,
+                          "inside_10deg_binning_roi": s <= 10.0,
+                          "inside_15deg_source_model_roi": s <= 15.0,
+                          "significance_or_ts_proxy": finite_or_blank(val_to_float(row[signif_col])) if signif_col else "",
+                          "flux_proxy": finite_or_blank(val_to_float(row[flux_col])) if flux_col else "",
+                          "variability_proxy": finite_or_blank(val_to_float(row[var_col])) if var_col else "",
+                      })
+              source_rows = sorted(source_rows, key=lambda r: r["sep_from_r9c_deg"])
+              cols = ["source_name", "assoc", "class", "ra_deg", "dec_deg", "sep_from_r9c_deg", "inside_1deg", "inside_2deg", "inside_5deg_analysis_roi", "inside_10deg_binning_roi", "inside_15deg_source_model_roi", "significance_or_ts_proxy", "flux_proxy", "variability_proxy"]
+              write_csv("R9C_CATALOG_SOURCES_WITHIN_15DEG.csv", source_rows, cols)
+              write_csv("R9C_NEAREST_CATALOG_SOURCES_TOP30.csv", source_rows[:30], cols)
+
+              radii = [0.5, 1.0, 2.0, 5.0, 10.0, 15.0]
+              count_rows = [{"radius_deg": rad, "catalog_source_count": sum(1 for r in source_rows if r["sep_from_r9c_deg"] <= rad)} for rad in radii]
+              write_csv("R9C_CATALOG_SOURCE_COUNTS_BY_RADIUS.csv", count_rows, ["radius_deg", "catalog_source_count"])
+
+              nearest = source_rows[0] if source_rows else None
+              inside5 = [r for r in source_rows if r["sep_from_r9c_deg"] <= 5.0]
+              inside2 = [r for r in source_rows if r["sep_from_r9c_deg"] <= 2.0]
+              likely_cygx1_assoc = [r for r in source_rows if ("cyg" in r["assoc"].lower() or "cyg" in r["source_name"].lower()) and r["sep_from_r9c_deg"] <= 5.0]
+              summary = {
+                  "stage": STAGE,
+                  "catalog_source_mode": catalog_source_mode,
+                  "catalog_rows_total": len(table),
+                  "r9c_ra_deg": R9C["ra_deg"],
+                  "r9c_dec_deg": R9C["dec_deg"],
+                  "sources_within_15deg": len(source_rows),
+                  "sources_within_10deg": sum(1 for r in source_rows if r["sep_from_r9c_deg"] <= 10.0),
+                  "sources_within_5deg_analysis_roi": len(inside5),
+                  "sources_within_2deg": len(inside2),
+                  "nearest_source": nearest,
+                  "cyg_named_sources_within_5deg": likely_cygx1_assoc,
+                  "successful_lags_for_source_followup": ["LAG_300D_W43", "LAG_650D_W93"],
+                  "source_attribution_status": "CATALOG_CANDIDATE_LIST_READY_NOT_ATTRIBUTED",
+                  "scientific_result": False,
+                  "technical_stop": False,
+                  "claim_ceiling": "NO_SCORE_NOT_PROOF_NOT_DISCOVERY_DIAGNOSTIC_ONLY",
+              }
+              write_json("SUMMARY.json", summary)
+
+              report = []
+              report.append("# ACIRM R13M N2E R1 Source Attribution and Localization Preflight")
+              report.append("")
+              report.append("Decision: catalog candidate list ready; source attribution is not claimed.")
+              report.append("")
+              report.append(f"Catalog source mode: {catalog_source_mode}.")
+              report.append(f"R9C coordinate: RA={R9C['ra_deg']}, Dec={R9C['dec_deg']}.")
+              report.append(f"4FGL sources within 5 deg analysis ROI: {len(inside5)}.")
+              report.append(f"4FGL sources within 15 deg source-model ROI: {len(source_rows)}.")
+              if nearest:
+                  report.append(f"Nearest catalog source: {nearest['source_name']} / assoc={nearest['assoc']} at {nearest['sep_from_r9c_deg']:.4f} deg.")
+              report.append("")
+              report.append("Interpretation: catalog proximity cannot decide whether the successful 300d/650d residual comes from Cyg X-1, another catalog source, diffuse mismatch, or a broad ROI-level effect. The next stage must run source-resolved or residual-map/TS diagnostics on the successful lags.")
+              (OUT / "N2E_R1_SOURCE_ATTRIBUTION_LOCALIZATION_PREFLIGHT_REPORT.md").write_text("\n".join(report) + "\n", encoding="utf-8")
+
+              final = dict(summary)
+              final.update({
+                  "decision": "N2E_R1_SOURCE_ATTRIBUTION_LOCALIZATION_PREFLIGHT_CATALOG_READY_NO_SCORE",
+                  "next_stage": "ACIRM_R13M_N2F_SUCCESSFUL_LAG_SOURCE_RESOLVED_RESIDUAL_MAP_OR_TS_LOCALIZATION_NO_SCORE",
+                  "timestamp_utc": datetime.now(timezone.utc).isoformat(),
+              })
+              write_json("FINAL_DECISION.json", final)
+              package_outputs()
+          except SystemExit:
+              raise
+          except Exception:
+              (OUT / "EXCEPTION_TRACEBACK.txt").write_text(traceback.format_exc(), encoding="utf-8")
+              final = {
+                  "stage": STAGE,
+                  "decision": "TECHNICAL_STOP_N2E_R1_UNHANDLED_EXCEPTION_NO_SCORE",
+                  "scientific_result": False,
+                  "technical_stop": True,
+                  "claim_ceiling": "NO_SCORE_NOT_PROOF_NOT_DISCOVERY",
+                  "error_tail": traceback.format_exc()[-2000:],
+                  "next_stage": "REPAIR_N2E_R1_FROM_TRACEBACK_NO_SCORE",
+                  "timestamp_utc": datetime.now(timezone.utc).isoformat(),
+              }
+              write_json("FINAL_DECISION.json", final)
+              package_outputs()
+          PY
+
+      - name: Show final decision
+        if: always()
+        shell: bash
+        run: |
+          set +e
+          cat ACIRM_R13M_N2E_R1_CATALOG_CACHE_OR_REDOWNLOAD_PREFLIGHT_NO_SCORE_OUTPUT/FINAL_DECISION.json || true
+          echo ""
+          tail -n 120 ACIRM_R13M_N2E_R1_CATALOG_CACHE_OR_REDOWNLOAD_PREFLIGHT_NO_SCORE_OUTPUT/PROGRESS.log || true
+
+      - name: Upload N2E R1 preflight artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ACIRM_R13M_N2E_R1_CATALOG_CACHE_OR_REDOWNLOAD_PREFLIGHT_RESULTS
+          path: |
+            ACIRM_R13M_N2E_R1_CATALOG_CACHE_OR_REDOWNLOAD_PREFLIGHT_NO_SCORE_RESULTS.zip
+            ACIRM_R13M_N2E_R1_CATALOG_CACHE_OR_REDOWNLOAD_PREFLIGHT_NO_SCORE_RESULTS.zip.sha256.txt
+            ACIRM_R13M_N2E_R1_CATALOG_CACHE_OR_REDOWNLOAD_PREFLIGHT_NO_SCORE_OUTPUT/**
+          retention-days: 14
