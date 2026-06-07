@@ -1,0 +1,392 @@
+name: ACIRM R13M N2F R3E Single Run Photon Aperture Localization
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  photon-inputs:
+    name: Prepare ${{ matrix.target_label }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 130
+    continue-on-error: true
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target_label: photon_w821
+            lag_label: LAG650D
+            phase: post
+            filename: lat_photon_weekly_w821_p305_v001.fits
+            url: https://heasarc.gsfc.nasa.gov/FTP/fermi/data/lat/weekly/photon/lat_photon_weekly_w821_p305_v001.fits
+            min_bytes: 100000000
+            expected_sha256: 8d7e12e51bfd8fcf844bd4132edd963f7826cedca8897c00fe6d805c4d119735
+            cache_path: .acirm_lat_cache_n2f_lag650d_split/photon_w821
+            cache_key: acirm-r13m-n2f-lag650d-split-photon_w821-v1
+          - target_label: photon_w635
+            lag_label: LAG650D
+            phase: pre
+            filename: lat_photon_weekly_w635_p305_v001.fits
+            url: https://heasarc.gsfc.nasa.gov/FTP/fermi/data/lat/weekly/photon/lat_photon_weekly_w635_p305_v001.fits
+            min_bytes: 100000000
+            expected_sha256: a9c828a2f8c722ac1a8030cf4d0aaf6c4b3e7cf2a5da9de6a42f0af2b9eec80b
+            cache_path: .acirm_lat_cache_n2f_lag650d_split/photon_w635
+            cache_key: acirm-r13m-n2f-lag650d-split-photon_w635-v1
+          - target_label: photon_w771
+            lag_label: LAG300D
+            phase: post
+            filename: lat_photon_weekly_w771_p305_v001.fits
+            url: https://heasarc.gsfc.nasa.gov/FTP/fermi/data/lat/weekly/photon/lat_photon_weekly_w771_p305_v001.fits
+            min_bytes: 100000000
+            expected_sha256: 6ed24e7064240f251bec06416eb5f9153473d551e03ce7ac270d6ca87255c7bb
+            cache_path: .acirm_lat_cache_n2b_lag300d
+            cache_key: acirm-r13m-n2f-r3e-lag300d-w771-v1
+          - target_label: photon_w685
+            lag_label: LAG300D
+            phase: pre
+            filename: lat_photon_weekly_w685_p305_v001.fits
+            url: https://heasarc.gsfc.nasa.gov/FTP/fermi/data/lat/weekly/photon/lat_photon_weekly_w685_p305_v001.fits
+            min_bytes: 100000000
+            expected_sha256: 56194daac708d24ae23becc7437b4cfa72c0192ecd84f6880c0652ff1793e8af
+            cache_path: .acirm_lat_cache_n2b_lag300d
+            cache_key: acirm-r13m-n2f-r3e-lag300d-w685-v1
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Restore photon cache
+        uses: actions/cache@v4
+        with:
+          path: ${{ matrix.cache_path }}
+          key: ${{ matrix.cache_key }}
+          restore-keys: |
+            ${{ matrix.cache_key }}
+            acirm-r13m-n2b-lag300d-w685-w771-inputs-r8-
+            acirm-r13m-n2f-lag650d-split-${{ matrix.target_label }}-v1
+
+      - name: Install download tools
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq aria2 curl wget zip unzip
+
+      - name: Ensure one photon FITS is ready
+        shell: bash
+        env:
+          TARGET_LABEL: ${{ matrix.target_label }}
+          LAG_LABEL: ${{ matrix.lag_label }}
+          PHASE: ${{ matrix.phase }}
+          FILENAME: ${{ matrix.filename }}
+          URL: ${{ matrix.url }}
+          MIN_BYTES: ${{ matrix.min_bytes }}
+          EXPECTED_SHA256: ${{ matrix.expected_sha256 }}
+          CACHE_PATH: ${{ matrix.cache_path }}
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import csv, json, hashlib, shutil, subprocess, os, sys, time, traceback
+          from pathlib import Path
+          from datetime import datetime, timezone
+
+          label = os.environ['TARGET_LABEL']
+          lag = os.environ['LAG_LABEL']
+          phase = os.environ['PHASE']
+          filename = os.environ['FILENAME']
+          url = os.environ['URL']
+          min_bytes = int(os.environ['MIN_BYTES'])
+          expected_sha = os.environ['EXPECTED_SHA256'].strip().lower()
+          cache_dir = Path(os.environ['CACHE_PATH'])
+          cache_dir.mkdir(parents=True, exist_ok=True)
+          dest = cache_dir / filename
+          payload = Path('payload') / label
+          payload.mkdir(parents=True, exist_ok=True)
+          out = payload / 'REPORT'
+          out.mkdir(parents=True, exist_ok=True)
+          progress = out / 'PROGRESS.log'
+
+          def log(msg):
+              s = f"[{datetime.now(timezone.utc).isoformat()}] {msg}"
+              print(s, flush=True)
+              with progress.open('a', encoding='utf-8') as f: f.write(s + '\n')
+          def sha256_file(p):
+              h=hashlib.sha256()
+              with open(p,'rb') as f:
+                  for chunk in iter(lambda:f.read(1024*1024), b''):
+                      h.update(chunk)
+              return h.hexdigest()
+          def fits_magic_ok(p):
+              try:
+                  with open(p,'rb') as f: return f.read(80).startswith(b'SIMPLE  =')
+              except Exception: return False
+          def validate(p):
+              p=Path(p)
+              if not p.exists(): return False, {'exists':False,'size_bytes':0,'fits_magic_ok':False,'sha256':'','sha_match':False}
+              size=p.stat().st_size
+              magic=fits_magic_ok(p)
+              sha=sha256_file(p) if size >= min_bytes and magic else ''
+              return bool(size >= min_bytes and magic and sha == expected_sha), {'exists':True,'size_bytes':size,'fits_magic_ok':magic,'sha256':sha,'sha_match':sha == expected_sha}
+          def run_cmd(cmd, timeout, name):
+              try:
+                  p=subprocess.run(cmd, text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=timeout)
+                  txt=p.stdout or ''
+                  (out / name).write_text(txt[-20000:], encoding='utf-8', errors='replace')
+                  return p.returncode, txt[-1000:]
+              except subprocess.TimeoutExpired as e:
+                  txt=e.stdout if isinstance(e.stdout,str) else ''
+                  (out / name).write_text((txt or '')[-20000:]+'\nTIMEOUT\n', encoding='utf-8', errors='replace')
+                  return 124, 'TIMEOUT'
+              except Exception as e:
+                  (out / name).write_text(repr(e), encoding='utf-8')
+                  return 125, repr(e)
+          def write_csv(name, rows, fields):
+              with (out/name).open('w', newline='', encoding='utf-8') as f:
+                  w=csv.DictWriter(f, fieldnames=fields); w.writeheader()
+                  for r in rows: w.writerow({k:r.get(k,'') for k in fields})
+          attempts=[]
+          try:
+              log(f'START prepare {label} {filename}')
+              ok, meta = validate(dest)
+              if ok:
+                  log('cache file is valid')
+              else:
+                  log('cache missing or invalid; starting direct download')
+                  # remove invalid file/partial products, but keep .part for curl resume if present
+                  if dest.exists() and dest.stat().st_size < min_bytes:
+                      try: dest.unlink()
+                      except Exception: pass
+                  # aria2c
+                  cmd=['aria2c','--allow-overwrite=true','--auto-file-renaming=false','--continue=true','--max-tries=10','--retry-wait=20','--timeout=120','--connect-timeout=90','--lowest-speed-limit=1K','--user-agent=ACIRM-R13M-N2F-R3E','-x','4','-s','4','-d',str(dest.parent),'-o',dest.name,url]
+                  code, tail=run_cmd(cmd, 5400, f'{label}_aria2.log')
+                  attempts.append({'method':'aria2c','returncode':code,'tail':tail})
+                  ok, meta=validate(dest)
+                  if not ok:
+                      part=dest.with_suffix(dest.suffix+'.part')
+                      if dest.exists() and not part.exists():
+                          try: dest.rename(part)
+                          except Exception: pass
+                      cmd=['curl','-L','--fail','--connect-timeout','90','--max-time','7200','--retry','12','--retry-delay','20','--retry-max-time','7200','--speed-time','180','--speed-limit','1024','-A','ACIRM-R13M-N2F-R3E','-C','-','-o',str(part),url]
+                      code, tail=run_cmd(cmd, 7600, f'{label}_curl.log')
+                      attempts.append({'method':'curl','returncode':code,'tail':tail})
+                      if code == 0 and part.exists():
+                          try:
+                              if dest.exists(): dest.unlink()
+                              part.rename(dest)
+                          except Exception: pass
+                      ok, meta=validate(dest)
+                  if not ok:
+                      cmd=['wget','-c','--tries=5','--timeout=120','--user-agent=ACIRM-R13M-N2F-R3E','-O',str(dest),url]
+                      code, tail=run_cmd(cmd, 5400, f'{label}_wget.log')
+                      attempts.append({'method':'wget','returncode':code,'tail':tail})
+                      ok, meta=validate(dest)
+              write_csv('DOWNLOAD_ATTEMPTS.csv', attempts, ['method','returncode','tail'])
+              decision = 'N2F_R3E_PHOTON_INPUT_READY_NO_SCORE' if ok else 'TECHNICAL_STOP_N2F_R3E_PHOTON_INPUT_NOT_READY_NO_SCORE'
+              final = {'target_label':label,'lag_label':lag,'phase':phase,'filename':filename,'url':url,'cache_path':str(dest),'decision':decision,'technical_stop':not ok,'scientific_result':False,**meta}
+              (out/'FINAL_DECISION.json').write_text(json.dumps(final, indent=2, sort_keys=True), encoding='utf-8')
+              if ok:
+                  shutil.copy2(dest, payload/filename)
+              # package report for inspection; the large FITS is outside REPORT subdir but inside same artifact
+              log('decision='+decision)
+          except Exception:
+              (out/'EXCEPTION_TRACEBACK.txt').write_text(traceback.format_exc(), encoding='utf-8')
+              final={'target_label':label,'decision':'TECHNICAL_STOP_N2F_R3E_PHOTON_INPUT_EXCEPTION_NO_SCORE','technical_stop':True,'scientific_result':False,'traceback_tail':traceback.format_exc()[-2000:]}
+              (out/'FINAL_DECISION.json').write_text(json.dumps(final, indent=2, sort_keys=True), encoding='utf-8')
+              write_csv('DOWNLOAD_ATTEMPTS.csv', attempts, ['method','returncode','tail'])
+          PY
+
+      - name: Upload photon input artifact for same-run localization
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ACIRM_R13M_N2F_R3E_PHOTON_${{ matrix.target_label }}
+          path: payload/${{ matrix.target_label }}/**
+          retention-days: 1
+
+  aperture-localization:
+    name: Run aperture localization from prepared photons
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    needs: photon-inputs
+    if: always()
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Download prepared photon artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: ACIRM_R13M_N2F_R3E_PHOTON_*
+          merge-multiple: false
+          path: photon_inputs
+
+      - name: Install Python dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m pip install --quiet --upgrade pip
+          python -m pip install --quiet numpy astropy
+
+      - name: Run locked-catalog aperture localization
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import csv, json, math, hashlib, shutil, traceback, gc
+          from pathlib import Path
+          from datetime import datetime, timezone
+          import numpy as np
+          from astropy.io import fits
+
+          STAGE='ACIRM_R13M_N2F_R3E_SINGLE_RUN_PHOTON_APERTURE_LOCALIZATION_NO_SCORE'
+          BASE=Path.cwd(); OUT=BASE/f'{STAGE}_OUTPUT'; OUT.mkdir(exist_ok=True)
+          PROGRESS=OUT/'PROGRESS.log'
+          R9C_RA=299.590315; R9C_DEC=35.201606
+          ENERGY_MIN=1000.0; ENERGY_MAX=1000000.0
+          APERTURES=[0.25,0.5,1.0]
+          RADIAL_BINS=[(0,0.25),(0.25,0.5),(0.5,1.0),(1.0,2.0),(2.0,5.0)]
+          # Locked source list from N2E R1, restricted to <=5 deg plus the exact R9C center.
+          SOURCES=[
+            ('R9C_CYGX1_CENTER','R9C/Cyg X-1 center','target_center',299.590315,35.201606,0.0),
+            ('4FGL J1958.5+3512','Cyg X-1','hmb',299.6343078613281,35.20240020751953,0.03595642763040945),
+            ('4FGL J1950.6+3456','2MASS J19502776+3456224','bcu',297.6642150878906,34.94340133666992,1.5973485808791534),
+            ('4FGL J2004.9+3421','','',301.2484130859375,34.35060119628906,1.6059157889571691),
+            ('4FGL J2004.3+3339','B2 2002+33','unk',301.09600830078125,33.655399322509766,1.9831609576184441),
+            ('4FGL J2005.8+3357','','',301.4739990234375,33.95610046386719,1.9890571175457838),
+            ('4FGL J1948.9+3414','','',297.2261962890625,34.239601135253906,2.1681655108615416),
+            ('4FGL J2009.9+3544','B2 2008+35','bcu',302.48919677734375,35.74599838256836,2.4226443394224186),
+            ('4FGL J1954.4+3252e','CTB 80','SPP',298.6000061035156,32.869998931884766,2.471769439602049),
+            ('4FGL J2002.3+3246','SNR G069.7+01.0','spp',300.5997009277344,32.77880096435547,2.5632321685955604),
+            ('4FGL J1952.9+3252','PSR J1952+3252','PSR',298.247314453125,32.882999420166016,2.5717577827173015),
+            ('4FGL J2013.5+3613','SNR G073.9+00.9','spp',303.3844909667969,36.225399017333984,3.246048161207813),
+            ('4FGL J1959.0+3844','LQAC 299+038','bcu',299.76629638671875,38.73680114746094,3.537987659798902),
+            ('4FGL J1950.2+3822','RX J1950.0+3821','unk',297.56939697265625,38.371700286865234,3.5590918954036876),
+            ('4FGL J1953.5+3841','','',298.3848876953125,38.6880989074707,3.6170398911174417),
+            ('4FGL J2017.3+3525','','',304.3492126464844,35.42259979248047,3.889238843639835),
+            ('4FGL J2015.5+3710','MG2 J201534+3710','FSRQ',303.89239501953125,37.17599868774414,3.993576217978025),
+            ('4FGL J2016.2+3712','VER J2016+372','snr',304.056884765625,37.21310043334961,4.126644299917183),
+            ('4FGL J2017.9+3625','PSR J2017+3625','PSR',304.49090576171875,36.42770004272461,4.158222141614726),
+            ('4FGL J2006.2+3102','PSR J2006+3102','PSR',301.56610107421875,31.044599533081055,4.473921852177352),
+            ('4FGL J1935.4+3547','','',293.86468505859375,35.796199798583984,4.69845561778258),
+            ('4FGL J2021.9+3609','','',305.4862976074219,36.15769958496094,4.882909314033249),
+            ('4FGL J2021.1+3651','PSR J2021+3651','PSR',305.27960205078125,36.85609817504883,4.888469684256179),
+          ]
+          REQUIRED={
+            'LAG300D_post_w771':'lat_photon_weekly_w771_p305_v001.fits',
+            'LAG300D_pre_w685':'lat_photon_weekly_w685_p305_v001.fits',
+            'LAG650D_post_w821':'lat_photon_weekly_w821_p305_v001.fits',
+            'LAG650D_pre_w635':'lat_photon_weekly_w635_p305_v001.fits',
+          }
+          def log(msg):
+              s=f'[{datetime.now(timezone.utc).isoformat()}] {msg}'
+              print(s, flush=True)
+              with PROGRESS.open('a', encoding='utf-8') as f: f.write(s+'\n')
+          def sha256_file(p):
+              h=hashlib.sha256()
+              with open(p,'rb') as f:
+                  for c in iter(lambda:f.read(1024*1024), b''): h.update(c)
+              return h.hexdigest()
+          def fits_magic_ok(p):
+              try:
+                  with open(p,'rb') as f: return f.read(80).startswith(b'SIMPLE  =')
+              except Exception: return False
+          def write_json(name,obj): (OUT/name).write_text(json.dumps(obj, indent=2, sort_keys=True), encoding='utf-8')
+          def write_csv(name, rows, fields):
+              with (OUT/name).open('w', newline='', encoding='utf-8') as f:
+                  w=csv.DictWriter(f, fieldnames=fields); w.writeheader()
+                  for r in rows: w.writerow({k:r.get(k,'') for k in fields})
+          def package(decision, extra=None):
+              obj={'stage':STAGE,'decision':decision,'scientific_result':False,'claim_ceiling':'NO_SCORE_NOT_PROOF_NOT_DISCOVERY','timestamp_utc':datetime.now(timezone.utc).isoformat()}
+              if extra: obj.update(extra)
+              write_json('FINAL_DECISION.json', obj)
+              zipname=f'{STAGE}_RESULTS.zip'; shutil.make_archive(zipname[:-4], 'zip', root_dir='.', base_dir=str(OUT))
+              sha=sha256_file(zipname); Path(zipname+'.sha256.txt').write_text(f'{sha}  {zipname}\n', encoding='utf-8')
+              log('FINAL_DECISION='+decision+' ZIP='+zipname+' SHA256='+sha)
+          def angsep_deg(ra1,dec1,ra2,dec2):
+              ra1=np.deg2rad(ra1); dec1=np.deg2rad(dec1); ra2=np.deg2rad(ra2); dec2=np.deg2rad(dec2)
+              c=np.sin(dec1)*np.sin(dec2)+np.cos(dec1)*np.cos(dec2)*np.cos(ra1-ra2)
+              return np.rad2deg(np.arccos(np.clip(c,-1,1)))
+          def find_event_hdu(hdul):
+              for h in hdul:
+                  if hasattr(h,'columns') and h.columns is not None and h.data is not None:
+                      cols=[str(c).upper() for c in h.columns.names]
+                      if all(x in cols for x in ['RA','DEC','ENERGY']): return h
+              return None
+          def load_events(path):
+              with fits.open(path, memmap=True) as hdul:
+                  h=find_event_hdu(hdul)
+                  if h is None: raise RuntimeError('no RA/DEC/ENERGY event table')
+                  ra=np.asarray(h.data['RA'], dtype=float); dec=np.asarray(h.data['DEC'], dtype=float); en=np.asarray(h.data['ENERGY'], dtype=float)
+                  m=np.isfinite(ra)&np.isfinite(dec)&np.isfinite(en)&(en>=ENERGY_MIN)&(en<=ENERGY_MAX)
+                  return ra[m], dec[m]
+          def count_sources(ra,dec):
+              rows=[]
+              for name,assoc,cls,sra,sdec,sep in SOURCES:
+                  d=angsep_deg(sra,sdec,ra,dec)
+                  for ap in APERTURES:
+                      rows.append({'source_name':name,'assoc':assoc,'class':cls,'ra':sra,'dec':sdec,'sep_from_r9c_deg':sep,'aperture_deg':ap,'count':int(np.sum(d<=ap))})
+              radial=[]; d0=angsep_deg(R9C_RA,R9C_DEC,ra,dec)
+              for lo,hi in RADIAL_BINS:
+                  radial.append({'r_min_deg':lo,'r_max_deg':hi,'count':int(np.sum((d0>=lo)&(d0<hi)))})
+              return rows, radial
+          try:
+              log('START R3E single-run photon aperture localization')
+              paths={}; manifest=[]; missing=[]
+              for label,fn in REQUIRED.items():
+                  hits=list(Path('photon_inputs').rglob(fn))
+                  p=hits[0] if hits else None
+                  ok=bool(p and p.exists() and fits_magic_ok(p))
+                  manifest.append({'label':label,'filename':fn,'found':bool(p),'path':str(p) if p else '', 'fits_magic_ok':ok, 'size_bytes':p.stat().st_size if p and p.exists() else 0, 'sha256':sha256_file(p) if ok else ''})
+                  if ok: paths[label]=p
+                  else: missing.append(label)
+              write_csv('INPUT_PHOTON_MANIFEST.csv', manifest, ['label','filename','found','path','fits_magic_ok','size_bytes','sha256'])
+              write_json('LOCKED_SOURCE_LIST_FROM_N2E_R1.json', {'r9c_ra':R9C_RA,'r9c_dec':R9C_DEC,'source_count_including_center':len(SOURCES),'sources':[{'source_name':x[0],'assoc':x[1],'class':x[2],'ra':x[3],'dec':x[4],'sep_from_r9c_deg':x[5]} for x in SOURCES]})
+              if missing:
+                  package('TECHNICAL_STOP_N2F_R3E_REQUIRED_PHOTON_INPUTS_MISSING_NO_SCORE', {'technical_stop':True,'missing_inputs':missing})
+                  raise SystemExit(0)
+              all_counts=[]; all_rad=[]
+              for lag,postlab,prelab in [('LAG300D','LAG300D_post_w771','LAG300D_pre_w685'),('LAG650D','LAG650D_post_w821','LAG650D_pre_w635')]:
+                  log('loading post '+lag); pra,pdec=load_events(paths[postlab]); post_counts,post_rad=count_sources(pra,pdec); del pra,pdec; gc.collect()
+                  log('loading pre '+lag); rra,rdec=load_events(paths[prelab]); pre_counts,pre_rad=count_sources(rra,rdec); del rra,rdec; gc.collect()
+                  bypre={(r['source_name'],r['aperture_deg']):r for r in pre_counts}
+                  for pr in post_counts:
+                      rr=bypre.get((pr['source_name'],pr['aperture_deg']), {'count':0})
+                      row={k:pr[k] for k in ['source_name','assoc','class','ra','dec','sep_from_r9c_deg','aperture_deg']}
+                      row.update({'lag_label':lag,'post_count':pr['count'],'pre_count':rr['count'],'post_minus_pre_count':pr['count']-rr['count']})
+                      all_counts.append(row)
+                  for a,b in zip(post_rad,pre_rad):
+                      all_rad.append({'lag_label':lag,'r_min_deg':a['r_min_deg'],'r_max_deg':a['r_max_deg'],'post_count':a['count'],'pre_count':b['count'],'post_minus_pre_count':a['count']-b['count']})
+              count_fields=['lag_label','source_name','assoc','class','ra','dec','sep_from_r9c_deg','aperture_deg','post_count','pre_count','post_minus_pre_count']
+              write_csv('APERTURE_COUNTS_LOCKED_N2E_SOURCES.csv', all_counts, count_fields)
+              write_csv('RADIAL_BINS_AROUND_R9C.csv', all_rad, ['lag_label','r_min_deg','r_max_deg','post_count','pre_count','post_minus_pre_count'])
+              rank_rows=[]
+              for lag in ['LAG300D','LAG650D']:
+                  for ap in APERTURES:
+                      subset=sorted([r for r in all_counts if r['lag_label']==lag and abs(r['aperture_deg']-ap)<1e-9], key=lambda r:r['post_minus_pre_count'], reverse=True)
+                      for i,r in enumerate(subset,1):
+                          rank_rows.append({'lag_label':lag,'aperture_deg':ap,'rank_descending':i,'source_name':r['source_name'],'assoc':r['assoc'],'class':r['class'],'sep_from_r9c_deg':r['sep_from_r9c_deg'],'post_minus_pre_count':r['post_minus_pre_count'],'post_count':r['post_count'],'pre_count':r['pre_count']})
+              write_csv('APERTURE_SOURCE_RANKING_BY_LAG.csv', rank_rows, ['lag_label','aperture_deg','rank_descending','source_name','assoc','class','sep_from_r9c_deg','post_minus_pre_count','post_count','pre_count'])
+              focus=[r for r in rank_rows if r['source_name'] in ['R9C_CYGX1_CENTER','4FGL J1958.5+3512']]
+              write_csv('R9C_CYGX1_APERTURE_SUMMARY.csv', focus, ['lag_label','aperture_deg','rank_descending','source_name','assoc','class','sep_from_r9c_deg','post_minus_pre_count','post_count','pre_count'])
+              summary={'technical_stop':False,'mode':'single_run_parallel_photon_artifacts_then_locked_catalog_aperture_counts','source_list':'locked_from_N2E_R1_no_catalog_download','aperture_rows':len(all_counts),'radial_rows':len(all_rad),'interpretation_limit':'Photon count aperture localization only; no exposure correction, no Fermipy, no source attribution proof.'}
+              write_json('SUMMARY.json', summary)
+              package('N2F_R3E_SINGLE_RUN_PHOTON_APERTURE_LOCALIZATION_COMPLETED_NO_SCORE', summary)
+          except SystemExit: raise
+          except Exception:
+              (OUT/'EXCEPTION_TRACEBACK.txt').write_text(traceback.format_exc(), encoding='utf-8')
+              package('TECHNICAL_STOP_N2F_R3E_EXCEPTION_NO_SCORE', {'technical_stop':True,'traceback_tail':traceback.format_exc()[-3000:]})
+          PY
+
+      - name: Upload final N2F R3E result artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ACIRM_R13M_N2F_R3E_SINGLE_RUN_PHOTON_APERTURE_LOCALIZATION_RESULTS
+          path: |
+            ACIRM_R13M_N2F_R3E_SINGLE_RUN_PHOTON_APERTURE_LOCALIZATION_NO_SCORE_RESULTS.zip
+            ACIRM_R13M_N2F_R3E_SINGLE_RUN_PHOTON_APERTURE_LOCALIZATION_NO_SCORE_RESULTS.zip.sha256.txt
+            ACIRM_R13M_N2F_R3E_SINGLE_RUN_PHOTON_APERTURE_LOCALIZATION_NO_SCORE_OUTPUT/**
+          retention-days: 14
