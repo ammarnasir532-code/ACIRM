@@ -1,0 +1,316 @@
+name: ACIRM R13 Quick Support Test V2
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - 'ACIRM_R13M_R9C_R12_MASTER_REVIEW_BUNDLE_20260608.zip'
+      - '.github/workflows/acirm_r13_quick_support_v2.yml'
+
+permissions:
+  contents: read
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: 'true'
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  quick-support-test-v2:
+    name: Run ACIRM R13 no-new-data support test V2
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Run ACIRM R13 no-new-data support test V2
+        id: run_test
+        continue-on-error: true
+        run: |
+          set -u
+          python - <<'PY'
+          import csv, hashlib, io, json, math, pathlib, sys, zipfile
+          from datetime import datetime, timezone
+
+          INPUT = pathlib.Path('ACIRM_R13M_R9C_R12_MASTER_REVIEW_BUNDLE_20260608.zip')
+          EXPECTED_SHA = 'cff2d1a83bf35b9e365e7676b071680dfa69d4741edcd2a452669b5be350870d'
+          OUTDIR = pathlib.Path('acirm_r13_quick_support_output')
+          OUTDIR.mkdir(parents=True, exist_ok=True)
+          RESULT_ZIP = pathlib.Path('ACIRM_R13M_R9C_R13_QUICK_SUPPORT_TEST_RESULTS.zip')
+          RESULT_SHA = pathlib.Path(str(RESULT_ZIP) + '.sha256.txt')
+
+          checks = []
+          extracted = {}
+
+          def add_check(name, passed, detail=''):
+              checks.append({'check': str(name), 'passed': bool(passed), 'detail': str(detail)[:5000]})
+
+          def sha256_bytes(b): return hashlib.sha256(b).hexdigest()
+          def sha256_file(p):
+              h = hashlib.sha256()
+              with open(p, 'rb') as f:
+                  for chunk in iter(lambda: f.read(1024 * 1024), b''):
+                      h.update(chunk)
+              return h.hexdigest()
+
+          def norm_text(s):
+              return str(s).replace(' ', '').replace('\n','').replace('\t','').lower()
+
+          def read_json_from_zip(zf, name):
+              return json.loads(zf.read(name).decode('utf-8'))
+
+          def get_first_json(zf, suffix):
+              for n in zf.namelist():
+                  if n.endswith(suffix):
+                      return n, read_json_from_zip(zf, n)
+              return None, None
+
+          def verify_manifest(zf, label):
+              names = set(zf.namelist())
+              if 'MANIFEST_SHA256.json' not in names:
+                  add_check(f'{label}:manifest_present', False, 'missing MANIFEST_SHA256.json')
+                  return
+              try:
+                  m = read_json_from_zip(zf, 'MANIFEST_SHA256.json')
+                  items = m.get('files', m) if isinstance(m, dict) else {}
+                  if not isinstance(items, dict):
+                      add_check(f'{label}:manifest_format_dict', False, type(items).__name__)
+                      return
+                  bad, checked = [], 0
+                  for path, expected in items.items():
+                      # Do not require a manifest to self-hash itself.
+                      if pathlib.PurePosixPath(path).name == 'MANIFEST_SHA256.json':
+                          continue
+                      if path not in names:
+                          bad.append((path, 'missing'))
+                          continue
+                      got = sha256_bytes(zf.read(path))
+                      checked += 1
+                      expected_sha = expected.get('sha256') if isinstance(expected, dict) else expected
+                      if got != expected_sha:
+                          bad.append((path, 'sha_mismatch'))
+                  add_check(f'{label}:manifest_entries_checked', checked > 0, checked)
+                  add_check(f'{label}:manifest_all_match', len(bad) == 0, bad[:10])
+              except Exception as e:
+                  add_check(f'{label}:manifest_exception', False, repr(e))
+
+          actual_sha = None
+          z = None
+          try:
+              add_check('input_bundle_exists', INPUT.exists(), str(INPUT))
+              if INPUT.exists():
+                  actual_sha = sha256_file(INPUT)
+                  add_check('input_bundle_sha256_matches_expected', actual_sha == EXPECTED_SHA, actual_sha)
+                  z = zipfile.ZipFile(INPUT, 'r')
+                  names = z.namelist()
+                  name_set = set(names)
+
+                  required_top = [
+                      '00_START_HERE_R12_MASTER_REVIEW_AR.md',
+                      'R12_MASTER_STATUS.json',
+                      'R12_THEORY_AND_RESULT_BRIEF_AR.md',
+                      'R12_EXTERNAL_VERIFIER_INSTRUCTIONS.md',
+                      'R12_CANONICAL_INCLUDED_FILE_SET.csv',
+                      'R12_EXTERNAL_DEPENDENCIES_NOT_EMBEDDED.csv',
+                      'MANIFEST_SHA256.json',
+                  ]
+                  for n in required_top:
+                      add_check('r12_required_file_present:' + n, n in name_set, n)
+                  verify_manifest(z, 'r12')
+
+                  canonical_expected = [
+                      'ACIRM_R13M_R9C_THEORY_R11_FINAL_REVIEW_READY_BRIDGE_PACKAGE.zip',
+                      'ACIRM_R13M_FINAL_COMPREHENSIVE_AUDIT_R7_CLOSURE_20260608.zip',
+                      'ACIRM_R13M_N2K_R4_VERSION_LABEL_NORMALIZATION_NO_ATTRIBUTION_RESULTS.zip',
+                      'ACIRM_R13M_N2L_R4_VERSION_LABEL_NORMALIZATION_OFFICIAL_N1_CONTROL_COMPARISON_NO_SCORE_RESULTS.zip',
+                      'ACIRM_R13M_EXTERNAL_AUDIT_STARTER_PACKAGE_20260608.zip',
+                      'ACIRM_R13_SYSTEMATICS_AUDITED_STRONG_OPERATIONAL_SUPPORT_BRANCH_COMPLETE_HANDOFF_PACKAGE.zip',
+                      'ACIRM_R13M_N1_OFFICIAL_CONTROL_COORDS_MANIFEST_EXTRACTED.zip',
+                      'ACIRM_R13M_NEW_CHAT_HANDOFF_MEMORY_20260608_AR.txt',
+                      'ACIRM_MULTI_GRAIN_RESONANCE_FINAL_WORKING_LAW_R9C.tex',
+                  ]
+                  for base in canonical_expected:
+                      present = any(pathlib.PurePosixPath(n).name == base for n in names)
+                      add_check('canonical_payload_present:' + base, present, base)
+
+                  # Recompute R9C frequency from the operational law.
+                  G = 6.67430e-11
+                  c = 299792458.0
+                  M_sun = 1.98847e30
+                  f_raw = (c**3 * math.log(2.0)) / (8.0 * math.pi * G * (5.0 * M_sun))
+                  f_r9c = 2.0 * 1.0 * f_raw
+                  expected_f = 2239.664337045391
+                  add_check('r9c_frequency_recomputed_matches_locked_value', abs(f_r9c - expected_f) < 1e-6, f'{f_r9c:.12f}')
+
+                  # Parse nested canonical N2K_R4 and N2L_R4 directly rather than relying on prose phrase matching.
+                  nested_map = {}
+                  for n in names:
+                      b = pathlib.PurePosixPath(n).name
+                      if b in canonical_expected and b.endswith('.zip'):
+                          nested_map[b] = n
+
+                  # N2K_R4 source-proximity checks.
+                  n2k_name = 'ACIRM_R13M_N2K_R4_VERSION_LABEL_NORMALIZATION_NO_ATTRIBUTION_RESULTS.zip'
+                  if n2k_name in nested_map:
+                      nz = zipfile.ZipFile(io.BytesIO(z.read(nested_map[n2k_name])), 'r')
+                      verify_manifest(nz, 'n2k_r4')
+                      _, fd = get_first_json(nz, 'FINAL_DECISION.json')
+                      _, sm = get_first_json(nz, 'SUMMARY.json')
+                      decision = (fd or {}).get('decision', '')
+                      metrics = (sm or {}).get('precise_coordinate_metrics', {})
+                      counts = (sm or {}).get('observed_counts', {})
+                      extracted['n2k_decision'] = decision
+                      extracted['n2k_metrics'] = metrics
+                      extracted['n2k_counts'] = counts
+                      add_check('n2k_r4_decision_is_not_attribution', 'NOT_ATTRIBUTION' in decision or 'NOT_ATTRIBUTION' in json.dumps(fd), decision)
+                      add_check('n2k_r4_post_count_4', counts.get('post_photons') == 4, counts)
+                      add_check('n2k_r4_pre_count_0', counts.get('pre_photons') == 0, counts)
+                      add_check('n2k_r4_unique_nearest_sources_4', metrics.get('unique_nearest_4FGL_sources_among_4_photons') == 4, metrics)
+                      add_check('n2k_r4_max_shared_nearest_source_1', metrics.get('max_photons_sharing_same_nearest_4FGL_source') == 1, metrics)
+                  else:
+                      add_check('n2k_r4_nested_zip_present', False, n2k_name)
+
+                  # N2L_R4 official N1-control checks.
+                  n2l_name = 'ACIRM_R13M_N2L_R4_VERSION_LABEL_NORMALIZATION_OFFICIAL_N1_CONTROL_COMPARISON_NO_SCORE_RESULTS.zip'
+                  if n2l_name in nested_map:
+                      nz = zipfile.ZipFile(io.BytesIO(z.read(nested_map[n2l_name])), 'r')
+                      verify_manifest(nz, 'n2l_r4')
+                      _, fd = get_first_json(nz, 'FINAL_DECISION.json')
+                      _, sm = get_first_json(nz, 'SUMMARY.json')
+                      decision = (fd or {}).get('decision', '')
+                      res = (fd or {}).get('correct_numeric_result', {}) or (sm or {}).get('counts_summary', {})
+                      extracted['n2l_decision'] = decision
+                      extracted['n2l_counts'] = res
+                      add_check('n2l_r4_decision_positive_but_not_unique', 'POSITIVE_BUT_NOT_UNIQUE' in decision, decision)
+                      add_check('n2l_r4_r9c_delta_4', res.get('r9c_delta') == 4, res)
+                      add_check('n2l_r4_control_ra240_delta_5', res.get('max_official_control_region_id') == 'NOGATE_RA240' and res.get('max_official_control_delta') == 5, res)
+                      add_check('n2l_r4_r9c_rank_2_of_10', res.get('r9c_rank_raw_delta_desc_among_target_plus_controls') == 2, res)
+                      add_check('n2l_r4_controls_ge_r9c_1', res.get('controls_ge_r9c_raw_delta') == 1, res)
+                  else:
+                      add_check('n2l_r4_nested_zip_present', False, n2l_name)
+
+                  # Broad Fermi and ring-response checks from R12 prose/JSON; flexible notation.
+                  joined = ''
+                  for doc in ['R12_MASTER_STATUS.json','R12_THEORY_AND_RESULT_BRIEF_AR.md','R12_EXTERNAL_VERIFIER_INSTRUCTIONS.md']:
+                      if doc in name_set:
+                          joined += z.read(doc).decode('utf-8', errors='replace') + '\n'
+                  normalized = norm_text(joined)
+                  phrase_options = {
+                      'broad_lag650_residual_21p718969': ['21.718969', '+21.718969'],
+                      'ring_post_712': ['post=712','post:712','post712','post"712','post 712'],
+                      'ring_pre_412': ['pre=412','pre:412','pre412','pre"412','pre 412'],
+                      'ring_delta_300': ['delta=+300','delta:+300','delta300','+300'],
+                      'claim_not_discovery': ['not_discovery','notdiscovery'],
+                      'claim_not_attribution': ['not_attribution','notattribution'],
+                  }
+                  for cname, opts in phrase_options.items():
+                      ok = any(norm_text(o) in normalized for o in opts)
+                      add_check('r12_locked_statement_present:' + cname, ok, opts)
+              else:
+                  add_check('input_bundle_opened', False, 'input missing')
+          except Exception as e:
+              add_check('unexpected_exception', False, repr(e))
+
+          failed = [c for c in checks if not c['passed']]
+          final_decision = 'PASS_QUICK_INTERNAL_SUPPORT_SMOKE_TEST_NO_NEW_DATA_NO_SCORE' if not failed else 'FAIL_QUICK_INTERNAL_SUPPORT_SMOKE_TEST_REVIEW_REQUIRED'
+          result = {
+              'created_utc': datetime.now(timezone.utc).isoformat(),
+              'input_bundle': str(INPUT),
+              'input_sha256': actual_sha,
+              'expected_sha256': EXPECTED_SHA,
+              'final_decision': final_decision,
+              'failed_required_checks': len(failed),
+              'claim_ceiling': [
+                  'INTERNAL_OPERATIONAL_ESTABLISHMENT',
+                  'NO_NEW_DATA',
+                  'NO_SCORE',
+                  'NOT_EXTERNAL_PROOF',
+                  'NOT_DISCOVERY',
+                  'NOT_ATTRIBUTION',
+                  'NOT_CONFIRMED_MATERIAL_OR_PARTICLE_PRODUCTION',
+              ],
+              'checks': checks,
+              'extracted_canonical_values': extracted,
+              'locked_scientific_summary': {
+                  'R9C_status': 'internally_operationally_established_within_locked_ACIRM_conditions',
+                  'Fermi_LAT_lag650_broad_residual': 21.718969,
+                  'ring_2_to_5_deg_post_pre_delta': 300,
+                  'narrow_30_100_GeV_R9C_delta': 4,
+                  'narrow_30_100_GeV_NOGATE_RA240_delta': 5,
+                  'narrow_tail_interpretation': 'R9C positive but not unique under official N1 controls',
+              }
+          }
+
+          (OUTDIR / 'R13_QUICK_SUPPORT_TEST_RESULT.json').write_text(json.dumps(result, indent=2, ensure_ascii=False), encoding='utf-8')
+          with open(OUTDIR / 'R13_QUICK_SUPPORT_CHECKS.csv', 'w', newline='', encoding='utf-8') as f:
+              w = csv.DictWriter(f, fieldnames=['check','passed','detail'])
+              w.writeheader(); w.writerows(checks)
+          report = [
+              '# ACIRM R13 Quick Support Test V2', '',
+              f'Final decision: `{final_decision}`',
+              f'Input SHA256: `{actual_sha}`',
+              f'Failed checks: {len(failed)}', '',
+              'Claim ceiling: NO_NEW_DATA / NO_SCORE / NOT_EXTERNAL_PROOF / NOT_DISCOVERY / NOT_ATTRIBUTION.',
+              '', '## Failed checks preview',
+          ]
+          if failed:
+              report += [f"- {c['check']}: {c['detail']}" for c in failed[:50]]
+          else:
+              report += ['None.']
+          (OUTDIR / 'R13_QUICK_SUPPORT_TEST_REPORT.md').write_text('\n'.join(report), encoding='utf-8')
+
+          with zipfile.ZipFile(RESULT_ZIP, 'w', compression=zipfile.ZIP_DEFLATED) as zout:
+              for p in sorted(OUTDIR.iterdir()):
+                  zout.write(p, arcname='acirm_r13_quick_support_output/' + p.name)
+          result_sha = sha256_file(RESULT_ZIP)
+          RESULT_SHA.write_text(result_sha + '  ' + RESULT_ZIP.name + '\n', encoding='utf-8')
+
+          print('FINAL_DECISION=' + final_decision)
+          print('FAILED_REQUIRED_CHECKS=' + str(len(failed)))
+          print('RESULT_ZIP_SHA256=' + result_sha)
+          if failed:
+              print('FAILED_CHECKS_PREVIEW=')
+              for c in failed[:20]:
+                  print('-', c['check'], '=>', c['detail'])
+              sys.exit(1)
+          PY
+
+      - name: Upload quick support result artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ACIRM_R13_QUICK_SUPPORT_TEST_RESULTS_V2
+          path: |
+            ACIRM_R13M_R9C_R13_QUICK_SUPPORT_TEST_RESULTS.zip
+            ACIRM_R13M_R9C_R13_QUICK_SUPPORT_TEST_RESULTS.zip.sha256.txt
+            acirm_r13_quick_support_output/R13_QUICK_SUPPORT_TEST_RESULT.json
+            acirm_r13_quick_support_output/R13_QUICK_SUPPORT_CHECKS.csv
+            acirm_r13_quick_support_output/R13_QUICK_SUPPORT_TEST_REPORT.md
+          if-no-files-found: warn
+          retention-days: 30
+
+      - name: Fail workflow if quick support test failed
+        if: always()
+        run: |
+          set -euo pipefail
+          if [ ! -f acirm_r13_quick_support_output/R13_QUICK_SUPPORT_TEST_RESULT.json ]; then
+            echo 'No result JSON was produced.'
+            exit 1
+          fi
+          python - <<'PY'
+          import json, sys
+          p='acirm_r13_quick_support_output/R13_QUICK_SUPPORT_TEST_RESULT.json'
+          s=json.load(open(p, encoding='utf-8'))
+          print('FINAL_DECISION=' + str(s.get('final_decision')))
+          print('FAILED_REQUIRED_CHECKS=' + str(s.get('failed_required_checks')))
+          sys.exit(0 if s.get('failed_required_checks') == 0 else 1)
+          PY
