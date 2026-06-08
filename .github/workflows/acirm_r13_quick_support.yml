@@ -1,0 +1,243 @@
+name: ACIRM R13 Quick Support Test
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - 'ACIRM_R13M_R9C_R12_MASTER_REVIEW_BUNDLE_20260608.zip'
+      - '.github/workflows/acirm_r13_quick_support.yml'
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  quick-support-test:
+    name: Run ACIRM R13 no-new-data support test
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Run self-contained ACIRM R13 quick support test
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import csv
+          import hashlib
+          import json
+          import math
+          import pathlib
+          import zipfile
+          from datetime import datetime, timezone
+
+          INPUT = pathlib.Path('ACIRM_R13M_R9C_R12_MASTER_REVIEW_BUNDLE_20260608.zip')
+          EXPECTED_SHA = 'cff2d1a83bf35b9e365e7676b071680dfa69d4741edcd2a452669b5be350870d'
+          OUTDIR = pathlib.Path('acirm_r13_quick_support_output')
+          OUTDIR.mkdir(exist_ok=True)
+
+          checks = []
+          def add_check(name, passed, detail=''):
+              checks.append({'check': name, 'passed': bool(passed), 'detail': str(detail)})
+
+          def sha256_bytes(b):
+              return hashlib.sha256(b).hexdigest()
+
+          def sha256_file(p):
+              h = hashlib.sha256()
+              with open(p, 'rb') as f:
+                  for chunk in iter(lambda: f.read(1024 * 1024), b''):
+                      h.update(chunk)
+              return h.hexdigest()
+
+          # Required input.
+          add_check('input_bundle_exists', INPUT.exists(), INPUT)
+          if not INPUT.exists():
+              raise SystemExit('Missing required input: ' + str(INPUT))
+
+          actual_sha = sha256_file(INPUT)
+          add_check('input_bundle_sha256_matches_expected', actual_sha == EXPECTED_SHA, actual_sha)
+
+          z = zipfile.ZipFile(INPUT, 'r')
+          names = z.namelist()
+          name_set = set(names)
+
+          required_top = [
+              '00_START_HERE_R12_MASTER_REVIEW_AR.md',
+              'R12_MASTER_STATUS.json',
+              'R12_THEORY_AND_RESULT_BRIEF_AR.md',
+              'R12_EXTERNAL_VERIFIER_INSTRUCTIONS.md',
+              'R12_CANONICAL_INCLUDED_FILE_SET.csv',
+              'R12_EXTERNAL_DEPENDENCIES_NOT_EMBEDDED.csv',
+              'MANIFEST_SHA256.json',
+          ]
+          for n in required_top:
+              add_check('r12_required_file_present:' + n, n in name_set, n)
+
+          # Manifest verification.
+          manifest_ok = False
+          if 'MANIFEST_SHA256.json' in name_set:
+              try:
+                  manifest = json.loads(z.read('MANIFEST_SHA256.json').decode('utf-8'))
+                  if isinstance(manifest, dict):
+                      items = manifest.get('files', manifest)
+                      if isinstance(items, dict):
+                          bad = []
+                          checked = 0
+                          for path, expected in items.items():
+                              # Avoid self-hash instability.
+                              if pathlib.PurePosixPath(path).name == 'MANIFEST_SHA256.json':
+                                  continue
+                              if path not in name_set:
+                                  bad.append((path, 'missing'))
+                                  continue
+                              got = sha256_bytes(z.read(path))
+                              checked += 1
+                              if got != expected:
+                                  bad.append((path, 'sha_mismatch'))
+                          manifest_ok = (len(bad) == 0 and checked > 0)
+                          add_check('r12_manifest_entries_checked', checked > 0, checked)
+                          add_check('r12_manifest_sha256_all_match', len(bad) == 0, bad[:10])
+                      else:
+                          add_check('r12_manifest_format_supported', False, 'files is not dict')
+                  else:
+                      add_check('r12_manifest_format_supported', False, 'manifest root is not dict')
+              except Exception as e:
+                  add_check('r12_manifest_parse_error', False, repr(e))
+          else:
+              add_check('r12_manifest_present', False, 'MANIFEST_SHA256.json missing')
+
+          canonical_expected = [
+              'ACIRM_R13M_R9C_THEORY_R11_FINAL_REVIEW_READY_BRIDGE_PACKAGE.zip',
+              'ACIRM_R13M_FINAL_COMPREHENSIVE_AUDIT_R7_CLOSURE_20260608.zip',
+              'ACIRM_R13M_N2K_R4_VERSION_LABEL_NORMALIZATION_NO_ATTRIBUTION_RESULTS.zip',
+              'ACIRM_R13M_N2L_R4_VERSION_LABEL_NORMALIZATION_OFFICIAL_N1_CONTROL_COMPARISON_NO_SCORE_RESULTS.zip',
+              'ACIRM_R13M_EXTERNAL_AUDIT_STARTER_PACKAGE_20260608.zip',
+              'ACIRM_R13_SYSTEMATICS_AUDITED_STRONG_OPERATIONAL_SUPPORT_BRANCH_COMPLETE_HANDOFF_PACKAGE.zip',
+              'ACIRM_R13M_N1_OFFICIAL_CONTROL_COORDS_MANIFEST_EXTRACTED.zip',
+              'ACIRM_R13M_NEW_CHAT_HANDOFF_MEMORY_20260608_AR.txt',
+              'ACIRM_MULTI_GRAIN_RESONANCE_FINAL_WORKING_LAW_R9C.tex',
+          ]
+          for base in canonical_expected:
+              present = any(pathlib.PurePosixPath(n).name == base for n in names)
+              add_check('canonical_payload_present:' + base, present, base)
+
+          # Theory numeric check: recompute R9C frequency.
+          G = 6.67430e-11
+          c = 299792458.0
+          M_sun = 1.98847e30
+          M_eff = 5.0 * M_sun
+          k = 2.0
+          chi_alpha = 1.0
+          f_raw = (c**3 * math.log(2.0)) / (8.0 * math.pi * G * M_eff)
+          f_r9c = k * chi_alpha * f_raw
+          expected_f = 2239.664337045391
+          add_check('r9c_frequency_recomputed_matches_locked_value', abs(f_r9c - expected_f) < 1e-6, f'{f_r9c:.12f}')
+
+          # Locked result statement checks from R12 docs.
+          joined_text = ''
+          for doc in ['R12_MASTER_STATUS.json', 'R12_THEORY_AND_RESULT_BRIEF_AR.md', 'R12_EXTERNAL_VERIFIER_INSTRUCTIONS.md']:
+              if doc in name_set:
+                  try:
+                      joined_text += z.read(doc).decode('utf-8', errors='replace') + '\n'
+                  except Exception:
+                      pass
+          required_phrases = [
+              '+21.718969',
+              'post 712',
+              'pre 412',
+              '+300',
+              '+4',
+              '+5',
+              'NOT_DISCOVERY',
+              'NOT_ATTRIBUTION',
+          ]
+          for phrase in required_phrases:
+              add_check('locked_phrase_present:' + phrase, phrase in joined_text, phrase)
+
+          failed = [c for c in checks if not c['passed']]
+          final_decision = 'PASS_QUICK_INTERNAL_SUPPORT_SMOKE_TEST_NO_NEW_DATA_NO_SCORE' if not failed else 'FAIL_QUICK_INTERNAL_SUPPORT_SMOKE_TEST_REVIEW_REQUIRED'
+
+          result = {
+              'created_utc': datetime.now(timezone.utc).isoformat(),
+              'input_bundle': str(INPUT),
+              'input_sha256': actual_sha,
+              'expected_sha256': EXPECTED_SHA,
+              'final_decision': final_decision,
+              'failed_required_checks': len(failed),
+              'claim_ceiling': [
+                  'INTERNAL_OPERATIONAL_ESTABLISHMENT',
+                  'NO_NEW_DATA',
+                  'NO_SCORE',
+                  'NOT_EXTERNAL_PROOF',
+                  'NOT_DISCOVERY',
+                  'NOT_ATTRIBUTION',
+                  'NOT_CONFIRMED_MATERIAL_OR_PARTICLE_PRODUCTION',
+              ],
+              'checks': checks,
+              'locked_scientific_summary': {
+                  'R9C_status': 'internally_operationally_established_within_locked_ACIRM_conditions',
+                  'Fermi_LAT_lag650_broad_residual': 21.718969,
+                  'ring_2_to_5_deg_post_pre_delta': 300,
+                  'narrow_30_100_GeV_R9C_delta': 4,
+                  'narrow_30_100_GeV_NOGATE_RA240_delta': 5,
+                  'narrow_tail_interpretation': 'R9C positive but not unique under official N1 controls',
+              }
+          }
+
+          (OUTDIR / 'R13_QUICK_SUPPORT_TEST_RESULT.json').write_text(json.dumps(result, indent=2, ensure_ascii=False), encoding='utf-8')
+          with open(OUTDIR / 'R13_QUICK_SUPPORT_CHECKS.csv', 'w', newline='', encoding='utf-8') as f:
+              w = csv.DictWriter(f, fieldnames=['check', 'passed', 'detail'])
+              w.writeheader()
+              w.writerows(checks)
+          report = [
+              '# ACIRM R13 Quick Support Test',
+              '',
+              f'Final decision: `{final_decision}`',
+              f'Input SHA256: `{actual_sha}`',
+              f'Failed checks: {len(failed)}',
+              '',
+              'Claim ceiling: NO_NEW_DATA / NO_SCORE / NOT_EXTERNAL_PROOF / NOT_DISCOVERY / NOT_ATTRIBUTION.',
+          ]
+          (OUTDIR / 'R13_QUICK_SUPPORT_TEST_REPORT.md').write_text('\n'.join(report), encoding='utf-8')
+
+          result_zip = pathlib.Path('ACIRM_R13M_R9C_R13_QUICK_SUPPORT_TEST_RESULTS.zip')
+          with zipfile.ZipFile(result_zip, 'w', compression=zipfile.ZIP_DEFLATED) as zout:
+              for p in OUTDIR.iterdir():
+                  zout.write(p, arcname='acirm_r13_quick_support_output/' + p.name)
+          result_sha = sha256_file(result_zip)
+          pathlib.Path(str(result_zip) + '.sha256.txt').write_text(result_sha + '  ' + result_zip.name + '\n', encoding='utf-8')
+
+          print('FINAL_DECISION=' + final_decision)
+          print('FAILED_REQUIRED_CHECKS=' + str(len(failed)))
+          print('RESULT_ZIP_SHA256=' + result_sha)
+          if failed:
+              print('FAILED_CHECKS_PREVIEW=')
+              for c in failed[:20]:
+                  print('-', c['check'], '=>', c['detail'])
+              raise SystemExit(1)
+          PY
+
+      - name: Upload quick support result artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ACIRM_R13_QUICK_SUPPORT_TEST_RESULTS
+          path: |
+            ACIRM_R13M_R9C_R13_QUICK_SUPPORT_TEST_RESULTS.zip
+            ACIRM_R13M_R9C_R13_QUICK_SUPPORT_TEST_RESULTS.zip.sha256.txt
+            acirm_r13_quick_support_output/R13_QUICK_SUPPORT_TEST_RESULT.json
+            acirm_r13_quick_support_output/R13_QUICK_SUPPORT_CHECKS.csv
+            acirm_r13_quick_support_output/R13_QUICK_SUPPORT_TEST_REPORT.md
+          if-no-files-found: error
+          retention-days: 30
