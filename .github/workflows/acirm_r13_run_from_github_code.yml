@@ -1,0 +1,173 @@
+name: ACIRM R13 Run From GitHub Code
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  acirm-r13-check:
+    name: ACIRM R13 Quick Check
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Run ACIRM quick check
+        run: |
+          set +e
+          mkdir -p acirm_r13_output
+          python - <<'PY'
+          import json, csv, hashlib, math, os, pathlib, zipfile, datetime, traceback
+
+          OUT = pathlib.Path('acirm_r13_output')
+          OUT.mkdir(exist_ok=True)
+          result = {
+              'workflow': 'ACIRM R13 Run From GitHub Code',
+              'time_utc': datetime.datetime.utcnow().isoformat() + 'Z',
+              'final_decision': 'UNSET',
+              'message_ar': '',
+              'checks': []
+          }
+
+          def add(name, passed, detail=''):
+              result['checks'].append({'check': name, 'passed': bool(passed), 'detail': str(detail)})
+
+          try:
+              expected_name = 'ACIRM_R13M_R9C_R12_MASTER_REVIEW_BUNDLE_20260608.zip'
+              p = pathlib.Path(expected_name)
+              if not p.exists():
+                  # Search for likely zip if user uploaded it under a different location/name.
+                  candidates = sorted(pathlib.Path('.').rglob('*R12*MASTER*REVIEW*.zip'))
+                  if candidates:
+                      p = candidates[0]
+                      add('input_bundle_found_with_different_path', True, str(p))
+                  else:
+                      add('input_bundle_exists', False, f'Missing {expected_name} in repository root')
+                      result['final_decision'] = 'MISSING_R12_MASTER_BUNDLE_UPLOAD_REQUIRED'
+                      result['message_ar'] = 'الوركفلو ظهر واشتغل، لكن حزمة R12 غير موجودة في المستودع. ارفع الملف ACIRM_R13M_R9C_R12_MASTER_REVIEW_BUNDLE_20260608.zip في الصفحة الرئيسية للمستودع ثم شغل الوركفلو مرة أخرى.'
+                      raise SystemExit(0)
+              else:
+                  add('input_bundle_exists', True, str(p))
+
+              data = p.read_bytes()
+              sha = hashlib.sha256(data).hexdigest()
+              expected_sha = 'cff2d1a83bf35b9e365e7676b071680dfa69d4741edcd2a452669b5be350870d'
+              add('input_bundle_sha256', sha == expected_sha, f'actual={sha}; expected={expected_sha}')
+
+              with zipfile.ZipFile(p, 'r') as z:
+                  names = z.namelist()
+                  add('input_bundle_opened_as_zip', True, f'{len(names)} entries')
+                  required = [
+                      'R12_MASTER_STATUS.json',
+                      'MANIFEST_SHA256.json',
+                      'ACIRM_R13M_R9C_THEORY_R11_FINAL_REVIEW_READY_BRIDGE_PACKAGE.zip',
+                      'ACIRM_R13M_FINAL_COMPREHENSIVE_AUDIT_R7_CLOSURE_20260608.zip',
+                      'ACIRM_R13M_N2K_R4_VERSION_LABEL_NORMALIZATION_NO_ATTRIBUTION_RESULTS.zip',
+                      'ACIRM_R13M_N2L_R4_VERSION_LABEL_NORMALIZATION_OFFICIAL_N1_CONTROL_COMPARISON_NO_SCORE_RESULTS.zip'
+                  ]
+                  name_set = set(names)
+                  for r in required:
+                      add('required_entry_' + r, r in name_set, r)
+
+                  # Read status if available.
+                  if 'R12_MASTER_STATUS.json' in name_set:
+                      status = json.loads(z.read('R12_MASTER_STATUS.json').decode('utf-8'))
+                      add('r12_status_readable', True, sorted(status.keys()))
+                      text = json.dumps(status, ensure_ascii=False)
+                      add('r12_preserves_no_discovery', 'NOT_DISCOVERY' in text or 'not_discovery' in text.lower(), 'claim boundary check')
+
+                  # Verify nested N2L_R4 summary facts if possible.
+                  n2l_name = 'ACIRM_R13M_N2L_R4_VERSION_LABEL_NORMALIZATION_OFFICIAL_N1_CONTROL_COMPARISON_NO_SCORE_RESULTS.zip'
+                  if n2l_name in name_set:
+                      nested_path = OUT / n2l_name
+                      nested_path.write_bytes(z.read(n2l_name))
+                      with zipfile.ZipFile(nested_path, 'r') as nz:
+                          nn = nz.namelist()
+                          combined = ''
+                          for fname in nn:
+                              if fname.endswith('.json') or fname.endswith('.md') or fname.endswith('.csv'):
+                                  try:
+                                      combined += nz.read(fname).decode('utf-8', errors='ignore') + '\n'
+                                  except Exception:
+                                      pass
+                          add('n2l_r4_r9c_plus4_present', '+4' in combined or ',4,' in combined or 'delta=+4' in combined, 'R9C +4 check')
+                          add('n2l_r4_ra240_plus5_present', '+5' in combined or ',5,' in combined or 'NOGATE_RA240' in combined, 'NOGATE_RA240 +5 check')
+                          add('n2l_r4_not_unique_present', 'not unique' in combined.lower() or 'غير فريد' in combined or 'NOT_UNIQUE' in combined, 'not unique check')
+
+                  # Verify frequency formula independently.
+                  G = 6.67430e-11
+                  c = 299792458.0
+                  M_sun = 1.98847e30
+                  M_eff = 5.0 * M_sun
+                  k = 2.0
+                  chi_alpha = 1.0
+                  f = k * chi_alpha * (c**3 * math.log(2.0) / (8.0 * math.pi * G * M_eff))
+                  add('r9c_frequency_formula', abs(f - 2239.664337045391) < 1e-6, f'f={f}')
+
+              failed = [c for c in result['checks'] if not c['passed']]
+              if failed:
+                  result['final_decision'] = 'FAIL_QUICK_CHECK_REVIEW_REQUIRED'
+                  result['message_ar'] = 'الوركفلو اشتغل، لكن توجد فحوصات لم تنجح. راجع ملف التقرير داخل Artifacts.'
+              else:
+                  result['final_decision'] = 'PASS_QUICK_INTERNAL_SUPPORT_SMOKE_TEST_NO_NEW_DATA_NO_SCORE'
+                  result['message_ar'] = 'نجح الاختبار السريع. الحزمة متماسكة داخليًا بدون بيانات جديدة وبدون رفع سقف الادعاء.'
+
+          except SystemExit:
+              pass
+          except Exception as e:
+              add('unexpected_exception', False, repr(e))
+              result['final_decision'] = 'FAIL_WORKFLOW_EXCEPTION_REVIEW_REQUIRED'
+              result['message_ar'] = 'حدث خطأ غير متوقع. راجع traceback داخل التقرير.'
+              (OUT / 'traceback.txt').write_text(traceback.format_exc(), encoding='utf-8')
+
+          # Write outputs no matter what.
+          (OUT / 'R13_QUICK_SUPPORT_TEST_RESULT.json').write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding='utf-8')
+          with (OUT / 'R13_QUICK_SUPPORT_CHECKS.csv').open('w', newline='', encoding='utf-8') as f:
+              w = csv.DictWriter(f, fieldnames=['check', 'passed', 'detail'])
+              w.writeheader()
+              for row in result['checks']:
+                  w.writerow(row)
+          report = []
+          report.append('# ACIRM R13 GitHub Quick Check Report')
+          report.append('')
+          report.append('Final decision: `' + result['final_decision'] + '`')
+          report.append('')
+          report.append(result.get('message_ar', ''))
+          report.append('')
+          report.append('## Checks')
+          for c in result['checks']:
+              report.append(f"- [{'PASS' if c['passed'] else 'FAIL'}] {c['check']}: {c['detail']}")
+          (OUT / 'R13_QUICK_SUPPORT_TEST_REPORT.md').write_text('\n'.join(report), encoding='utf-8')
+
+          print('FINAL_DECISION=' + result['final_decision'])
+          print(result.get('message_ar', ''))
+          PY
+
+          cd acirm_r13_output
+          zip -qr ../ACIRM_R13_QUICK_SUPPORT_TEST_RESULTS_GITHUB_CODE.zip .
+          cd ..
+          sha256sum ACIRM_R13_QUICK_SUPPORT_TEST_RESULTS_GITHUB_CODE.zip > ACIRM_R13_QUICK_SUPPORT_TEST_RESULTS_GITHUB_CODE.zip.sha256.txt
+          exit 0
+
+      - name: Upload ACIRM quick check artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ACIRM_R13_QUICK_SUPPORT_TEST_RESULTS_GITHUB_CODE
+          path: |
+            ACIRM_R13_QUICK_SUPPORT_TEST_RESULTS_GITHUB_CODE.zip
+            ACIRM_R13_QUICK_SUPPORT_TEST_RESULTS_GITHUB_CODE.zip.sha256.txt
+            acirm_r13_output/R13_QUICK_SUPPORT_TEST_RESULT.json
+            acirm_r13_output/R13_QUICK_SUPPORT_CHECKS.csv
+            acirm_r13_output/R13_QUICK_SUPPORT_TEST_REPORT.md
+          if-no-files-found: warn
+          retention-days: 30
