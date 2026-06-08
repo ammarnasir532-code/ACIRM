@@ -1,0 +1,278 @@
+name: ACIRM R13 Run From GitHub Code V4
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - 'ACIRM_R13M_R9C_R12_MASTER_REVIEW_BUNDLE_20260608.zip'
+      - '.github/workflows/acirm_r13_run_from_github_code_v4.yml'
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  acirm-r13-r12-quick-check:
+    name: ACIRM R13 R12 quick support check
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Run ACIRM R13 R12 no-new-data support check
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import zipfile, json, hashlib, math, csv, io, pathlib, datetime, os
+
+          INPUT = pathlib.Path("ACIRM_R13M_R9C_R12_MASTER_REVIEW_BUNDLE_20260608.zip")
+          EXPECTED_R12_SHA = "cff2d1a83bf35b9e365e7676b071680dfa69d4741edcd2a452669b5be350870d"
+
+          OUTDIR = pathlib.Path("acirm_r13_output")
+          OUTDIR.mkdir(exist_ok=True)
+
+          checks = []
+          def add(name, passed, detail=""):
+              checks.append({"check": name, "passed": bool(passed), "detail": str(detail)})
+
+          final_decision = "FAIL_QUICK_CHECK_REVIEW_REQUIRED"
+          message_ar = "الوركفلو اشتغل، لكن توجد فحوصات لم تنجح. راجع التقرير داخل Artifacts."
+
+          status = {}
+          names = []
+          zbytes_cache = {}
+
+          if not INPUT.exists():
+              add("input_bundle_exists", False, str(INPUT))
+              final_decision = "MISSING_R12_MASTER_BUNDLE_UPLOAD_REQUIRED"
+              message_ar = "الوركفلو صحيح، لكن حزمة R12 غير موجودة في جذر المستودع. ارفع الملف المطلوب ثم شغل الوركفلو مرة ثانية."
+          else:
+              add("input_bundle_exists", True, str(INPUT))
+              actual_sha = hashlib.sha256(INPUT.read_bytes()).hexdigest()
+              add("input_bundle_sha256", actual_sha == EXPECTED_R12_SHA, f"actual={actual_sha}; expected={EXPECTED_R12_SHA}")
+
+              try:
+                  with zipfile.ZipFile(INPUT) as z:
+                      names = z.namelist()
+                      name_set = set(names)
+                      add("input_bundle_opened_as_zip", True, f"{len(names)} entries")
+
+                      # R12 expected top-level files
+                      for req in ["R12_MASTER_STATUS.json", "MANIFEST_SHA256.json", "R12_CANONICAL_INCLUDED_FILE_SET.csv"]:
+                          add(f"required_entry_{req}", req in name_set, req)
+
+                      # Manifest validation; MANIFEST_SHA256.json excludes itself.
+                      if "MANIFEST_SHA256.json" in name_set:
+                          try:
+                              manifest = json.loads(z.read("MANIFEST_SHA256.json").decode("utf-8"))
+                              mf = manifest.get("files", {})
+                              bad = []
+                              missing = []
+                              for fname, expected in mf.items():
+                                  if fname not in name_set:
+                                      missing.append(fname)
+                                  else:
+                                      got = hashlib.sha256(z.read(fname)).hexdigest()
+                                      if got != expected:
+                                          bad.append(f"{fname}: {got} != {expected}")
+                              add("r12_manifest_paths_present", len(missing) == 0, "; ".join(missing[:10]) if missing else "all manifest paths present")
+                              add("r12_manifest_hashes_match", len(bad) == 0, "; ".join(bad[:10]) if bad else "all manifest hashes match")
+                          except Exception as e:
+                              add("r12_manifest_validation_exception", False, repr(e))
+
+                      # R12 status
+                      if "R12_MASTER_STATUS.json" in name_set:
+                          try:
+                              status = json.loads(z.read("R12_MASTER_STATUS.json").decode("utf-8"))
+                              add("r12_status_readable", True, sorted(status.keys()))
+                              ceiling_text = json.dumps(status, ensure_ascii=False).lower()
+                              no_bad_claims = ("not_discovery" in ceiling_text or "no_discovery" in ceiling_text) and ("not_attribution" in ceiling_text or "no_attribution" in ceiling_text)
+                              add("r12_preserves_no_discovery_no_attribution", no_bad_claims, "claim boundary check")
+                          except Exception as e:
+                              add("r12_status_readable", False, repr(e))
+
+                      # Canonical packages are embedded under canonical_inputs/ in R12.
+                      canonical_expected = {
+                          "theory": "canonical_inputs/ACIRM_R13M_R9C_THEORY_R11_FINAL_REVIEW_READY_BRIDGE_PACKAGE.zip",
+                          "audit": "canonical_inputs/ACIRM_R13M_FINAL_COMPREHENSIVE_AUDIT_R7_CLOSURE_20260608.zip",
+                          "n2k": "canonical_inputs/ACIRM_R13M_N2K_R4_VERSION_LABEL_NORMALIZATION_NO_ATTRIBUTION_RESULTS.zip",
+                          "n2l": "canonical_inputs/ACIRM_R13M_N2L_R4_VERSION_LABEL_NORMALIZATION_OFFICIAL_N1_CONTROL_COMPARISON_NO_SCORE_RESULTS.zip",
+                          "external_starter": "canonical_inputs/ACIRM_R13M_EXTERNAL_AUDIT_STARTER_PACKAGE_20260608.zip",
+                          "r9c_systematics": "canonical_inputs/ACIRM_R13_SYSTEMATICS_AUDITED_STRONG_OPERATIONAL_SUPPORT_BRANCH_COMPLETE_HANDOFF_PACKAGE.zip",
+                      }
+                      for key, req in canonical_expected.items():
+                          add(f"canonical_embedded_{key}", req in name_set, req)
+                          if req in name_set:
+                              zbytes_cache[key] = z.read(req)
+
+                      # Frequency formula check.
+                      G = 6.67430e-11
+                      c = 299792458.0
+                      M_sun = 1.98847e30
+                      M_eff = 5.0 * M_sun
+                      k = 2.0
+                      chi_alpha = 1.0
+                      f = k * chi_alpha * (c**3 * math.log(2) / (8.0 * math.pi * G * M_eff))
+                      add("r9c_frequency_formula", abs(f - 2239.664337045391) < 1e-6, f"f={f}")
+
+                  # Inspect N2K embedded zip for current no-attribution summary.
+                  if "n2k" in zbytes_cache:
+                      try:
+                          with zipfile.ZipFile(io.BytesIO(zbytes_cache["n2k"])) as nz:
+                              nn = nz.namelist()
+                              ntext = "\n".join(nn)
+                              all_text = ""
+                              for n in nn:
+                                  if n.lower().endswith((".json", ".md", ".csv", ".txt")):
+                                      try:
+                                          all_text += "\n" + nz.read(n).decode("utf-8", errors="replace")
+                                      except Exception:
+                                          pass
+                              add("n2k_r4_no_attribution_text", ("NOT_ATTRIBUTION" in all_text or "NO_ATTRIBUTION" in all_text), "N2K_R4 claim boundary")
+                              # Prefer structured SUMMARY.json when available; fall back to text.
+                              n2k_summary_ok = False
+                              n2k_counts_ok = False
+                              try:
+                                  for n in nn:
+                                      if n.endswith("SUMMARY.json"):
+                                          sj = json.loads(nz.read(n).decode("utf-8"))
+                                          m = sj.get("precise_coordinate_metrics", {})
+                                          obs = sj.get("observed_counts", {})
+                                          n2k_summary_ok = (
+                                              m.get("unique_nearest_4FGL_sources_among_4_photons") == 4 and
+                                              m.get("max_photons_sharing_same_nearest_4FGL_source") == 1
+                                          )
+                                          n2k_counts_ok = (obs.get("post_photons") == 4 and obs.get("pre_photons") == 0 and obs.get("delta") == 4)
+                              except Exception:
+                                  pass
+                              if not n2k_summary_ok:
+                                  n2k_summary_ok = (
+                                      "unique_nearest_4FGL_sources_among_4_photons" in all_text and
+                                      "max_photons_sharing_same_nearest_4FGL_source" in all_text and
+                                      '"unique_nearest_4FGL_sources_among_4_photons": 4' in all_text and
+                                      '"max_photons_sharing_same_nearest_4FGL_source": 1' in all_text
+                                  )
+                              if not n2k_counts_ok:
+                                  n2k_counts_ok = ('"post_photons": 4' in all_text and '"pre_photons": 0' in all_text and '"delta": 4' in all_text)
+                              add("n2k_r4_no_single_source_cluster", n2k_summary_ok, "unique nearest sources=4 and max sharing=1")
+                              add("n2k_r4_has_four_post_photons", n2k_counts_ok, "post=4 pre=0 delta=4")
+                      except Exception as e:
+                          add("n2k_r4_embedded_read_exception", False, repr(e))
+
+                  # Inspect N2L embedded zip for official N1 control comparison.
+                  if "n2l" in zbytes_cache:
+                      try:
+                          with zipfile.ZipFile(io.BytesIO(zbytes_cache["n2l"])) as nz:
+                              nn = nz.namelist()
+                              all_text = ""
+                              for n in nn:
+                                  if n.lower().endswith((".json", ".md", ".csv", ".txt")):
+                                      try:
+                                          all_text += "\n" + nz.read(n).decode("utf-8", errors="replace")
+                                      except Exception:
+                                          pass
+                              add("n2l_r4_r9c_positive_plus4", ("R9C" in all_text and "+4" in all_text) or ("delta,4" in all_text.replace(" ", "")), "R9C +4")
+                              add("n2l_r4_ra240_plus5", ("NOGATE_RA240" in all_text and "+5" in all_text) or ("NOGATE_RA240" in all_text and ",5" in all_text.replace(" ", "")), "NOGATE_RA240 +5")
+                              add("n2l_r4_not_unique_boundary", ("not unique" in all_text.lower() or "NOT_UNIQUE" in all_text or "غير فريد" in all_text), "not unique boundary")
+                      except Exception as e:
+                          add("n2l_r4_embedded_read_exception", False, repr(e))
+
+              except Exception as e:
+                  add("input_bundle_opened_as_zip", False, repr(e))
+
+          failed = [c for c in checks if not c["passed"]]
+          if INPUT.exists() and len(failed) == 0:
+              final_decision = "PASS_QUICK_INTERNAL_SUPPORT_SMOKE_TEST_NO_NEW_DATA_NO_SCORE"
+              message_ar = "نجح اختبار R13 السريع: حزمة R12 موجودة، الهاش مطابق، manifest سليم، والحزم canonical موجودة ومتسقة مع السقف العلمي."
+
+          result = {
+              "workflow": "ACIRM R13 Run From GitHub Code V4",
+              "time_utc": datetime.datetime.utcnow().isoformat() + "Z",
+              "final_decision": final_decision,
+              "message_ar": message_ar,
+              "failed_required_checks": len(failed),
+              "checks": checks,
+              "scientific_claim_boundary": {
+                  "R9C_internal_status": "INTERNAL_OPERATIONAL_ESTABLISHMENT_ONLY",
+                  "proof": False,
+                  "discovery": False,
+                  "attribution": False,
+                  "confirmed_material_or_particle_production": False
+              }
+          }
+
+          (OUTDIR / "R13_QUICK_SUPPORT_TEST_RESULT.json").write_text(json.dumps(result, indent=2, ensure_ascii=False), encoding="utf-8")
+
+          with (OUTDIR / "R13_QUICK_SUPPORT_CHECKS.csv").open("w", newline="", encoding="utf-8") as fcsv:
+              writer = csv.DictWriter(fcsv, fieldnames=["check", "passed", "detail"])
+              writer.writeheader()
+              for c in checks:
+                  writer.writerow(c)
+
+          report_lines = [
+              "# ACIRM R13 GitHub Quick Check Report",
+              "",
+              f"Final decision: `{final_decision}`",
+              "",
+              message_ar,
+              "",
+              "## Checks"
+          ]
+          for c in checks:
+              mark = "PASS" if c["passed"] else "FAIL"
+              report_lines.append(f"- [{mark}] {c['check']}: {c['detail']}")
+          report_lines += [
+              "",
+              "## Claim boundary",
+              "- NO_SCORE / no new data",
+              "- NOT_EXTERNAL_PROOF",
+              "- NOT_DISCOVERY",
+              "- NOT_ATTRIBUTION",
+              "- NOT_CONFIRMED_MATERIAL_OR_PARTICLE_PRODUCTION",
+          ]
+          (OUTDIR / "R13_QUICK_SUPPORT_TEST_REPORT.md").write_text("\n".join(report_lines), encoding="utf-8")
+
+          # Create a result ZIP and sha file.
+          result_zip = pathlib.Path("ACIRM_R13_QUICK_SUPPORT_TEST_RESULTS_GITHUB_CODE_V4.zip")
+          with zipfile.ZipFile(result_zip, "w", compression=zipfile.ZIP_DEFLATED) as rz:
+              for fp in sorted(OUTDIR.iterdir()):
+                  rz.write(fp, f"acirm_r13_output/{fp.name}")
+          h = hashlib.sha256(result_zip.read_bytes()).hexdigest()
+          pathlib.Path(str(result_zip) + ".sha256.txt").write_text(f"{h}  {result_zip.name}\n", encoding="utf-8")
+
+          print("FINAL_DECISION=" + final_decision)
+          print("FAILED_REQUIRED_CHECKS=" + str(len(failed)))
+          if failed:
+              print("FAILED_CHECKS:")
+              for f in failed:
+                  print(f" - {f['check']}: {f['detail']}")
+
+          # Do not hard-fail if R12 is missing; artifact explains it.
+          # Hard-fail only when R12 exists but checks failed, so Actions status reflects real review required.
+          if INPUT.exists() and len(failed) > 0:
+              raise SystemExit(1)
+          PY
+
+      - name: Upload ACIRM R13 quick check artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ACIRM_R13_QUICK_SUPPORT_TEST_RESULTS_GITHUB_CODE_V4
+          path: |
+            ACIRM_R13_QUICK_SUPPORT_TEST_RESULTS_GITHUB_CODE_V4.zip
+            ACIRM_R13_QUICK_SUPPORT_TEST_RESULTS_GITHUB_CODE_V4.zip.sha256.txt
+            acirm_r13_output/R13_QUICK_SUPPORT_TEST_RESULT.json
+            acirm_r13_output/R13_QUICK_SUPPORT_CHECKS.csv
+            acirm_r13_output/R13_QUICK_SUPPORT_TEST_REPORT.md
+          if-no-files-found: warn
+          retention-days: 30
